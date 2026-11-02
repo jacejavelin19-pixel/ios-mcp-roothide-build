@@ -1,10 +1,22 @@
 #import <Foundation/Foundation.h>
 #import <sys/mman.h>
+#import <spawn.h>
+#import <signal.h>
+#import <sys/wait.h>
 #import <unistd.h>
 #import "../MemoryManager.h"
 
-int main(void) {
+extern char **environ;
+
+int main(int argc, char **argv) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--target") == 0) {
+            static volatile uint64_t target = 0x123456789abcdef0ULL;
+            printf("%llu\n", (unsigned long long)(uintptr_t)&target);
+            fflush(stdout);
+            sleep(30);
+            return 0;
+        }
         const size_t size = 131072;
         uint8_t *buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (buffer == MAP_FAILED) { perror("mmap"); return 1; }
@@ -34,6 +46,36 @@ int main(void) {
         }
         munmap(buffer, size);
         puts("PASS self read/write/search cross-chunk and bounds");
+        if (argc == 2 && strcmp(argv[1], "--cross-process") == 0) {
+            int fds[2];
+            if (pipe(fds) != 0) { perror("pipe"); return 7; }
+            posix_spawn_file_actions_t actions;
+            posix_spawn_file_actions_init(&actions);
+            posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+            posix_spawn_file_actions_addclose(&actions, fds[0]);
+            posix_spawn_file_actions_addclose(&actions, fds[1]);
+            char *childArgs[] = {argv[0], "--target", NULL};
+            pid_t child = 0;
+            int spawnResult = posix_spawn(&child, argv[0], &actions, NULL, childArgs, environ);
+            posix_spawn_file_actions_destroy(&actions);
+            close(fds[1]);
+            if (spawnResult != 0) { close(fds[0]); fprintf(stderr, "spawn failed: %d\n", spawnResult); return 8; }
+            FILE *stream = fdopen(fds[0], "r");
+            unsigned long long remoteAddress = 0;
+            int parsed = stream ? fscanf(stream, "%llu", &remoteAddress) : 0;
+            if (stream) fclose(stream); else close(fds[0]);
+            NSString *crossError = nil;
+            NSDictionary *remote = parsed == 1 ? [manager readPID:child address:remoteAddress length:sizeof(uint64_t) error:&crossError] : nil;
+            kill(child, SIGTERM);
+            waitpid(child, NULL, 0);
+            if (!remote) { fprintf(stderr, "cross-process read failed: %s\n", crossError.UTF8String ?: "target did not report address"); return 9; }
+            NSData *remoteData = [[NSData alloc] initWithBase64EncodedString:remote[@"data"] options:0];
+            uint64_t actual = 0;
+            if (remoteData.length != sizeof(actual)) return 10;
+            memcpy(&actual, remoteData.bytes, sizeof(actual));
+            if (actual != 0x123456789abcdef0ULL) { fprintf(stderr, "cross-process read mismatch\n"); return 11; }
+            puts("PASS cross-process read from dedicated child");
+        }
         return 0;
     }
 }

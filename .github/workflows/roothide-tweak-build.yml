@@ -50,6 +50,10 @@ jobs:
             tests/memory_manager_device_test.m MemoryManager.m -o ci-output/memory-manager-device-test
           lipo -info ci-output/memory-manager-device-test
           shasum -a 256 ci-output/memory-manager-device-test >> ci-output/SHA256SUMS
+          xcrun --sdk iphoneos clang -arch arm64e -fobjc-arc -miphoneos-version-min=15.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -framework Foundation \
+            tests/plist_manager_device_test.m PlistPatchManager.m -o ci-output/plist-manager-device-test
+          shasum -a 256 ci-output/plist-manager-device-test >> ci-output/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: roothide-tweak-compile-only
