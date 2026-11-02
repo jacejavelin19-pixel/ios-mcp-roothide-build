@@ -75,6 +75,7 @@ static NSString *MCPMachError(kern_return_t result) {
     NSMutableArray *matches = [NSMutableArray array];
     mach_vm_address_t cursor = start;
     NSUInteger regions = 0;
+    BOOL complete = YES;
     while (cursor < end && regions++ < 4096 && matches.count < 1000) {
         mach_vm_address_t region = cursor;
         mach_vm_size_t regionSize = 0;
@@ -83,7 +84,11 @@ static NSString *MCPMachError(kern_return_t result) {
         mach_port_t object = MACH_PORT_NULL;
         kern_return_t kr = mach_vm_region(task, &region, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
         if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
-        if (kr != KERN_SUCCESS || !regionSize || region > UINT64_MAX - regionSize) break;
+        if (kr != KERN_SUCCESS || !regionSize || region > UINT64_MAX - regionSize) {
+            complete = NO;
+            break;
+        }
+        if (region > cursor || !(info.protection & VM_PROT_READ)) complete = NO;
         mach_vm_address_t regionEnd = MIN(end, region + regionSize);
         mach_vm_address_t position = MAX(cursor, region);
         if ((info.protection & VM_PROT_READ) && position < regionEnd) {
@@ -92,12 +97,19 @@ static NSString *MCPMachError(kern_return_t result) {
                 NSMutableData *block = [NSMutableData dataWithLength:(NSUInteger)amount];
                 mach_vm_size_t actual = 0;
                 kr = mach_vm_read_overwrite(task, position, amount, (mach_vm_address_t)block.mutableBytes, &actual);
-                if (kr != KERN_SUCCESS || actual == 0) break;
+                if (kr != KERN_SUCCESS || actual == 0) {
+                    complete = NO;
+                    break;
+                }
                 const uint8_t *bytes = block.bytes;
                 for (NSUInteger i = 0; i + data.length <= actual && matches.count < 1000; i++) {
                     if (memcmp(bytes + i, data.bytes, data.length) == 0) [matches addObject:[NSString stringWithFormat:@"0x%llx", position + i]];
                 }
-                if (actual <= data.length - 1 || position + actual >= regionEnd) break;
+                if (actual <= data.length - 1) {
+                    if (position + actual < regionEnd) complete = NO;
+                    break;
+                }
+                if (position + actual >= regionEnd) break;
                 position += actual - (data.length - 1);
             }
         }
@@ -105,7 +117,8 @@ static NSString *MCPMachError(kern_return_t result) {
         cursor = regionEnd;
     }
     mach_port_deallocate(mach_task_self(), task);
-    return @{@"matches": matches, @"limited": @(matches.count >= 1000 || regions > 4096)};
+    BOOL limited = matches.count >= 1000 || regions > 4096;
+    return @{@"matches": matches, @"limited": @(limited), @"complete": @(complete && !limited)};
 }
 
 @end
