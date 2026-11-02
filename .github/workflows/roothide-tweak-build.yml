@@ -36,6 +36,8 @@ jobs:
           tar -xzf "$TMP_ZIP/libzip.tar.gz" -C "$TMP_ZIP"
           IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           cmake -S "$TMP_ZIP/libzip-1.7.3" -B "$TMP_ZIP/build" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
             -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e" \
