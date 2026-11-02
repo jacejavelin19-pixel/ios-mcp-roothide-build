@@ -15,11 +15,13 @@ BUNDLE_NAME = iosmcpprefs
 
 ios-mcp_FILES = Tweak.x MCPServer.m MCPLogger.m HIDManager.m ScreenManager.m ClipboardManager.m AppManager.m AccessibilityManager.m TextInputManager.m FileSystemManager.m LogManager.m OCRManager.m MCPProcessUtil.m MCPAXQueryContext.m MCPAXRemoteContextResolver.m MCPUIElementSerializer.m MCPUIElementsFacade.m MCPAXAttributeBridge.m MCPAXNodeSource.m
 ios-mcp_FILES += VisionOCREngine.m PaddleOCRManager.m MCPOCRRequestContext.m PlistPatchManager.m MemoryManager.m
+ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m
 ios-mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-deprecated-declarations
 ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Vision
+ios-mcp_LIBRARIES = sqlite3
 
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
-    ios-mcp_LIBRARIES = roothide
+    ios-mcp_LIBRARIES += roothide
     ios-mcp_CFLAGS += -DMCP_ROOTHIDE=1
     iosmcpprefs_LIBRARIES = roothide
 else ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
@@ -39,7 +41,7 @@ include $(THEOS_MAKE_PATH)/bundle.mk
 
 after-stage::
 	@# Paddle runs in a separate process: SpringBoard does not link ONNX/OpenCV.
-	$(ECHO_NOTHING)mkdir -p "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp" "$(THEOS_STAGING_DIR)/usr/share/ios-mcp/paddleocr"$(ECHO_END)
+	$(ECHO_NOTHING)mkdir -p "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp" "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp" "$(THEOS_STAGING_DIR)/usr/share/ios-mcp/paddleocr"$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-ocr-worker/.theos/obj/mcp-ocr-worker "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/"$(ECHO_END)
 	$(ECHO_NOTHING)cp third_party/paddleocr/models/* "$(THEOS_STAGING_DIR)/usr/share/ios-mcp/paddleocr/"$(ECHO_END)
 	$(ECHO_NOTHING)mkdir -p "$(THEOS_STAGING_DIR)/Library/PreferenceLoader/Preferences"$(ECHO_END)
@@ -71,8 +73,14 @@ after-stage::
 	$(ECHO_NOTHING)chmod 4755 "$(THEOS_STAGING_DIR)/usr/bin/mcp-root"$(ECHO_END)
 	@# Bundle mcp-logreader (unified system log reader via diagnosticd live stream)
 	$(ECHO_NOTHING)cp mcp-logreader/.theos/obj/mcp-logreader "$(THEOS_STAGING_DIR)/usr/bin/mcp-logreader"$(ECHO_END)
-	@# Bounded memory operations run in a separately entitled helper, not SpringBoard.
+	@# Bounded memory, keychain, and Mach-O/app modification helpers run out-of-process with scoped entitlements.
 	$(ECHO_NOTHING)cp mcp-memory/.theos/obj/mcp-memory "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-memory"$(ECHO_END)
+	$(ECHO_NOTHING)cp mcp-keychain/.theos/obj/mcp-keychain "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-keychain"$(ECHO_END)
+	$(ECHO_NOTHING)cp mcp-appmod/.theos/obj/mcp-appmod "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-appmod"$(ECHO_END)
+	@# Standalone pure-Apple-SDK companion payload dylibs injected per-app (SSL Kill Switch, Network Capture, Frida Stealth).
+	$(ECHO_NOTHING)cp payloads/sslkillswitch/.theos/obj/libmcp_sslks.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_sslks.dylib"$(ECHO_END)
+	$(ECHO_NOTHING)cp payloads/netcapture/.theos/obj/libmcp_netcap.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_netcap.dylib"$(ECHO_END)
+	$(ECHO_NOTHING)cp payloads/fridastealth/.theos/obj/libmcp_stealth.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_stealth.dylib"$(ECHO_END)
 
 after-install::
 	install.exec "killall -9 SpringBoard"

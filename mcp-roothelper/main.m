@@ -45,7 +45,13 @@ static BOOL MCPRHPathExists(NSString *path) {
 }
 
 static BOOL MCPRHPathExecutable(NSString *path) {
-    return (path.length > 0 && access(path.fileSystemRepresentation, X_OK) == 0);
+    if (path.length == 0) return NO;
+    const char *fsPath = path.fileSystemRepresentation;
+    if (!fsPath || !*fsPath) return NO;
+    if (access(fsPath, X_OK) == 0) return YES;
+    struct stat st;
+    if (stat(fsPath, &st) != 0) return NO;
+    return S_ISREG(st.st_mode) && ((st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0);
 }
 
 static NSString *MCPRHResolvedJailbreakPath(NSString *path) {
@@ -91,7 +97,7 @@ static NSString *MCPRHFindInstalledTrollStoreHelper(void) {
             NSString *containerPath = [basePath stringByAppendingPathComponent:entry];
             for (NSString *appName in appNames) {
                 NSString *helperPath = [[containerPath stringByAppendingPathComponent:appName] stringByAppendingPathComponent:@"trollstorehelper"];
-                if ([fm isExecutableFileAtPath:helperPath]) {
+                if (MCPRHPathExecutable(helperPath)) {
                     return helperPath;
                 }
             }

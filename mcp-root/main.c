@@ -30,6 +30,9 @@ typedef enum {
     MCP_ALLOWED_COMMAND_LAUNCHCTL,
     MCP_ALLOWED_COMMAND_ID,
     MCP_ALLOWED_COMMAND_DPKG,
+    MCP_ALLOWED_COMMAND_MEMORY,
+    MCP_ALLOWED_COMMAND_KEYCHAIN,
+    MCP_ALLOWED_COMMAND_APPMOD,
 } MCPAllowedCommand;
 
 static void print_usage(const char *program) {
@@ -43,6 +46,17 @@ static void print_usage(const char *program) {
     fprintf(stderr, "  /usr/bin/id\n");
     fprintf(stderr, "  /usr/bin/dpkg -i|--install|--unpack [safe dpkg options] <absolute .deb path>...\n");
     fprintf(stderr, "  /usr/bin/dpkg -s|--status|-r|--remove|--purge <package-id>\n");
+    fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-memory [args...]\n");
+    fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-keychain [args...]\n");
+    fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-appmod [args...]\n");
+}
+
+static int is_executable_file(const char *path) {
+    struct stat st;
+    if (!path || path[0] == '\0') return 0;
+    if (access(path, X_OK) == 0) return 1;
+    if (stat(path, &st) != 0) return 0;
+    return S_ISREG(st.st_mode) && ((st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0);
 }
 
 static const char *resolve_command_path(const char *path) {
@@ -52,12 +66,12 @@ static const char *resolve_command_path(const char *path) {
 
 #ifdef MCP_ROOTHIDE
     const char *jbPath = jbroot(path);
-    if (jbPath && access(jbPath, X_OK) == 0) {
+    if (jbPath && is_executable_file(jbPath)) {
         return jbPath;
     }
 
     const char *rootfsPath = rootfs(path);
-    if (rootfsPath && access(rootfsPath, X_OK) == 0) {
+    if (rootfsPath && is_executable_file(rootfsPath)) {
         return rootfsPath;
     }
 #endif
@@ -68,7 +82,7 @@ static const char *resolve_command_path(const char *path) {
         static unsigned int rootlessPathIndex = 0;
         char *candidate = rootlessPaths[rootlessPathIndex++ % 4];
         int written = snprintf(candidate, PATH_MAX, "/var/jb%s", path);
-        if (written > 0 && written < PATH_MAX && access(candidate, X_OK) == 0) {
+        if (written > 0 && written < PATH_MAX && is_executable_file(candidate)) {
             return candidate;
         }
     }
@@ -468,6 +482,9 @@ static MCPAllowedCommand classify_allowed_command(const char *command_path) {
         {"/var/jb/usr/bin/id", MCP_ALLOWED_COMMAND_ID},
         {"/usr/bin/dpkg", MCP_ALLOWED_COMMAND_DPKG},
         {"/var/jb/usr/bin/dpkg", MCP_ALLOWED_COMMAND_DPKG},
+        {"/usr/libexec/ios-mcp/mcp-memory", MCP_ALLOWED_COMMAND_MEMORY},
+        {"/usr/libexec/ios-mcp/mcp-keychain", MCP_ALLOWED_COMMAND_KEYCHAIN},
+        {"/usr/libexec/ios-mcp/mcp-appmod", MCP_ALLOWED_COMMAND_APPMOD},
     };
     size_t i;
 

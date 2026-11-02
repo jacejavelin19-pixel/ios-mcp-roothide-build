@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 
 FOUNDATION_EXPORT NSString *MCPResolvedJailbreakPath(NSString *path);
+FOUNDATION_EXPORT NSString *MCPBootstrapPathForRootHide(NSString *path);
+FOUNDATION_EXPORT BOOL MCPIsExecutableFile(NSString *path);
 FOUNDATION_EXPORT NSDictionary<NSString *, NSString *> *MCPJailbreakEnvironment(void);
 FOUNDATION_EXPORT BOOL MCPRunProcess(NSString *launchPath,
                                      NSArray<NSString *> *arguments,
@@ -25,6 +27,15 @@ FOUNDATION_EXPORT BOOL MCPRunProcessData(NSString *launchPath,
 
 /// Resolve the bundled setuid mcp-root helper path, or nil/empty when unavailable.
 FOUNDATION_EXPORT NSString *MCPRootHelperPath(void);
+
+/// Run a command as root via the bundled mcp-root helper, capturing UTF-8 text output.
+FOUNDATION_EXPORT BOOL MCPRunRootProcess(NSString *launchPath,
+                                         NSArray<NSString *> *arguments,
+                                         NSTimeInterval timeout,
+                                         NSUInteger maxOutputBytes,
+                                         NSString **output,
+                                         int *exitCode,
+                                         NSString **errorMessage);
 
 /// Run a command as root via the bundled mcp-root helper, capturing raw bytes.
 /// Returns NO (with errorMessage) when no privileged helper is available.

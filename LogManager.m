@@ -53,7 +53,7 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
     if (lastSeconds > kLogMaxSeconds) lastSeconds = kLogMaxSeconds;
 
     NSString *helper = MCPResolvedJailbreakPath(@"/usr/bin/mcp-logreader");
-    if (![[NSFileManager defaultManager] isExecutableFileAtPath:helper]) {
+    if (!MCPIsExecutableFile(helper)) {
         if (error) *error = @"mcp-logreader helper not installed";
         return nil;
     }

@@ -82,13 +82,20 @@ build_subprojects() {
   (cd mcp-roothelper && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-ldid && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-memory && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
+  (cd mcp-keychain && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
+  (cd mcp-appmod && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-root && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-logreader && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
-  if [[ ! -f third_party/paddleocr/runtime/ios/lib/libonnxruntime.a ]]; then
-    print -u2 "PaddleOCR runtime missing: see docs/PADDLEOCR.md and run scripts/build_paddle_runtime.sh ios"
-    exit 1
+  (cd payloads/sslkillswitch && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
+  (cd payloads/netcapture && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
+  (cd payloads/fridastealth && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
+  if [[ ! -f mcp-ocr-worker/.theos/obj/mcp-ocr-worker ]]; then
+    if [[ ! -f third_party/paddleocr/runtime/ios/lib/libonnxruntime.a ]]; then
+      print -u2 "PaddleOCR runtime missing: see docs/PADDLEOCR.md and run scripts/build_paddle_runtime.sh ios"
+      exit 1
+    fi
+    (cd mcp-ocr-worker && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   fi
-  (cd mcp-ocr-worker && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
 }
 
 build_selected_package() {

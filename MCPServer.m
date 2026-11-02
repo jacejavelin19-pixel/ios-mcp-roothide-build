@@ -9,6 +9,17 @@
 #import "FileSystemManager.h"
 #import "PlistPatchManager.h"
 #import "MemoryManager.h"
+#import "MCPMachOUtil.h"
+#import "EntitlementManager.h"
+#import "DylibInjectManager.h"
+#import "ClassDumpManager.h"
+#import "KeychainManager.h"
+#import "SSLKillSwitchManager.h"
+#import "CrashSymbolicateManager.h"
+#import "NetworkCaptureManager.h"
+#import "IL2CPPManager.h"
+#import "FridaManager.h"
+#import "SQLiteQueryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
 #import "MCPOCRRequestContext.h"
@@ -35,7 +46,7 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"1.2.8"
+#define MCP_SERVER_VERSION          @"1.2.9"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
@@ -456,10 +467,21 @@ static BOOL MCPDirectoryExists(NSString *path) {
 
 static NSDictionary *MCPHelperExecutableStatus(NSString *logicalPath) {
     NSString *resolvedPath = MCPResolvedJailbreakPath(logicalPath);
-    BOOL executable = resolvedPath.length > 0 && [[NSFileManager defaultManager] isExecutableFileAtPath:resolvedPath];
+    BOOL executable = resolvedPath.length > 0 && MCPIsExecutableFile(resolvedPath);
     return @{
         @"path": resolvedPath ?: @"",
         @"executable": @(executable)
+    };
+}
+
+static NSDictionary *MCPPayloadFileStatus(NSString *logicalPath) {
+    NSString *resolvedPath = MCPResolvedJailbreakPath(logicalPath);
+    struct stat st;
+    BOOL exists = resolvedPath.length > 0 && stat(resolvedPath.fileSystemRepresentation, &st) == 0 && S_ISREG(st.st_mode);
+    return @{
+        @"path": resolvedPath ?: @"",
+        @"exists": @(exists),
+        @"size": @(exists ? (unsigned long long)st.st_size : 0ULL)
     };
 }
 
@@ -501,7 +523,17 @@ static NSDictionary *MCPJailbreakInfo(BOOL debug) {
             @"mcpRoot": MCPHelperExecutableStatus(@"/usr/bin/mcp-root"),
             @"mcpRootHelper": MCPHelperExecutableStatus(@"/usr/bin/mcp-roothelper"),
             @"mcpAppInst": MCPHelperExecutableStatus(@"/usr/bin/mcp-appinst"),
-            @"mcpLdid": MCPHelperExecutableStatus(@"/usr/bin/mcp-ldid")
+            @"mcpLdid": MCPHelperExecutableStatus(@"/usr/bin/mcp-ldid"),
+            @"mcpLogReader": MCPHelperExecutableStatus(@"/usr/bin/mcp-logreader"),
+            @"mcpMemory": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-memory"),
+            @"mcpKeychain": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-keychain"),
+            @"mcpAppMod": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-appmod"),
+            @"mcpOcrWorker": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-ocr-worker")
+        };
+        info[@"payloads"] = @{
+            @"sslKillSwitch": MCPPayloadFileStatus(@"/usr/lib/ios-mcp/libmcp_sslks.dylib"),
+            @"netCapture": MCPPayloadFileStatus(@"/usr/lib/ios-mcp/libmcp_netcap.dylib"),
+            @"fridaStealth": MCPPayloadFileStatus(@"/usr/lib/ios-mcp/libmcp_stealth.dylib")
         };
     }
 
@@ -534,6 +566,18 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_app_info",
             @"list_dir",
             @"read_file",
+            @"get_plist_value",
+            @"read_memory",
+            @"search_memory",
+            @"list_memory_regions",
+            @"dump_entitlements",
+            @"inspect_macho",
+            @"dump_classes",
+            @"symbolicate_crash",
+            @"get_captured_requests",
+            @"dump_il2cpp",
+            @"query_sqlite",
+            @"get_frida_stealth_status",
             @"get_syslog",
             @"get_crash_logs",
             @"read_crash_log"
@@ -780,6 +824,30 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executePlistValue:(id)reqId args:(NSDictionary *)args write:(BOOL)write;
 - (NSDictionary *)executeMemory:(id)reqId args:(NSDictionary *)args operation:(NSString *)operation;
+- (NSDictionary *)executeDumpEntitlements:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executePatchEntitlements:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeInjectDylib:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeRemoveDylib:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeInspectMachO:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeDumpClasses:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeKeychainOperation:(id)reqId args:(NSDictionary *)args action:(NSString *)action;
+- (NSDictionary *)executeSSLKillSwitch:(id)reqId args:(NSDictionary *)args enable:(BOOL)enable;
+- (NSDictionary *)executeSymbolicateCrash:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeStartCapture:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeStopCapture:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetCapturedRequests:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeDumpIL2CPP:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeQuerySQLite:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeInjectFridaGadget:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeRemoveFridaGadget:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFridaRPCCall:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeScrubGadgetBinary:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeConfigureFridaStealth:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGetFridaStealthStatus:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFridaAntiDetectionProbe:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFridaListModules:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFridaHookObjC:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFridaMemoryScan:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args;
@@ -2528,25 +2596,460 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"get_plist_value",
-            @"description": @"Read a dot-separated dictionary keypath from a local binary or XML property list.",
-            @"inputSchema": @{@"type": @"object", @"properties": @{@"path": @{@"type": @"string"}, @"keypath": @{@"type": @"string"}}, @"required": @[@"path", @"keypath"]}
+            @"description": @"Read a typed value at a dot-separated keypath (supports dictionary keys and numeric array indices, e.g. 'CFBundleURLTypes.0.CFBundleURLSchemes.0'; empty keypath returns root) from an XML or binary plist, with automatic RootHide jbroot path resolution and privileged root fallback.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute plist path on device."},
+                    @"keypath": @{@"type": @"string", @"description": @"Dot-separated keypath (empty string '' returns full root plist)."}
+                },
+                @"required": @[@"path", @"keypath"]
+            }
         },
         @{
             @"name": @"set_plist_value",
-            @"description": @"Atomically set a dictionary keypath, preserving the property-list format. Requires write access.",
-            @"inputSchema": @{@"type": @"object", @"properties": @{@"path": @{@"type": @"string"}, @"keypath": @{@"type": @"string"}, @"value": @{}}, @"required": @[@"path", @"keypath", @"value"]}
+            @"description": @"Atomically set a typed JSON value (string, number, boolean, array, dictionary, or {'__type':'data','base64':...}) at a dot-separated keypath while preserving the original XML or binary plist format and file permissions, with privileged root fallback.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute plist path on device."},
+                    @"keypath": @{@"type": @"string", @"description": @"Dot-separated keypath to set (intermediate dictionaries are created if missing)."},
+                    @"value": @{@"description": @"Typed JSON value to store at keypath."}
+                },
+                @"required": @[@"path", @"keypath", @"value"]
+            }
         },
         @{
-            @"name": @"read_memory", @"description": @"Read a bounded region of another process into base64. Requires an obtainable task port.",
-            @"inputSchema": @{@"type": @"object", @"properties": @{@"pid": @{@"type": @"integer"}, @"address": @{@"type": @"string"}, @"length": @{@"type": @"integer"}}, @"required": @[@"pid", @"address", @"length"]}
+            @"name": @"read_memory",
+            @"description": @"Read a bounded virtual memory range (up to 1 MiB) from a running process via Mach task_for_pid / mach_vm_read_overwrite in the entitled mcp-memory helper. Provide pid (or bundle_id) and hex/decimal address.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"pid": @{@"type": @"integer", @"description": @"Target process ID (optional if bundle_id is provided)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional running app bundle identifier to resolve PID."},
+                    @"address": @{@"type": @"string", @"description": @"Start virtual address (e.g. '0x104000000')."},
+                    @"length": @{@"type": @"integer", @"description": @"Byte count to read (1..1048576)."}
+                },
+                @"required": @[@"address", @"length"]
+            }
         },
         @{
-            @"name": @"write_memory", @"description": @"Write base64 bytes to a process. Requires an obtainable task port and writable memory.",
-            @"inputSchema": @{@"type": @"object", @"properties": @{@"pid": @{@"type": @"integer"}, @"address": @{@"type": @"string"}, @"data": @{@"type": @"string"}}, @"required": @[@"pid", @"address", @"data"]}
+            @"name": @"write_memory",
+            @"description": @"Write base64 bytes (up to 64 KiB) to a running process virtual address via Mach task_for_pid / mach_vm_write in the entitled mcp-memory helper.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"pid": @{@"type": @"integer", @"description": @"Target process ID (optional if bundle_id is provided)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional running app bundle identifier to resolve PID."},
+                    @"address": @{@"type": @"string", @"description": @"Destination virtual address (e.g. '0x104008000')."},
+                    @"data": @{@"type": @"string", @"description": @"Base64-encoded bytes to write (1..65536 bytes)."}
+                },
+                @"required": @[@"address", @"data"]
+            }
         },
         @{
-            @"name": @"search_memory", @"description": @"Search a bounded address range for base64 bytes. Requires an obtainable task port.",
-            @"inputSchema": @{@"type": @"object", @"properties": @{@"pid": @{@"type": @"integer"}, @"address": @{@"type": @"string"}, @"end": @{@"type": @"string"}, @"data": @{@"type": @"string"}}, @"required": @[@"pid", @"address", @"end", @"data"]}
+            @"name": @"search_memory",
+            @"description": @"Search readable virtual memory regions of a running process between address and end for a byte sequence (base64 data or UTF-8 text) via mach_vm_region + mach_vm_read_overwrite.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"pid": @{@"type": @"integer", @"description": @"Target process ID (optional if bundle_id is provided)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional running app bundle identifier to resolve PID."},
+                    @"address": @{@"type": @"string", @"description": @"Start virtual address (default '0x0')."},
+                    @"end": @{@"type": @"string", @"description": @"End virtual address (default '0x7fffffffffff')."},
+                    @"data": @{@"type": @"string", @"description": @"Base64-encoded byte pattern to search for (optional if text is provided)."},
+                    @"text": @{@"type": @"string", @"description": @"Optional UTF-8 string to search for when data is omitted."}
+                }
+            }
+        },
+        @{
+            @"name": @"list_memory_regions",
+            @"description": @"Enumerate mapped Mach VM regions (address, end, size, current & max rwx protection, user_tag, share_mode) of a running process via task_for_pid + mach_vm_region.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"pid": @{@"type": @"integer", @"description": @"Target process ID (optional if bundle_id is provided)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional running app bundle identifier to resolve PID."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum regions to return (default 256, max 4096)."}
+                }
+            }
+        },
+        // ---- Reverse-engineering: entitlements, Mach-O & dylib injection, ObjC class-dump, keychain, SSL pinning, crash symbolication, network capture, IL2CPP, SQLite ----
+        @{
+            @"name": @"dump_entitlements",
+            @"description": @"Extract the embedded code-signing entitlements dictionary and raw XML blob (CSSLOT_ENTITLEMENTS / 0xfade7171) directly from an installed app's main Mach-O executable.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier (e.g. com.example.app)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"patch_entitlements",
+            @"description": @"Merge plist_patch into an installed app's embedded Mach-O entitlements (set key to null to delete a key; preserves RootHide jb.pmap_cs.custom_trust), re-sign via mcp-ldid -S on a fresh vnode so the kernel does not SIGKILL stale cs_blob pages.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier (refuses com.apple.* system apps for safety)."},
+                    @"plist_patch": @{@"type": @"object", @"description": @"Dictionary of entitlement keys/values to merge into the existing entitlements (null removes a key)."}
+                },
+                @"required": @[@"bundle_id", @"plist_patch"]
+            }
+        },
+        @{
+            @"name": @"inject_dylib",
+            @"description": @"Copy a dylib into <App>.app/Frameworks/, sign it via mcp-ldid -S, create a reversible .mcp_orig backup of the app executable, insert LC_LOAD_DYLIB (@executable_path/Frameworks/<Name>.dylib) across all 64-bit Mach-O slices on a fresh vnode, and re-sign the app preserving entitlements.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"dylib_path": @{@"type": @"string", @"description": @"Absolute path on device to the .dylib to inject."},
+                    @"dest_name": @{@"type": @"string", @"description": @"Optional destination filename inside <App>.app/Frameworks/ (defaults to dylib_path basename)."}
+                },
+                @"required": @[@"bundle_id", @"dylib_path"]
+            }
+        },
+        @{
+            @"name": @"remove_dylib",
+            @"description": @"Remove a previously injected LC_LOAD_DYLIB command (and staged Frameworks dylib) from an app's Mach-O executable or restore its pristine .mcp_orig backup, writing to a fresh vnode and re-signing with preserved entitlements.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"dylib_name": @{@"type": @"string", @"description": @"Optional dylib name or load-path substring to remove. When omitted with restore_original=true (default when omitted), restores .mcp_orig."},
+                    @"restore_original": @{@"type": @"boolean", @"description": @"Restore pristine .mcp_orig backup directly (default: true when dylib_name is omitted, false otherwise)."},
+                    @"delete_staged": @{@"type": @"boolean", @"description": @"Delete matching staged file(s) from <App>.app/Frameworks/ (default: true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"inspect_macho",
+            @"description": @"Statically inspect a thin or universal Mach-O binary on device: CPU slices, UUIDs, encryption info (cryptid), segments/sections, LC_LOAD_DYLIB dependencies, LC_RPATHs, code-signature flags, and embedded entitlements.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute Mach-O binary path on device (optional if bundle_id is provided)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional installed app bundle identifier whose main executable should be inspected."}
+                }
+            }
+        },
+        @{
+            @"name": @"dump_classes",
+            @"description": @"Introspect the Objective-C runtime of a target app's remote process via Mach task_for_pid (walking TASK_DYLD_INFO -> app images -> __objc_classlist -> class_rw_t/class_ro_t with arm64e PAC stripping) to list classes, superclass, instance/class methods with type encodings, and ivars with offsets.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier."},
+                    @"filter": @{@"type": @"string", @"description": @"Optional case-insensitive class-name substring filter."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum classes to return (default 500, max 5000)."},
+                    @"include_system": @{@"type": @"boolean", @"description": @"Include system/shared-cache images loaded into the process (default false: app bundle images only)."},
+                    @"auto_launch": @{@"type": @"boolean", @"description": @"Automatically launch the target app if it is not currently running (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"get_keychain_item",
+            @"description": @"Query iOS Keychain items via SecItemCopyMatching in the wildcard-entitled mcp-keychain helper (with automatic app-scoped fallback when an app's explicit keychain-access-group requires exact entitlement matching).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"class": @{@"type": @"string", @"enum": @[@"genp", @"inet", @"cert", @"keys"], @"description": @"Keychain item class (default 'genp' = GenericPassword)."},
+                    @"service": @{@"type": @"string", @"description": @"Optional kSecAttrService filter."},
+                    @"account": @{@"type": @"string", @"description": @"Optional kSecAttrAccount filter."},
+                    @"label": @{@"type": @"string", @"description": @"Optional kSecAttrLabel filter."},
+                    @"server": @{@"type": @"string", @"description": @"Optional kSecAttrServer filter (for 'inet')."},
+                    @"access_group": @{@"type": @"string", @"description": @"Optional kSecAttrAccessGroup filter."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional app bundle_id to auto-resolve its primary keychain-access-group."},
+                    @"include_data": @{@"type": @"boolean", @"description": @"Decrypt and return secret value_utf8 / value_base64 (default true)."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum items to return (default 50, max 200)."}
+                }
+            }
+        },
+        @{
+            @"name": @"set_keychain_item",
+            @"description": @"Create or update an iOS Keychain item via SecItemAdd / SecItemUpdate in the entitled mcp-keychain helper (with automatic app-scoped fallback on -34018).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"class": @{@"type": @"string", @"enum": @[@"genp", @"inet"], @"description": @"Keychain item class (default 'genp')."},
+                    @"service": @{@"type": @"string", @"description": @"kSecAttrService (recommended for 'genp')."},
+                    @"account": @{@"type": @"string", @"description": @"kSecAttrAccount."},
+                    @"label": @{@"type": @"string", @"description": @"Optional kSecAttrLabel."},
+                    @"server": @{@"type": @"string", @"description": @"kSecAttrServer (for 'inet')."},
+                    @"access_group": @{@"type": @"string", @"description": @"Optional kSecAttrAccessGroup."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional app bundle_id to auto-resolve its primary keychain-access-group."},
+                    @"accessible": @{@"type": @"string", @"description": @"Optional accessibility constant suffix (default 'AfterFirstUnlock')."},
+                    @"data": @{@"type": @"string", @"description": @"UTF-8 secret string to store (optional if data_base64 is provided)."},
+                    @"data_base64": @{@"type": @"string", @"description": @"Base64-encoded secret bytes to store."}
+                }
+            }
+        },
+        @{
+            @"name": @"delete_keychain_item",
+            @"description": @"Delete matching iOS Keychain item(s) via SecItemDelete. Requires at least one selector (service, account, label, server, or access_group) to prevent accidental mass deletion.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"class": @{@"type": @"string", @"enum": @[@"genp", @"inet", @"cert", @"keys"], @"description": @"Keychain item class (default 'genp')."},
+                    @"service": @{@"type": @"string", @"description": @"kSecAttrService selector."},
+                    @"account": @{@"type": @"string", @"description": @"kSecAttrAccount selector."},
+                    @"label": @{@"type": @"string", @"description": @"kSecAttrLabel selector."},
+                    @"server": @{@"type": @"string", @"description": @"kSecAttrServer selector."},
+                    @"access_group": @{@"type": @"string", @"description": @"kSecAttrAccessGroup selector."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional app bundle_id to auto-resolve its primary keychain-access-group."}
+                }
+            }
+        },
+        @{
+            @"name": @"bypass_pinning",
+            @"description": @"Enable per-app TLS/SSL certificate pinning bypass by injecting the standalone arm64/arm64e libmcp_sslks.dylib (interposing SecTrustEvaluate*, SSLHandshake/SSLSetSessionOption, BoringSSL/Network.framework sec_protocol_options_set_verify_block, and NSURLSession ServerTrust delegates) and optionally relaunching the app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Terminate and relaunch the app so TLS hooks take effect immediately (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"restore_pinning",
+            @"description": @"Disable per-app TLS/SSL certificate pinning bypass by removing libmcp_sslks.dylib from the app's Mach-O and Frameworks directory and re-signing.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch the app after removing the bypass dylib (default false)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"symbolicate_crash",
+            @"description": @"Parse an on-device .ips (v2 two-JSON-object or v1 single-JSON) or legacy .crash report and symbolicate stack frames on-device without external dSYMs using Mach-O LC_SYMTAB, LC_DYLD_EXPORTS_TRIE, __objc_classlist method addresses, LC_FUNCTION_STARTS boundaries, and live dyld_shared_cache dladdr lookup.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"log_path": @{@"type": @"string", @"description": @"Absolute path to the .ips or .crash file (e.g. from get_crash_logs)."},
+                    @"all_threads": @{@"type": @"boolean", @"description": @"Symbolicate every thread instead of only the crashing/triggered thread (default false)."},
+                    @"max_frames": @{@"type": @"integer", @"description": @"Maximum frames per thread to symbolicate (default 64, max 256)."}
+                },
+                @"required": @[@"log_path"]
+            }
+        },
+        @{
+            @"name": @"start_capture",
+            @"description": @"Start per-app HTTP/HTTPS request & response capture by injecting standalone libmcp_netcap.dylib (NSURLProtocol + NSURLSessionConfiguration/sharedSession swizzles writing JSONL entries to <DataContainer>/tmp/.mcp_netcap.jsonl) and optionally relaunching the app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"clear_existing": @{@"type": @"boolean", @"description": @"Clear prior captured request log before starting (default true)."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch the target app so capture hooks activate immediately (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"stop_capture",
+            @"description": @"Stop per-app HTTP/HTTPS network capture by removing libmcp_netcap.dylib from the target app and re-signing cleanly (captured JSONL log remains readable via get_captured_requests unless clear_logs=true).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"clear_logs": @{@"type": @"boolean", @"description": @"Delete <DataContainer>/tmp/.mcp_netcap.jsonl as well (default false)."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch the app after removing capture dylib (default false)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"get_captured_requests",
+            @"description": @"Read captured HTTP/HTTPS request & response entries (method, URL, request/response headers, status code, duration_ms, body preview) recorded by start_capture for bundle_id.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum newest requests to return (default 100, max 1000)."},
+                    @"url_filter": @{@"type": @"string", @"description": @"Optional case-insensitive URL substring filter."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Truncate capture log after reading (default false)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"dump_il2cpp",
+            @"description": @"Inspect a Unity IL2CPP iOS app bundle: locate UnityFramework / libil2cpp.dylib and Data/Managed/Metadata/global-metadata.dat, validate magic 0xFAB11BAF and metadata versions 24..31, check FairPlay LC_ENCRYPTION_INFO_64 (cryptid), and dump assemblies/images, C# namespaces/classes, methods, fields, and string literals.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Installed Unity IL2CPP app bundle identifier."},
+                    @"image_filter": @{@"type": @"string", @"description": @"Optional assembly/image name substring filter (e.g. 'Assembly-CSharp')."},
+                    @"type_filter": @{@"type": @"string", @"description": @"Optional namespace/type name substring filter."},
+                    @"max_types": @{@"type": @"integer", @"description": @"Maximum type definitions to return in full detail (default 500, max 5000)."},
+                    @"max_string_literals": @{@"type": @"integer", @"description": @"Maximum string literals to extract (default 300, max 5000)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"query_sqlite",
+            @"description": @"Execute a read-only SQLite query (or inspect schema tables when sql is omitted) against any on-device .sqlite / .db / .sqlitedb file, automatically copying protected sandbox DB + WAL/SHM sidecars via root fallback when needed.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute path to the SQLite database on device."},
+                    @"sql": @{@"type": @"string", @"description": @"Read-only SQL statement (SELECT / PRAGMA / WITH / EXPLAIN). Omit to list schema tables and row counts."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum rows to return (default 200, max 2000)."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        // ---- Frida Gadget Stealth Lifecycle, Unix-Socket RPC & Anti-Detection Bypasses (Zero frida-server, Zero TCP) ----
+        @{
+            @"name": @"inject_frida_gadget",
+            @"description": @"Inject stealth-hardened Frida Gadget (from preserved /var/mobile/Library/ios-mcp/frida/gadget.dylib, never frida-server) into a user app: scrubs Gadget binary strings & LC_ID_DYLIB with a fresh random seed (#13), stages libmcp_stealth.dylib FIRST (thread-name laundering #14 + dyld/dladdr hiding #15 + 6 runtime anti-detection bypasses) and scrubbed Gadget SECOND under innocuous Apple-style names, writes a zero-TCP Unix-socket-only Gadget config + RPC boot script (#12), signs via mcp-ldid, and optionally launches the app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                    @"script_path": @{@"type": @"string", @"description": @"Optional absolute path on device to a custom Frida JS script to embed alongside the Unix-socket RPC bridge."},
+                    @"launch": @{@"type": @"boolean", @"description": @"Launch/relaunch the instrumented app and verify the AF_UNIX control socket comes online (default true)."},
+                    @"stealth_config": @{
+                        @"type": @"object",
+                        @"description": @"Optional initial stealth & anti-detection bypass flags (all default to true): thread_cloak, dyld_cloak, anti_debug, exception_cloak, fs_cloak, port_cloak, env_scheme_cloak, vm_integrity_cloak."
+                    }
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"remove_frida_gadget",
+            @"description": @"Cleanly remove both injected Frida Gadget and stealth companion LC_LOAD_DYLIB commands, delete staged Frameworks dylibs/.config/.js and container control socket/config files, restore/re-sign the app Mach-O on a fresh vnode, and verify the clean app launches.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"frida_rpc_call",
+            @"description": @"Evaluate a JavaScript expression or invoke rpc.exports[rpc_method](...rpc_args) inside a Gadget-instrumented app over its randomized AF_UNIX domain socket in <DataContainer>/tmp/.fc_<hex> (zero TCP listeners opened).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Instrumented app bundle identifier."},
+                    @"js_expr": @{@"type": @"string", @"description": @"JavaScript expression or async body to evaluate in the Frida GumJS runtime (optional if rpc_method is provided)."},
+                    @"rpc_method": @{@"type": @"string", @"description": @"Optional rpc.exports method name to invoke instead of js_expr."},
+                    @"rpc_args": @{@"type": @"array", @"description": @"Optional JSON arguments array passed to rpc.exports[rpc_method]."},
+                    @"timeout_ms": @{@"type": @"integer", @"description": @"Socket RPC timeout in milliseconds (default 10000, max 60000)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"scrub_gadget_binary",
+            @"description": @"Deterministically scrub Frida/Gum signature tokens ('gum-js-loop', 'frida', 'gmain', 'gdbus', and prefix-bounded 'gum') in __TEXT,__cstring and LC_ID_DYLIB across all slices of a Gadget dylib using same-length seeded alphabetic replacements without changing section sizes or offsets, then sign via mcp-ldid -S.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"dylib_path": @{@"type": @"string", @"description": @"Input dylib path (defaults to preserved /var/mobile/Library/ios-mcp/frida/gadget.dylib, which is never modified in place)."},
+                    @"output_path": @{@"type": @"string", @"description": @"Optional output path for the scrubbed & signed dylib (defaults to /var/mobile/Library/Caches/ios-mcp-work/gadget_scrubbed_<seed>.dylib)."},
+                    @"seed": @{@"type": @"integer", @"description": @"Optional deterministic 64-bit integer seed (random 64-bit seed generated if omitted)."}
+                }
+            }
+        },
+        @{
+            @"name": @"configure_frida_stealth",
+            @"description": @"Live-toggle stealth & runtime anti-detection bypasses (thread_cloak, dyld_cloak, anti_debug, exception_cloak, fs_cloak, port_cloak, env_scheme_cloak, vm_integrity_cloak) in <DataContainer>/tmp/.mcp_stealth_cfg.json for an app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier."},
+                    @"thread_cloak": @{@"type": @"boolean", @"description": @"Launder Frida/Gum thread names to Apple stock queue names."},
+                    @"dyld_cloak": @{@"type": @"boolean", @"description": @"Hide Gadget & Stealth dylibs from _dyld_* enumeration and dladdr."},
+                    @"anti_debug": @{@"type": @"boolean", @"description": @"Neutralize ptrace(PT_DENY_ATTACH), sysctl P_TRACED, getppid!=1, and isatty."},
+                    @"exception_cloak": @{@"type": @"boolean", @"description": @"Mask Gum Mach exception ports in task/thread_get_exception_ports."},
+                    @"fs_cloak": @{@"type": @"boolean", @"description": @"Return ENOENT on stat/access/open/fopen/opendir for jailbreak & Frida paths."},
+                    @"port_cloak": @{@"type": @"boolean", @"description": @"Return ECONNREFUSED on localhost TCP probes to Frida/debug ports 27042/27043/23946."},
+                    @"env_scheme_cloak": @{@"type": @"boolean", @"description": @"Scrub DYLD_INSERT_LIBRARIES from getenv and block jailbreak URL scheme probes in -[UIApplication canOpenURL:]."},
+                    @"vm_integrity_cloak": @{@"type": @"boolean", @"description": @"Mask RWX JIT/hook pages to R-X in vm_region_64 / mach_vm_region."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"get_frida_stealth_status",
+            @"description": @"Return current Frida stealth session metadata, active bypass configuration, laundered pthread table, hidden vs visible dyld image counts, and per-bypass interception counters written by libmcp_stealth.dylib.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"frida_anti_detection_probe",
+            @"description": @"Run a live in-process anti-detection self-audit over the Unix-socket Gadget channel, verifying zero leaked Frida/Gum thread names via task_threads + pthread_getname_np, zero TCP listeners, hidden dyld images/dladdr, and runtime anti-debug/fs/port/exception/VM bypasses.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Instrumented app bundle identifier."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"frida_list_modules",
+            @"description": @"List loaded Mach-O modules inside a Gadget-instrumented process via Gum Process.enumerateModules() alongside the external cloaked _dyld_image_count() view.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Instrumented app bundle identifier."},
+                    @"filter": @{@"type": @"string", @"description": @"Optional case-insensitive module name/path substring filter."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum modules to return (default 200, max 2000)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"frida_hook_objc",
+            @"description": @"Dynamically hook, inspect, or clear Objective-C method interceptors inside a Gadget-instrumented app over the AF_UNIX channel (recording call count, arguments, return values, and optional integer/boolean return override).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Instrumented app bundle identifier."},
+                    @"action": @{@"type": @"string", @"enum": @[@"install", @"get_events", @"list", @"clear"], @"description": @"Hook action (default 'install')."},
+                    @"class_name": @{@"type": @"string", @"description": @"Objective-C class name (required for 'install')."},
+                    @"selector": @{@"type": @"string", @"description": @"Objective-C selector, optionally prefixed with '+ ' for class methods or '- ' for instance methods (required for 'install')."},
+                    @"override_return_int": @{@"type": @"integer", @"description": @"Optional integer/BOOL return value override when action='install'."},
+                    @"max_events": @{@"type": @"integer", @"description": @"Maximum recorded call events to retain/return (default 50)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"frida_memory_scan",
+            @"description": @"Scan readable memory ranges inside a Gadget-instrumented process using Frida Gum Memory.scanSync pattern syntax (hex bytes with optional '??' wildcards, or UTF-8 text).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Instrumented app bundle identifier."},
+                    @"pattern": @{@"type": @"string", @"description": @"Frida Gum hex byte pattern (e.g. '4d 43 50 5f' or '48 ?? 6c 6c 6f'). Optional if text is provided."},
+                    @"text": @{@"type": @"string", @"description": @"Optional UTF-8 string automatically converted to a Gum hex byte pattern when pattern is omitted."},
+                    @"module_name": @{@"type": @"string", @"description": @"Optional loaded module name to restrict scan ranges."},
+                    @"protection": @{@"type": @"string", @"description": @"Minimum page protection filter (default 'r--')."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum matches to return (default 50, max 500)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
         },
         // ---- Reverse-engineering: app info, filesystem, logs ----
         @{
@@ -2787,8 +3290,65 @@ static NSString *MCPLogId(id reqId) {
         return [self executePlistValue:reqId args:args write:NO];
     } else if ([toolName isEqualToString:@"set_plist_value"]) {
         return [self executePlistValue:reqId args:args write:YES];
-    } else if ([toolName isEqualToString:@"read_memory"] || [toolName isEqualToString:@"write_memory"] || [toolName isEqualToString:@"search_memory"]) {
+    } else if ([toolName isEqualToString:@"read_memory"] ||
+               [toolName isEqualToString:@"write_memory"] ||
+               [toolName isEqualToString:@"search_memory"] ||
+               [toolName isEqualToString:@"list_memory_regions"]) {
         return [self executeMemory:reqId args:args operation:toolName];
+    } else if ([toolName isEqualToString:@"dump_entitlements"]) {
+        return [self executeDumpEntitlements:reqId args:args];
+    } else if ([toolName isEqualToString:@"patch_entitlements"]) {
+        return [self executePatchEntitlements:reqId args:args];
+    } else if ([toolName isEqualToString:@"inject_dylib"]) {
+        return [self executeInjectDylib:reqId args:args];
+    } else if ([toolName isEqualToString:@"remove_dylib"]) {
+        return [self executeRemoveDylib:reqId args:args];
+    } else if ([toolName isEqualToString:@"inspect_macho"]) {
+        return [self executeInspectMachO:reqId args:args];
+    } else if ([toolName isEqualToString:@"dump_classes"]) {
+        return [self executeDumpClasses:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_keychain_item"]) {
+        return [self executeKeychainOperation:reqId args:args action:@"get"];
+    } else if ([toolName isEqualToString:@"set_keychain_item"]) {
+        return [self executeKeychainOperation:reqId args:args action:@"set"];
+    } else if ([toolName isEqualToString:@"delete_keychain_item"]) {
+        return [self executeKeychainOperation:reqId args:args action:@"delete"];
+    } else if ([toolName isEqualToString:@"bypass_pinning"]) {
+        return [self executeSSLKillSwitch:reqId args:args enable:YES];
+    } else if ([toolName isEqualToString:@"restore_pinning"]) {
+        return [self executeSSLKillSwitch:reqId args:args enable:NO];
+    } else if ([toolName isEqualToString:@"symbolicate_crash"]) {
+        return [self executeSymbolicateCrash:reqId args:args];
+    } else if ([toolName isEqualToString:@"start_capture"]) {
+        return [self executeStartCapture:reqId args:args];
+    } else if ([toolName isEqualToString:@"stop_capture"]) {
+        return [self executeStopCapture:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_captured_requests"]) {
+        return [self executeGetCapturedRequests:reqId args:args];
+    } else if ([toolName isEqualToString:@"dump_il2cpp"]) {
+        return [self executeDumpIL2CPP:reqId args:args];
+    } else if ([toolName isEqualToString:@"query_sqlite"]) {
+        return [self executeQuerySQLite:reqId args:args];
+    } else if ([toolName isEqualToString:@"inject_frida_gadget"]) {
+        return [self executeInjectFridaGadget:reqId args:args];
+    } else if ([toolName isEqualToString:@"remove_frida_gadget"]) {
+        return [self executeRemoveFridaGadget:reqId args:args];
+    } else if ([toolName isEqualToString:@"frida_rpc_call"]) {
+        return [self executeFridaRPCCall:reqId args:args];
+    } else if ([toolName isEqualToString:@"scrub_gadget_binary"]) {
+        return [self executeScrubGadgetBinary:reqId args:args];
+    } else if ([toolName isEqualToString:@"configure_frida_stealth"]) {
+        return [self executeConfigureFridaStealth:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_frida_stealth_status"]) {
+        return [self executeGetFridaStealthStatus:reqId args:args];
+    } else if ([toolName isEqualToString:@"frida_anti_detection_probe"]) {
+        return [self executeFridaAntiDetectionProbe:reqId args:args];
+    } else if ([toolName isEqualToString:@"frida_list_modules"]) {
+        return [self executeFridaListModules:reqId args:args];
+    } else if ([toolName isEqualToString:@"frida_hook_objc"]) {
+        return [self executeFridaHookObjC:reqId args:args];
+    } else if ([toolName isEqualToString:@"frida_memory_scan"]) {
+        return [self executeFridaMemoryScan:reqId args:args];
     } else if ([toolName isEqualToString:@"write_file"]) {
         return [self executeWriteFile:reqId args:args];
     } else if ([toolName isEqualToString:@"get_syslog"]) {
@@ -4460,36 +5020,107 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
 }
 
 - (NSDictionary *)executeMemory:(id)reqId args:(NSDictionary *)args operation:(NSString *)operation {
-    NSString *addressText = nil, *paramError = nil;
+    NSString *paramError = nil;
     double pidValue = 0;
-    if (!MCPNumberFromArgs(args, @"pid", 0, YES, &pidValue, &paramError) ||
-        !MCPStringFromArgs(args, @"address", YES, &addressText, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
-    uint64_t address = 0;
-    if (pidValue <= 0 || pidValue > INT32_MAX || floor(pidValue) != pidValue || !MCPParseMemoryAddress(addressText, &address)) return [self mcpError:reqId code:-32602 message:@"Invalid pid or address"];
-    NSString *err = nil;
-    NSMutableArray<NSString *> *helperArgs = [NSMutableArray array];
-    NSString *pidText = [NSString stringWithFormat:@"%d", (int)pidValue];
-    if ([operation isEqualToString:@"read_memory"]) {
-        double length = 0;
-        if (!MCPNumberFromArgs(args, @"length", 0, YES, &length, &paramError) || length <= 0 || length > 1048576 || floor(length) != length) return [self mcpError:reqId code:-32602 message:paramError ?: @"Invalid length"];
-        [helperArgs addObjectsFromArray:@[@"read", pidText, addressText, [NSString stringWithFormat:@"%lu", (unsigned long)length]]];
-    } else {
-        NSString *encoded = nil;
-        if (!MCPStringFromArgs(args, @"data", YES, &encoded, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
-        NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
-        if (!data || !data.length || data.length > 65536) return [self mcpError:reqId code:-32602 message:@"Invalid base64 data or payload exceeds 65536 bytes"];
-        if ([operation isEqualToString:@"write_memory"]) [helperArgs addObjectsFromArray:@[@"write", pidText, addressText, encoded]];
-        else {
-            NSString *endText = nil;
-            uint64_t end = 0;
-            if (!MCPStringFromArgs(args, @"end", YES, &endText, &paramError) || !MCPParseMemoryAddress(endText, &end)) return [self mcpError:reqId code:-32602 message:paramError ?: @"Invalid end address"];
-            [helperArgs addObjectsFromArray:@[@"search", pidText, addressText, endText, encoded]];
-        }
+    NSString *bundleId = nil;
+    if (!MCPNumberFromArgs(args, @"pid", 0, NO, &pidValue, &paramError) ||
+        !MCPStringFromArgs(args, @"bundle_id", NO, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
     }
+    if (pidValue <= 0 && bundleId.length > 0) {
+        pid_t resolvedPid = [[AppManager sharedInstance] pidForBundleId:bundleId];
+        if (resolvedPid <= 0) {
+            return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Process for bundle_id '%@' is not running", bundleId] isError:YES];
+        }
+        pidValue = (double)resolvedPid;
+    }
+    if (pidValue <= 0 || pidValue > INT32_MAX || floor(pidValue) != pidValue) {
+        return [self mcpError:reqId code:-32602 message:@"Missing or invalid pid (provide a positive integer pid or running bundle_id)"];
+    }
+
+    NSString *pidText = [NSString stringWithFormat:@"%d", (int)pidValue];
+    NSMutableArray<NSString *> *helperArgs = [NSMutableArray array];
+
+    if ([operation isEqualToString:@"list_memory_regions"]) {
+        double limit = 256;
+        if (!MCPNumberFromArgs(args, @"limit", 256, NO, &limit, &paramError)) {
+            return [self mcpError:reqId code:-32602 message:paramError];
+        }
+        if (limit < 1) limit = 1;
+        if (limit > 4096) limit = 4096;
+        [helperArgs addObjectsFromArray:@[@"regions", pidText, [NSString stringWithFormat:@"%lu", (unsigned long)limit]]];
+    } else if ([operation isEqualToString:@"read_memory"]) {
+        NSString *addressText = nil;
+        double length = 0;
+        uint64_t address = 0;
+        if (!MCPStringFromArgs(args, @"address", YES, &addressText, &paramError) ||
+            !MCPNumberFromArgs(args, @"length", 0, YES, &length, &paramError)) {
+            return [self mcpError:reqId code:-32602 message:paramError];
+        }
+        if (!MCPParseMemoryAddress(addressText, &address) || length <= 0 || length > 1048576 || floor(length) != length) {
+            return [self mcpError:reqId code:-32602 message:@"Invalid address or length (1..1048576)"];
+        }
+        [helperArgs addObjectsFromArray:@[@"read", pidText, addressText, [NSString stringWithFormat:@"%lu", (unsigned long)length]]];
+    } else if ([operation isEqualToString:@"write_memory"]) {
+        NSString *addressText = nil;
+        NSString *encoded = nil;
+        uint64_t address = 0;
+        if (!MCPStringFromArgs(args, @"address", YES, &addressText, &paramError) ||
+            !MCPStringFromArgs(args, @"data", YES, &encoded, &paramError)) {
+            return [self mcpError:reqId code:-32602 message:paramError];
+        }
+        if (!MCPParseMemoryAddress(addressText, &address)) {
+            return [self mcpError:reqId code:-32602 message:@"Invalid address"];
+        }
+        NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+        if (!data || !data.length || data.length > 65536) {
+            return [self mcpError:reqId code:-32602 message:@"Invalid base64 data or payload exceeds 65536 bytes"];
+        }
+        [helperArgs addObjectsFromArray:@[@"write", pidText, addressText, encoded]];
+    } else {
+        NSString *addressText = nil;
+        NSString *endText = nil;
+        NSString *encoded = nil;
+        NSString *plainText = nil;
+        if (!MCPStringFromArgs(args, @"address", NO, &addressText, &paramError) ||
+            !MCPStringFromArgs(args, @"end", NO, &endText, &paramError) ||
+            !MCPStringFromArgs(args, @"data", NO, &encoded, &paramError) ||
+            !MCPStringFromArgs(args, @"text", NO, &plainText, &paramError)) {
+            return [self mcpError:reqId code:-32602 message:paramError];
+        }
+        if (!addressText.length) addressText = @"0x0";
+        if (!endText.length) endText = @"0x7fffffffffff";
+        uint64_t address = 0, end = 0;
+        if (!MCPParseMemoryAddress(addressText, &address) || !MCPParseMemoryAddress(endText, &end)) {
+            return [self mcpError:reqId code:-32602 message:@"Invalid address or end address"];
+        }
+        if (!encoded.length && plainText.length > 0) {
+            encoded = [[plainText dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+        }
+        if (!encoded.length) {
+            return [self mcpError:reqId code:-32602 message:@"Missing required parameter: data (base64) or text"];
+        }
+        NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+        if (!data || !data.length || data.length > 65536) {
+            return [self mcpError:reqId code:-32602 message:@"Invalid base64 data or payload exceeds 65536 bytes"];
+        }
+        [helperArgs addObjectsFromArray:@[@"search", pidText, addressText, endText, encoded]];
+    }
+
     NSString *output = nil;
+    NSString *err = nil;
     int exitCode = -1;
-    NSString *helperPath = MCPResolvedJailbreakPath(@"/usr/libexec/ios-mcp/mcp-memory");
-    BOOL launched = MCPRunProcess(helperPath, helperArgs, MCPJailbreakEnvironment(), 30, 2 * 1024 * 1024, &output, &exitCode, &err);
+    BOOL launched = MCPRunRootProcess(@"/usr/libexec/ios-mcp/mcp-memory",
+                                      helperArgs,
+                                      30.0,
+                                      4 * 1024 * 1024,
+                                      &output,
+                                      &exitCode,
+                                      &err);
+    if (!launched) {
+        NSString *helperPath = MCPResolvedJailbreakPath(@"/usr/libexec/ios-mcp/mcp-memory");
+        launched = MCPRunProcess(helperPath, helperArgs, MCPJailbreakEnvironment(), 30.0, 4 * 1024 * 1024, &output, &exitCode, &err);
+    }
     if (!launched) return [self mcpSuccess:reqId text:(err ?: @"Memory helper could not be launched") isError:YES];
     NSData *responseData = [output dataUsingEncoding:NSUTF8StringEncoding];
     id response = responseData ? [NSJSONSerialization JSONObjectWithData:responseData options:0 error:NULL] : nil;
@@ -4497,6 +5128,456 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     if (exitCode != 0 || ![response[@"ok"] boolValue]) return [self mcpSuccess:reqId text:([response[@"error"] isKindOfClass:[NSString class]] ? response[@"error"] : @"Memory helper failed") isError:YES];
     NSDictionary *result = [response[@"result"] isKindOfClass:[NSDictionary class]] ? response[@"result"] : nil;
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"Memory operation failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDumpEntitlements:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[EntitlementManager sharedInstance] dumpEntitlementsForBundleId:bundleId error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to dump entitlements") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executePatchEntitlements:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    id patchObj = args[@"plist_patch"] ?: args[@"patch"];
+    if (![patchObj isKindOfClass:[NSDictionary class]]) {
+        return [self mcpError:reqId code:-32602 message:@"Missing or invalid parameter: plist_patch (expected dictionary)"];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[EntitlementManager sharedInstance] patchEntitlementsForBundleId:bundleId
+                                                                                       patch:(NSDictionary *)patchObj
+                                                                                       error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to patch entitlements") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeInjectDylib:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *dylibPath = nil, *destName = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"dylib_path", YES, &dylibPath, &paramError) ||
+        !MCPStringFromArgs(args, @"dest_name", NO, &destName, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[DylibInjectManager sharedInstance] injectDylibForBundleId:bundleId
+                                                                             dylibPath:dylibPath
+                                                                              destName:destName
+                                                                                 error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to inject dylib") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeRemoveDylib:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *dylibName = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"dylib_name", NO, &dylibName, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    BOOL defaultRestore = (dylibName.length == 0);
+    BOOL restoreOriginal = defaultRestore;
+    BOOL deleteStaged = YES;
+    if (!MCPBoolFromArgs(args, @"restore_original", defaultRestore, &restoreOriginal, &paramError) ||
+        !MCPBoolFromArgs(args, @"delete_staged", YES, &deleteStaged, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[DylibInjectManager sharedInstance] removeDylibForBundleId:bundleId
+                                                                             dylibName:dylibName
+                                                                       restoreOriginal:restoreOriginal
+                                                                          deleteStaged:deleteStaged
+                                                                                 error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to remove dylib") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeInspectMachO:(id)reqId args:(NSDictionary *)args {
+    NSString *path = nil, *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"path", NO, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"bundle_id", NO, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (!path.length && bundleId.length > 0) {
+        NSString *appErr = nil;
+        NSDictionary *info = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:&appErr];
+        path = [info[@"executable_path"] isKindOfClass:[NSString class]] ? info[@"executable_path"] : nil;
+        if (!path.length) {
+            return [self mcpSuccess:reqId text:(appErr ?: @"Could not locate executable_path for bundle_id") isError:YES];
+        }
+    }
+    if (!path.length) {
+        return [self mcpError:reqId code:-32602 message:@"Missing required parameter: path or bundle_id"];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[DylibInjectManager sharedInstance] inspectMachOAtPath:path error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to inspect Mach-O") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDumpClasses:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *filter = nil, *paramError = nil;
+    double limit = 500;
+    BOOL includeSystem = NO;
+    BOOL autoLaunch = YES;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"filter", NO, &filter, &paramError) ||
+        !MCPNumberFromArgs(args, @"limit", 500, NO, &limit, &paramError) ||
+        !MCPBoolFromArgs(args, @"include_system", NO, &includeSystem, &paramError) ||
+        !MCPBoolFromArgs(args, @"auto_launch", YES, &autoLaunch, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 5000) limit = 5000;
+    NSString *err = nil;
+    NSDictionary *result = [[ClassDumpManager sharedInstance] dumpClassesForBundleId:bundleId
+                                                                              filter:filter
+                                                                               limit:(NSUInteger)limit
+                                                                       includeSystem:includeSystem
+                                                                          autoLaunch:autoLaunch
+                                                                               error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to dump Objective-C classes") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeKeychainOperation:(id)reqId args:(NSDictionary *)args action:(NSString *)action {
+    NSString *err = nil;
+    NSDictionary *result = nil;
+    if ([action isEqualToString:@"get"]) {
+        result = [[KeychainManager sharedInstance] getKeychainItemsWithArgs:args error:&err];
+    } else if ([action isEqualToString:@"set"]) {
+        result = [[KeychainManager sharedInstance] setKeychainItemWithArgs:args error:&err];
+    } else if ([action isEqualToString:@"delete"]) {
+        result = [[KeychainManager sharedInstance] deleteKeychainItemWithArgs:args error:&err];
+    } else {
+        return [self mcpError:reqId code:-32602 message:@"Unknown keychain action"];
+    }
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Keychain operation failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSSLKillSwitch:(id)reqId args:(NSDictionary *)args enable:(BOOL)enable {
+    NSString *bundleId = nil, *paramError = nil;
+    BOOL relaunch = enable ? YES : NO;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPBoolFromArgs(args, @"relaunch", relaunch, &relaunch, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = enable
+        ? [[SSLKillSwitchManager sharedInstance] bypassPinningForBundleId:bundleId relaunch:relaunch error:&err]
+        : [[SSLKillSwitchManager sharedInstance] restorePinningForBundleId:bundleId relaunch:relaunch error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"SSL Kill Switch operation failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSymbolicateCrash:(id)reqId args:(NSDictionary *)args {
+    NSString *logPath = nil, *altPath = nil, *paramError = nil;
+    BOOL allThreads = NO;
+    double maxFrames = 64;
+    if (!MCPStringFromArgs(args, @"log_path", NO, &logPath, &paramError) ||
+        !MCPStringFromArgs(args, @"path", NO, &altPath, &paramError) ||
+        !MCPBoolFromArgs(args, @"all_threads", NO, &allThreads, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_frames", 64, NO, &maxFrames, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (!logPath.length) logPath = altPath;
+    if (!logPath.length) {
+        return [self mcpError:reqId code:-32602 message:@"Missing required parameter: log_path"];
+    }
+    if (maxFrames < 1) maxFrames = 1;
+    if (maxFrames > 256) maxFrames = 256;
+    NSString *err = nil;
+    NSDictionary *result = [[CrashSymbolicateManager sharedInstance] symbolicateCrashAtPath:logPath
+                                                                                 allThreads:allThreads
+                                                                                  maxFrames:(NSUInteger)maxFrames
+                                                                                      error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Crash symbolication failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeStartCapture:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    BOOL clearExisting = YES;
+    BOOL relaunch = YES;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPBoolFromArgs(args, @"clear_existing", YES, &clearExisting, &paramError) ||
+        !MCPBoolFromArgs(args, @"relaunch", YES, &relaunch, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] startCaptureForBundleId:bundleId
+                                                                             clearExisting:clearExisting
+                                                                                  relaunch:relaunch
+                                                                                     error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to start network capture") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeStopCapture:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    BOOL clearLogs = NO;
+    BOOL relaunch = NO;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPBoolFromArgs(args, @"clear_logs", NO, &clearLogs, &paramError) ||
+        !MCPBoolFromArgs(args, @"relaunch", NO, &relaunch, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] stopCaptureForBundleId:bundleId
+                                                                                clearLogs:clearLogs
+                                                                                 relaunch:relaunch
+                                                                                    error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to stop network capture") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeGetCapturedRequests:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *urlFilter = nil, *paramError = nil;
+    double limit = 100;
+    BOOL clear = NO;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"url_filter", NO, &urlFilter, &paramError) ||
+        !MCPNumberFromArgs(args, @"limit", 100, NO, &limit, &paramError) ||
+        !MCPBoolFromArgs(args, @"clear", NO, &clear, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 1000) limit = 1000;
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] getCapturedRequestsForBundleId:bundleId
+                                                                                            limit:(NSUInteger)limit
+                                                                                        urlFilter:urlFilter
+                                                                                            clear:clear
+                                                                                            error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to read captured requests") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDumpIL2CPP:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *imageFilter = nil, *typeFilter = nil, *paramError = nil;
+    double maxTypes = 500;
+    double maxStringLiterals = 300;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"image_filter", NO, &imageFilter, &paramError) ||
+        !MCPStringFromArgs(args, @"type_filter", NO, &typeFilter, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_types", 500, NO, &maxTypes, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_string_literals", 300, NO, &maxStringLiterals, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (maxTypes < 1) maxTypes = 1;
+    if (maxTypes > 5000) maxTypes = 5000;
+    if (maxStringLiterals < 0) maxStringLiterals = 0;
+    if (maxStringLiterals > 5000) maxStringLiterals = 5000;
+    NSString *err = nil;
+    NSDictionary *result = [[IL2CPPManager sharedInstance] dumpIL2CPPForBundleId:bundleId
+                                                                     imageFilter:imageFilter
+                                                                      typeFilter:typeFilter
+                                                                        maxTypes:(NSUInteger)maxTypes
+                                                               maxStringLiterals:(NSUInteger)maxStringLiterals
+                                                                           error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to dump IL2CPP metadata") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeQuerySQLite:(id)reqId args:(NSDictionary *)args {
+    NSString *path = nil, *sql = nil, *paramError = nil;
+    double limit = 200;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"sql", NO, &sql, &paramError) ||
+        !MCPNumberFromArgs(args, @"limit", 200, NO, &limit, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 2000) limit = 2000;
+    NSString *err = nil;
+    NSDictionary *result = [[SQLiteQueryManager sharedInstance] queryDatabaseAtPath:path
+                                                                                sql:sql
+                                                                              limit:(NSUInteger)limit
+                                                                              error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"SQLite query failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeInjectFridaGadget:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *scriptPath = nil, *paramError = nil;
+    BOOL launch = YES;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"script_path", NO, &scriptPath, &paramError) ||
+        !MCPBoolFromArgs(args, @"launch", YES, &launch, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSDictionary *stealthConfig = [args[@"stealth_config"] isKindOfClass:[NSDictionary class]] ? args[@"stealth_config"] : nil;
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] injectFridaGadgetForBundleId:bundleId
+                                                                            scriptPath:scriptPath
+                                                                         stealthConfig:stealthConfig
+                                                                                launch:launch
+                                                                                 error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to inject Frida Gadget") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeRemoveFridaGadget:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] removeFridaGadgetForBundleId:bundleId error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to remove Frida Gadget") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFridaRPCCall:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *jsExpr = nil, *rpcMethod = nil, *paramError = nil;
+    double timeoutMs = 10000;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"js_expr", NO, &jsExpr, &paramError) ||
+        !MCPStringFromArgs(args, @"rpc_method", NO, &rpcMethod, &paramError) ||
+        !MCPNumberFromArgs(args, @"timeout_ms", 10000, NO, &timeoutMs, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (!jsExpr.length && !rpcMethod.length) {
+        return [self mcpError:reqId code:-32602 message:@"Provide js_expr or rpc_method"];
+    }
+    NSArray *rpcArgs = [args[@"rpc_args"] isKindOfClass:[NSArray class]] ? args[@"rpc_args"] : nil;
+    if (timeoutMs < 500) timeoutMs = 500;
+    if (timeoutMs > 60000) timeoutMs = 60000;
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] rpcCallForBundleId:bundleId
+                                                                      jsExpr:jsExpr
+                                                                   rpcMethod:rpcMethod
+                                                                     rpcArgs:rpcArgs
+                                                                   timeoutMs:(NSInteger)timeoutMs
+                                                                       error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Frida RPC call failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeScrubGadgetBinary:(id)reqId args:(NSDictionary *)args {
+    NSString *dylibPath = nil, *outputPath = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"dylib_path", NO, &dylibPath, &paramError) ||
+        !MCPStringFromArgs(args, @"output_path", NO, &outputPath, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSNumber *seedNumber = nil;
+    id rawSeed = args[@"seed"];
+    if ([rawSeed isKindOfClass:[NSNumber class]]) {
+        seedNumber = (NSNumber *)rawSeed;
+    } else if ([rawSeed isKindOfClass:[NSString class]] && [(NSString *)rawSeed length] > 0) {
+        uint64_t parsedSeed = 0;
+        if (!MCPParseMemoryAddress((NSString *)rawSeed, &parsedSeed)) {
+            return [self mcpError:reqId code:-32602 message:@"Invalid seed: expected 64-bit integer or hex string"];
+        }
+        seedNumber = @(parsedSeed);
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] scrubGadgetBinaryAtPath:dylibPath
+                                                                       outputPath:outputPath
+                                                                             seed:seedNumber
+                                                                            error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to scrub Gadget binary") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeConfigureFridaStealth:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSDictionary *options = [args[@"options"] isKindOfClass:[NSDictionary class]] ? args[@"options"] : args;
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] configureStealthForBundleId:bundleId
+                                                                              options:options
+                                                                                error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to configure Frida stealth") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeGetFridaStealthStatus:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] stealthStatusForBundleId:bundleId error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to read Frida stealth status") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFridaAntiDetectionProbe:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] antiDetectionProbeForBundleId:bundleId error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Frida anti-detection probe failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFridaListModules:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *filter = nil, *paramError = nil;
+    double limit = 200;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"filter", NO, &filter, &paramError) ||
+        !MCPNumberFromArgs(args, @"limit", 200, NO, &limit, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 2000) limit = 2000;
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] listModulesForBundleId:bundleId
+                                                                          filter:filter
+                                                                           limit:(NSUInteger)limit
+                                                                           error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"frida_list_modules failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFridaHookObjC:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] hookObjCForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"frida_hook_objc failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFridaMemoryScan:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *pattern = nil, *plainText = nil, *moduleName = nil, *altModule = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"pattern", NO, &pattern, &paramError) ||
+        !MCPStringFromArgs(args, @"text", NO, &plainText, &paramError) ||
+        !MCPStringFromArgs(args, @"module_name", NO, &moduleName, &paramError) ||
+        !MCPStringFromArgs(args, @"module", NO, &altModule, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSMutableDictionary *scanArgs = [NSMutableDictionary dictionaryWithDictionary:args];
+    if (!pattern.length && plainText.length > 0) {
+        NSData *utf8 = [plainText dataUsingEncoding:NSUTF8StringEncoding];
+        const uint8_t *bytes = (const uint8_t *)utf8.bytes;
+        NSMutableArray<NSString *> *hexTokens = [NSMutableArray arrayWithCapacity:utf8.length];
+        for (NSUInteger i = 0; i < utf8.length; i++) {
+            [hexTokens addObject:[NSString stringWithFormat:@"%02x", bytes[i]]];
+        }
+        scanArgs[@"pattern"] = [hexTokens componentsJoinedByString:@" "];
+    }
+    if (!moduleName.length && altModule.length > 0) {
+        scanArgs[@"module_name"] = altModule;
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FridaManager sharedInstance] memoryScanForBundleId:bundleId args:scanArgs error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"frida_memory_scan failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 

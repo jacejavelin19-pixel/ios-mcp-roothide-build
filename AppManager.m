@@ -14,6 +14,7 @@
 #import <string.h>
 #import <sys/stat.h>
 #import <sys/wait.h>
+#include <sys/sysctl.h>
 #import <unistd.h>
 
 extern char **environ;
@@ -125,7 +126,7 @@ static NSString *MCPSpringBoardKillallPath(void) {
         @"/usr/bin/killall",
         @"/bin/killall"
     ]) {
-        if (candidate.length && [fm isExecutableFileAtPath:candidate]) {
+        if (candidate.length && MCPIsExecutableFile(candidate)) {
             return candidate;
         }
     }
@@ -377,7 +378,7 @@ static BOOL MCPRunDpkgWithPrivileges(NSArray<NSString *> *dpkgArguments,
     int helperExitCode = -1;
     BOOL helperFinished = NO;
 
-    if ([fm isExecutableFileAtPath:mcpRootPath]) {
+    if (MCPIsExecutableFile(mcpRootPath)) {
         helperFinished = MCPRunProcess(mcpRootPath,
                                        helperArguments,
                                        MCPJailbreakEnvironment(),
@@ -408,7 +409,7 @@ static BOOL MCPRunDpkgWithPrivileges(NSArray<NSString *> *dpkgArguments,
     NSString *sudoPath = MCPResolvedJailbreakPath(@"/usr/bin/sudo");
     NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
     NSString *dpkgPath = MCPResolvedJailbreakPath(@"/usr/bin/dpkg");
-    if (![fm isExecutableFileAtPath:sudoPath]) {
+    if (!MCPIsExecutableFile(sudoPath)) {
         if (output) *output = helperOutput ?: @"";
         if (exitCode) *exitCode = helperExitCode;
         if (errorMessage) {
@@ -416,10 +417,10 @@ static BOOL MCPRunDpkgWithPrivileges(NSArray<NSString *> *dpkgArguments,
         }
         return helperFinished;
     }
-    if (![fm isExecutableFileAtPath:shellPath]) {
+    if (!MCPIsExecutableFile(shellPath)) {
         shellPath = @"/bin/sh";
     }
-    if (![fm isExecutableFileAtPath:dpkgPath]) {
+    if (!MCPIsExecutableFile(dpkgPath)) {
         if (output) *output = helperOutput ?: @"";
         if (exitCode) *exitCode = helperExitCode;
         if (errorMessage) *errorMessage = @"dpkg executable not found";
@@ -480,7 +481,7 @@ static BOOL MCPWriteFileToShellPath(NSString *sourcePath, NSString *destPath, NS
     }
 
     NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
-    if (![[NSFileManager defaultManager] isExecutableFileAtPath:shellPath]) {
+    if (!MCPIsExecutableFile(shellPath)) {
         shellPath = @"/bin/sh";
     }
 
@@ -601,7 +602,7 @@ static BOOL MCPWriteFileToShellPath(NSString *sourcePath, NSString *destPath, NS
 static void MCPRemoveShellPath(NSString *path) {
     if (!path.length) return;
     NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
-    if (![[NSFileManager defaultManager] isExecutableFileAtPath:shellPath]) {
+    if (!MCPIsExecutableFile(shellPath)) {
         shellPath = @"/bin/sh";
     }
     NSString *command = [NSString stringWithFormat:@"rm -f %@", MCPShellQuote(path)];
@@ -1492,17 +1493,17 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
 
     NSMutableArray<NSString *> *ldidCandidates = [NSMutableArray array];
     NSString *bundledLdidPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-ldid");
-    if ([NSFileManager.defaultManager isExecutableFileAtPath:bundledLdidPath]) {
+    if (MCPIsExecutableFile(bundledLdidPath)) {
         [ldidCandidates addObject:bundledLdidPath];
     }
     NSString *mcpRootPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
     NSString *sudoPath = MCPResolvedJailbreakPath(@"/usr/bin/sudo");
     NSString *chmodPath = MCPResolvedJailbreakPath(@"/bin/chmod");
     NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
-    if (![NSFileManager.defaultManager isExecutableFileAtPath:chmodPath]) {
+    if (!MCPIsExecutableFile(chmodPath)) {
         chmodPath = MCPResolvedJailbreakPath(@"/usr/bin/chmod");
     }
-    if (![NSFileManager.defaultManager isExecutableFileAtPath:shellPath]) {
+    if (!MCPIsExecutableFile(shellPath)) {
         shellPath = @"/bin/sh";
     }
     if (ldidCandidates.count == 0) {
@@ -1510,13 +1511,13 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         if (error) *error = @"mcp-ldid not found";
         return NO;
     }
-    if (![NSFileManager.defaultManager isExecutableFileAtPath:mcpRootPath]) {
+    if (!MCPIsExecutableFile(mcpRootPath)) {
         APP_LOG(@"mcp-root not found, skipping fakesign for %@", bundleId);
     }
 
-    BOOL sudoAvailable = [NSFileManager.defaultManager isExecutableFileAtPath:sudoPath];
+    BOOL sudoAvailable = MCPIsExecutableFile(sudoPath);
     NSString *sudoPassword = sudoAvailable ? MCPConfiguredSudoPassword() : nil;
-    if (![NSFileManager.defaultManager isExecutableFileAtPath:mcpRootPath] && !sudoAvailable) {
+    if (!MCPIsExecutableFile(mcpRootPath) && !sudoAvailable) {
         if (error) *error = @"No privileged helper available";
         return NO;
     }
@@ -1546,7 +1547,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         if (commandExitCode) *commandExitCode = -1;
         if (commandError) *commandError = nil;
 
-        if ([NSFileManager.defaultManager isExecutableFileAtPath:mcpRootPath]) {
+        if (MCPIsExecutableFile(mcpRootPath)) {
             NSMutableArray<NSString *> *argv = [NSMutableArray arrayWithObject:toolPath];
             if (arguments.count > 0) {
                 [argv addObjectsFromArray:arguments];
@@ -1758,7 +1759,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     NSString *bootstrapAppBundlePath = MCPBootstrapArgumentPath(appBundlePath);
     NSString *permissionFailure = nil;
 
-    if (![fm isExecutableFileAtPath:chmodPath]) {
+    if (!MCPIsExecutableFile(chmodPath)) {
         if (error) *error = @"chmod not found";
         return NO;
     }
@@ -1920,7 +1921,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
 
 #ifdef MCP_ROOTHIDE
     NSString *mcpRootPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
-    BOOL canUseMcpRoot = [fm isExecutableFileAtPath:mcpRootPath];
+    BOOL canUseMcpRoot = MCPIsExecutableFile(mcpRootPath);
     NSString *rootHelperPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-roothelper");
     if ([fm fileExistsAtPath:rootHelperPath]) {
         NSString *launchPath = canUseMcpRoot ? mcpRootPath : rootHelperPath;
@@ -2076,7 +2077,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
 - (NSString *)bundleIdFromIPA:(NSString *)ipaPath {
 #ifdef MCP_ROOTHIDE
     NSString *rootHelperPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-roothelper");
-    if ([[NSFileManager defaultManager] isExecutableFileAtPath:rootHelperPath]) {
+    if (MCPIsExecutableFile(rootHelperPath)) {
         NSString *output = nil;
         NSString *spawnError = nil;
         int exitCode = -1;
@@ -2104,7 +2105,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
 #endif
 
     NSString *appinstPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-appinst");
-    if ([[NSFileManager defaultManager] isExecutableFileAtPath:appinstPath]) {
+    if (MCPIsExecutableFile(appinstPath)) {
         NSString *output = nil;
         NSString *spawnError = nil;
         int exitCode = -1;
@@ -2131,7 +2132,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     }
 
     NSString *unzipPath = MCPResolvedJailbreakPath(@"/usr/bin/unzip");
-    if (![[NSFileManager defaultManager] isExecutableFileAtPath:unzipPath]) {
+    if (!MCPIsExecutableFile(unzipPath)) {
         APP_LOG(@"unzip not found, skipping bundle ID extraction for %@", MCPAppLogSafePath(ipaPath));
         return nil;
     }
@@ -2361,8 +2362,102 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         if (error) *error = failure ?: @"Failed to read app info";
         return nil;
     }
+    pid_t runningPid = [self pidForBundleId:bundleId];
+    if (runningPid > 0) {
+        NSMutableDictionary *enriched = [result mutableCopy];
+        enriched[@"pid"] = @(runningPid);
+        enriched[@"running"] = @YES;
+        return [enriched copy];
+    }
     return result;
 }
+
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+- (pid_t)pidForBundleId:(NSString *)bundleId {
+    if (!bundleId.length) return 0;
+
+    // 1. Check SpringBoard SBApplication processState.pid
+    __block pid_t sbPid = 0;
+    dispatch_block_t sbBlock = ^{
+        Class SBAppCtrl = objc_getClass("SBApplicationController");
+        if (!SBAppCtrl) return;
+        id appCtrl = [SBAppCtrl performSelector:@selector(sharedInstance)];
+        if (!appCtrl || ![appCtrl respondsToSelector:@selector(applicationWithBundleIdentifier:)]) return;
+        id sbApp = MCPAppMsgSendObjectArg(appCtrl, @selector(applicationWithBundleIdentifier:), bundleId);
+        if (!sbApp) return;
+        if ([sbApp respondsToSelector:@selector(processState)]) {
+            id procState = MCPAppMsgSendObject(sbApp, @selector(processState));
+            if (procState && [procState respondsToSelector:@selector(pid)]) {
+                int p = ((int (*)(id, SEL))objc_msgSend)(procState, @selector(pid));
+                if (p > 0) sbPid = (pid_t)p;
+            }
+        }
+    };
+    if ([NSThread isMainThread]) {
+        sbBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), sbBlock);
+    }
+    if (sbPid > 0 && kill(sbPid, 0) == 0) {
+        return sbPid;
+    }
+
+    // 2. Check frontmostApplicationInfo
+    NSDictionary *front = [[AccessibilityManager sharedInstance] frontmostApplicationInfo];
+    if ([front isKindOfClass:[NSDictionary class]] && [front[@"bundleId"] isEqualToString:bundleId]) {
+        pid_t fp = (pid_t)[front[@"pid"] intValue];
+        if (fp > 0 && kill(fp, 0) == 0) return fp;
+    }
+
+    // 3. Fallback: match running process path against executable_path via sysctl + proc_pidpath
+    NSString *execPath = nil;
+    NSString *bundlePath = [self appBundlePathForBundleId:bundleId mainExecutablePath:&execPath];
+    if (!execPath.length && bundlePath.length) {
+        NSDictionary *info = [self appInfoForBundleId:bundleId error:nil];
+        execPath = info[@"executable_path"];
+    }
+    if (execPath.length) {
+        char realExec[PATH_MAX];
+        NSString *canonExec = realpath(execPath.fileSystemRepresentation, realExec)
+            ? [NSString stringWithUTF8String:realExec]
+            : [execPath stringByStandardizingPath];
+        NSString *execName = execPath.lastPathComponent;
+
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+        size_t size = 0;
+        if (sysctl(mib, 3, NULL, &size, NULL, 0) == 0 && size > 0) {
+            size += sizeof(struct kinfo_proc) * 16;
+            struct kinfo_proc *procs = malloc(size);
+            if (procs) {
+                if (sysctl(mib, 3, procs, &size, NULL, 0) == 0) {
+                    size_t count = size / sizeof(struct kinfo_proc);
+                    for (size_t i = 0; i < count; i++) {
+                        pid_t p = procs[i].kp_proc.p_pid;
+                        if (p <= 1) continue;
+                        char pbuf[4096];
+                        int plen = proc_pidpath(p, pbuf, sizeof(pbuf));
+                        if (plen > 0) {
+                            char realProc[PATH_MAX];
+                            NSString *procStr = realpath(pbuf, realProc)
+                                ? [NSString stringWithUTF8String:realProc]
+                                : [[NSString stringWithUTF8String:pbuf] stringByStandardizingPath];
+                            if ([procStr isEqualToString:canonExec] || [procStr hasSuffix:[@"/" stringByAppendingString:execName]]) {
+                                if (bundlePath.length == 0 || [procStr containsString:bundlePath.lastPathComponent]) {
+                                    free(procs);
+                                    return p;
+                                }
+                            }
+                        }
+                    }
+                }
+                free(procs);
+            }
+        }
+    }
+    return 0;
+}
+
 
 - (BOOL)debPackageInstalled:(NSString *)packageId statusOutput:(NSString **)statusOutput error:(NSString **)error {
     NSString *output = nil;

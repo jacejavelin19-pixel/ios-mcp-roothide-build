@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
+JB_BASE=""
+if [ -n "$DPKG_ROOT" ] && [ -d "$DPKG_ROOT/usr/bin" ]; then
+    JB_BASE="$DPKG_ROOT"
+elif [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr/bin" ]; then
+    JB_BASE="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+fi
+
+fix_perms() {
+    base="$1"
+    if [ -f "${base}/usr/bin/mcp-root" ]; then
+        chown 0:0 "${base}/usr/bin/mcp-root" 2>/dev/null || true
+        chmod 4755 "${base}/usr/bin/mcp-root" 2>/dev/null || true
+    fi
+    for bin in mcp-ldid mcp-roothelper mcp-appinst mcp-logreader; do
+        if [ -f "${base}/usr/bin/${bin}" ]; then
+            chown 0:0 "${base}/usr/bin/${bin}" 2>/dev/null || true
+            chmod 0755 "${base}/usr/bin/${bin}" 2>/dev/null || true
+        fi
+    done
+    for helper in mcp-memory mcp-keychain mcp-appmod mcp-ocr-worker; do
+        if [ -f "${base}/usr/libexec/ios-mcp/${helper}" ]; then
+            chown 0:0 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true
+            chmod 0755 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true
+        fi
+    done
+}
+
+if [ -n "$JB_BASE" ]; then
+    fix_perms "$JB_BASE"
+fi
+fix_perms ""
+
+exit 0

@@ -1,15 +1,30 @@
 #import "MCPProcessUtil.h"
+#ifdef MCP_ROOTHIDE
 #include <roothide.h>
+#endif
 #import <dispatch/dispatch.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <signal.h>
 #import <spawn.h>
 #import <string.h>
+#import <sys/stat.h>
 #import <sys/wait.h>
 #import <unistd.h>
 
 extern char **environ;
+
+// SpringBoard may have closed stdio descriptors 0/1/2. Move pipe FDs >= 3 so
+// posix_spawn dup2/close actions never clobber child stdout/stderr pipes.
+static BOOL MCPKeepFDAboveStdio(int *fd) {
+    if (!fd || *fd < 0) return NO;
+    if (*fd >= 3) return YES;
+    int moved = fcntl(*fd, F_DUPFD_CLOEXEC, 3);
+    if (moved < 0) return NO;
+    close(*fd);
+    *fd = moved;
+    return YES;
+}
 
 static char **MCPCreateCStringArray(NSArray<NSString *> *strings) {
     NSUInteger count = strings.count;
@@ -49,14 +64,82 @@ static void MCPInitSpawnAttributes(posix_spawnattr_t *attr) {
 #endif
 }
 
+BOOL MCPIsExecutableFile(NSString *path) {
+    if (!path.length) return NO;
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:path]) {
+        return YES;
+    }
+    // On iOS 18.5 Dopamine RootHide, SpringBoard's Seatbelt sandbox denies unhooked
+    // access(path, X_OK) inside .jbroot with EPERM even though systemhook's
+    // posix_spawn hook grants jbd execution trust at spawn time. Fall back to stat()
+    // regular-file + execute-mode bit check.
+    const char *fsPath = path.fileSystemRepresentation;
+    if (!fsPath || !*fsPath) return NO;
+    struct stat st;
+    if (stat(fsPath, &st) != 0) return NO;
+    return S_ISREG(st.st_mode) && ((st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0);
+}
+
 NSString *MCPResolvedJailbreakPath(NSString *path) {
     if (!path.length) return @"";
 
     NSFileManager *fm = [NSFileManager defaultManager];
+#ifdef MCP_ROOTHIDE
+    if ([path rangeOfString:@"/.jbroot-"].location != NSNotFound) {
+        return path;
+    }
+    NSString *jbRootBase = jbroot(@"/");
+    while (jbRootBase.length > 1 && [jbRootBase hasSuffix:@"/"]) {
+        jbRootBase = [jbRootBase substringToIndex:jbRootBase.length - 1];
+    }
+    if (jbRootBase.length > 1) {
+        NSString *privateJBRoot = [@"/private" stringByAppendingString:jbRootBase];
+        if ([path hasPrefix:jbRootBase] || [path hasPrefix:privateJBRoot]) {
+            return path;
+        }
+    }
+
+    BOOL preferRealRootFS =
+        [path hasPrefix:@"/var/mobile/"] || [path isEqualToString:@"/var/mobile"] ||
+        [path hasPrefix:@"/private/var/mobile/"] || [path isEqualToString:@"/private/var/mobile"] ||
+        [path hasPrefix:@"/var/containers/"] || [path hasPrefix:@"/private/var/containers/"] ||
+        [path hasPrefix:@"/var/tmp/"] || [path isEqualToString:@"/var/tmp"] ||
+        [path hasPrefix:@"/private/var/tmp/"] || [path hasPrefix:@"/tmp/"] || [path isEqualToString:@"/tmp"] ||
+        [path hasPrefix:@"/System/"] || [path hasPrefix:@"/Developer/"];
+
+    if (preferRealRootFS) {
+        if ([fm fileExistsAtPath:path]) return path;
+        NSString *parent = [path stringByDeletingLastPathComponent];
+        if (parent.length > 0 && [fm fileExistsAtPath:parent]) return path;
+    }
+
     NSString *resolved = jbroot(path);
     if (resolved.length && [fm fileExistsAtPath:resolved]) return resolved;
     if ([fm fileExistsAtPath:path]) return path;
+    NSString *resolvedParent = [resolved stringByDeletingLastPathComponent];
+    if (resolved.length && resolvedParent.length > 0 && [fm fileExistsAtPath:resolvedParent]) return resolved;
+    NSString *parent = [path stringByDeletingLastPathComponent];
+    if (parent.length > 0 && [fm fileExistsAtPath:parent]) return path;
     return resolved.length ? resolved : path;
+#elif defined(MCP_ROOTLESS)
+    if ([path hasPrefix:@"/"] && ![path hasPrefix:@"/var/jb/"]) {
+        NSString *candidate = [@"/var/jb" stringByAppendingString:path];
+        if ([fm fileExistsAtPath:candidate]) return candidate;
+    }
+    return path;
+#else
+    return path;
+#endif
+}
+
+NSString *MCPBootstrapPathForRootHide(NSString *path) {
+    if (!path.length) return @"";
+#ifdef MCP_ROOTHIDE
+    NSString *converted = rootfs(path);
+    return converted.length > 0 ? converted : path;
+#else
+    return path;
+#endif
 }
 
 NSDictionary<NSString *, NSString *> *MCPJailbreakEnvironment(void) {
@@ -114,8 +197,7 @@ BOOL MCPRunProcess(NSString *launchPath,
         return NO;
     }
 
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm isExecutableFileAtPath:launchPath]) {
+    if (!MCPIsExecutableFile(launchPath)) {
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Executable not found: %@", launchPath];
         return NO;
     }
@@ -123,6 +205,12 @@ BOOL MCPRunProcess(NSString *launchPath,
     int pipeFDs[2] = {-1, -1};
     if (pipe(pipeFDs) != 0) {
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"pipe failed: %s", strerror(errno)];
+        return NO;
+    }
+    if (!MCPKeepFDAboveStdio(&pipeFDs[0]) || !MCPKeepFDAboveStdio(&pipeFDs[1])) {
+        if (pipeFDs[0] >= 0) close(pipeFDs[0]);
+        if (pipeFDs[1] >= 0) close(pipeFDs[1]);
+        if (errorMessage) *errorMessage = @"Failed to reserve process pipe descriptors above stdio";
         return NO;
     }
 
@@ -266,8 +354,7 @@ BOOL MCPRunProcessData(NSString *launchPath,
         return NO;
     }
 
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm isExecutableFileAtPath:launchPath]) {
+    if (!MCPIsExecutableFile(launchPath)) {
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Executable not found: %@", launchPath];
         return NO;
     }
@@ -275,6 +362,12 @@ BOOL MCPRunProcessData(NSString *launchPath,
     int pipeFDs[2] = {-1, -1};
     if (pipe(pipeFDs) != 0) {
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"pipe failed: %s", strerror(errno)];
+        return NO;
+    }
+    if (!MCPKeepFDAboveStdio(&pipeFDs[0]) || !MCPKeepFDAboveStdio(&pipeFDs[1])) {
+        if (pipeFDs[0] >= 0) close(pipeFDs[0]);
+        if (pipeFDs[1] >= 0) close(pipeFDs[1]);
+        if (errorMessage) *errorMessage = @"Failed to reserve process pipe descriptors above stdio";
         return NO;
     }
 
@@ -393,10 +486,36 @@ BOOL MCPRunProcessData(NSString *launchPath,
 
 NSString *MCPRootHelperPath(void) {
     NSString *path = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
-    if (path.length && [[NSFileManager defaultManager] isExecutableFileAtPath:path]) {
+    if (path.length && MCPIsExecutableFile(path)) {
         return path;
     }
     return nil;
+}
+
+BOOL MCPRunRootProcess(NSString *launchPath,
+                       NSArray<NSString *> *arguments,
+                       NSTimeInterval timeout,
+                       NSUInteger maxOutputBytes,
+                       NSString **output,
+                       int *exitCode,
+                       NSString **errorMessage) {
+    NSString *rootHelper = MCPRootHelperPath();
+    if (!rootHelper.length) {
+        if (errorMessage) *errorMessage = @"mcp-root helper not available";
+        return NO;
+    }
+    NSMutableArray<NSString *> *argv = [NSMutableArray arrayWithObject:launchPath ?: @""];
+    if (arguments.count > 0) {
+        [argv addObjectsFromArray:arguments];
+    }
+    return MCPRunProcess(rootHelper,
+                         argv,
+                         MCPJailbreakEnvironment(),
+                         timeout,
+                         maxOutputBytes,
+                         output,
+                         exitCode,
+                         errorMessage);
 }
 
 BOOL MCPRunRootProcessData(NSString *launchPath,

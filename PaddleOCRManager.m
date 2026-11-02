@@ -79,7 +79,7 @@ static BOOL MCPKeepFDAboveStdio(int *fd) {
     }
     NSString *path = MCPResolvedJailbreakPath(@"/usr/libexec/ios-mcp/mcp-ocr-worker");
     NSString *resources = MCPResolvedJailbreakPath(@"/usr/share/ios-mcp/paddleocr");
-    if (![[NSFileManager defaultManager] isExecutableFileAtPath:path]) {
+    if (!MCPIsExecutableFile(path)) {
         if (error) *error = @"PaddleOCR: worker is missing or not executable";
         return NO;
     }

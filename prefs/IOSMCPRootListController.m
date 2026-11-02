@@ -5,6 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <roothide.h>
 #import "../IOSMCPPreferences.h"
 #import "../MCPLogger.h"
@@ -76,7 +77,11 @@ static NSString *IOSMCPKillallPath(void) {
     ];
     NSFileManager *fileManager = [NSFileManager defaultManager];
     for (NSString *path in candidatePaths) {
-        if (path.length > 0 && [fileManager isExecutableFileAtPath:path]) {
+        if (path.length == 0) continue;
+        if ([fileManager isExecutableFileAtPath:path]) return path;
+        struct stat st;
+        const char *fsPath = path.fileSystemRepresentation;
+        if (fsPath && stat(fsPath, &st) == 0 && S_ISREG(st.st_mode) && ((st.st_mode & 0111) != 0)) {
             return path;
         }
     }

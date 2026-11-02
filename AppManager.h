@@ -33,4 +33,7 @@
 /// *error when the app is not found.
 - (NSDictionary *)appInfoForBundleId:(NSString *)bundleId error:(NSString **)error;
 
+/// Resolve live running PID for an installed bundle identifier, or 0 if not running.
+- (pid_t)pidForBundleId:(NSString *)bundleId;
+
 @end
