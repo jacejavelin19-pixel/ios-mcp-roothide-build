@@ -19,6 +19,7 @@
     if (error) *error = nil;
     NSMutableDictionary *req = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
     req[@"action"] = action;
+    req[@"op"] = action;
 
     NSString *bundleId = [args[@"bundle_id"] isKindOfClass:[NSString class]] ? args[@"bundle_id"] : nil;
     NSString *explicitGroup = [args[@"access_group"] isKindOfClass:[NSString class]] ? args[@"access_group"] : nil;
