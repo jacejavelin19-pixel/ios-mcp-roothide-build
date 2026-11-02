@@ -68,7 +68,7 @@ jobs:
           set -euo pipefail
           TMP_DEB_DIR="$(mktemp -d)"
           V128_DEB="$TMP_DEB_DIR/com.witchan.ios-mcp_1.2.8_iphoneos-arm64e.deb"
-          curl -fsSL "https://github.com/witchann/ios-mcp/releases/download/v1.2.8/com.witchan.ios-mcp_1.2.8_iphoneos-arm64e.deb" -o "$V128_DEB"
+          curl -fsSL "https://github.com/witchan/ios-mcp/releases/download/v1.2.8/com.witchan.ios-mcp_1.2.8_iphoneos-arm64e.deb" -o "$V128_DEB"
           ACTUAL_SHA="$(shasum -a 256 "$V128_DEB" | awk '{print $1}')"
           EXPECTED_SHA="9cce934fe76ab421cb29f14c09be2b44251fda4cbc87c2e3559be9df8a580f33"
           if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
