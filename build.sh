@@ -81,6 +81,7 @@ build_subprojects() {
   (cd AppSync/appinst && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-roothelper && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-ldid && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
+  (cd mcp-memory && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-root && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-logreader && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   if [[ ! -f third_party/paddleocr/runtime/ios/lib/libonnxruntime.a ]]; then

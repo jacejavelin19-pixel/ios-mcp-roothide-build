@@ -71,6 +71,8 @@ after-stage::
 	$(ECHO_NOTHING)chmod 4755 "$(THEOS_STAGING_DIR)/usr/bin/mcp-root"$(ECHO_END)
 	@# Bundle mcp-logreader (unified system log reader via diagnosticd live stream)
 	$(ECHO_NOTHING)cp mcp-logreader/.theos/obj/mcp-logreader "$(THEOS_STAGING_DIR)/usr/bin/mcp-logreader"$(ECHO_END)
+	@# Bounded memory operations run in a separately entitled helper, not SpringBoard.
+	$(ECHO_NOTHING)cp mcp-memory/.theos/obj/mcp-memory "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-memory"$(ECHO_END)
 
 after-install::
 	install.exec "killall -9 SpringBoard"

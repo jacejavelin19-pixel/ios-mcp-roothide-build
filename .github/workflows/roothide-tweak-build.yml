@@ -41,6 +41,11 @@ jobs:
           mkdir -p ci-output
           cp .theos/obj/ios-mcp.dylib ci-output/
           shasum -a 256 ci-output/ios-mcp.dylib > ci-output/SHA256SUMS
+          make -C mcp-memory FINALPACKAGE=1 DEBUG=0 STRIP=1
+          cp mcp-memory/.theos/obj/mcp-memory ci-output/
+          lipo -info ci-output/mcp-memory
+          ldid -e ci-output/mcp-memory > ci-output/mcp-memory-entitlements.plist
+          shasum -a 256 ci-output/mcp-memory >> ci-output/SHA256SUMS
       - name: Compile memory manager device test
         shell: bash
         run: |
