@@ -213,7 +213,7 @@ static NSString *mcp_stealth_status_path(void) {
 }
 
 static void mcp_reload_config_if_needed(int force) {
-    const char *cfgCStr = [NSTemporaryDirectory() stringByAppendingPathComponent:@".mcp_stealth_cfg.json"].fileSystemRepresentation;
+    const char *cfgCStr = mcp_stealth_cfg_path().fileSystemRepresentation;
     if (!cfgCStr) return;
     struct stat st;
     int rc = orig_stat ? orig_stat(cfgCStr, &st) : stat(cfgCStr, &st);
