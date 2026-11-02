@@ -1,0 +1,47 @@
+name: RootHide tweak compile
+
+on:
+  push:
+    branches: [chore-roothide-toolchain]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      THEOS: ${{ github.workspace }}/.ci-theos
+      THEOS_PACKAGE_SCHEME: roothide
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install RootHide Theos and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ldid xz
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          "$THEOS/bin/install-sdk" iPhoneOS16.5
+          xcodebuild -version
+          xcrun --sdk iphoneos clang --version
+      - name: Build tweak and preferences
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make FINALPACKAGE=1 DEBUG=0 STRIP=1
+          find .theos/obj -name 'ios-mcp.dylib' -print
+          test -f .theos/obj/ios-mcp.dylib
+          lipo -info .theos/obj/ios-mcp.dylib
+          otool -L .theos/obj/ios-mcp.dylib
+          mkdir -p ci-output
+          cp .theos/obj/ios-mcp.dylib ci-output/
+          shasum -a 256 ci-output/ios-mcp.dylib > ci-output/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roothide-tweak-compile-only
+          path: ci-output/
+          if-no-files-found: error
+          retention-days: 7
