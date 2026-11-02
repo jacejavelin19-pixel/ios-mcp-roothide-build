@@ -1,0 +1,36 @@
+name: RootHide arm64e toolchain probe
+
+on:
+  push:
+    branches: [chore-roothide-toolchain]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect Xcode and compile iOS arm64e probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe-output
+          xcodebuild -version | tee probe-output/toolchain.txt
+          xcrun --sdk iphoneos clang --version | tee -a probe-output/toolchain.txt
+          xcrun --sdk iphoneos --show-sdk-version | tee -a probe-output/toolchain.txt
+          printf 'int main(void) { return 0; }\n' > probe-output/probe.c
+          xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=15.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            probe-output/probe.c -o probe-output/probe-arm64e
+          lipo -info probe-output/probe-arm64e | tee probe-output/architecture.txt
+          shasum -a 256 probe-output/probe-arm64e > probe-output/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-arm64e-toolchain-probe
+          path: probe-output/
+          if-no-files-found: error
+          retention-days: 7
