@@ -7,6 +7,7 @@
 #import "MCPProcessUtil.h"
 #import "TextInputManager.h"
 #import "FileSystemManager.h"
+#import "PlistPatchManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
 #import "MCPOCRRequestContext.h"
@@ -775,6 +776,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeGetAppInfo:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executePlistValue:(id)reqId args:(NSDictionary *)args write:(BOOL)write;
 - (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args;
@@ -2521,6 +2523,16 @@ static NSString *MCPLogId(id reqId) {
                 ]
             }
         },
+        @{
+            @"name": @"get_plist_value",
+            @"description": @"Read a dot-separated dictionary keypath from a local binary or XML property list.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"path": @{@"type": @"string"}, @"keypath": @{@"type": @"string"}}, @"required": @[@"path", @"keypath"]}
+        },
+        @{
+            @"name": @"set_plist_value",
+            @"description": @"Atomically set a dictionary keypath, preserving the property-list format. Requires write access.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"path": @{@"type": @"string"}, @"keypath": @{@"type": @"string"}, @"value": @{}}, @"required": @[@"path", @"keypath", @"value"]}
+        },
         // ---- Reverse-engineering: app info, filesystem, logs ----
         @{
             @"name": @"get_app_info",
@@ -2756,6 +2768,10 @@ static NSString *MCPLogId(id reqId) {
         return [self executeListDir:reqId args:args];
     } else if ([toolName isEqualToString:@"read_file"]) {
         return [self executeReadFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_plist_value"]) {
+        return [self executePlistValue:reqId args:args write:NO];
+    } else if ([toolName isEqualToString:@"set_plist_value"]) {
+        return [self executePlistValue:reqId args:args write:YES];
     } else if ([toolName isEqualToString:@"write_file"]) {
         return [self executeWriteFile:reqId args:args];
     } else if ([toolName isEqualToString:@"get_syslog"]) {
@@ -4412,6 +4428,19 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
         return [self mcpSuccess:reqId text:(err ?: @"Failed to read app info") isError:YES];
     }
     return [self mcpSuccess:reqId structuredContent:info];
+}
+
+- (NSDictionary *)executePlistValue:(id)reqId args:(NSDictionary *)args write:(BOOL)write {
+    NSString *path = nil, *keypath = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"keypath", YES, &keypath, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (write && !args[@"value"]) return [self mcpError:reqId code:-32602 message:@"Missing value"];
+    NSString *err = nil;
+    NSDictionary *result = write ? [[PlistPatchManager sharedInstance] setValue:args[@"value"] atPath:path keypath:keypath error:&err] : [[PlistPatchManager sharedInstance] valueAtPath:path keypath:keypath error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Property list operation failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
 }
 
 - (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args {

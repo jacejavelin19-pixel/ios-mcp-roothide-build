@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install RootHide Theos and SDK
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           brew install ldid xz
