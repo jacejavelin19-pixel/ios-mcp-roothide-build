@@ -1,5 +1,6 @@
 #import "MemoryManager.h"
 #import <mach/mach.h>
+#import <unistd.h>
 
 // The iOS SDK intentionally omits the mach_vm MIG declarations.
 extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *);
@@ -23,6 +24,15 @@ static NSString *MCPMachError(kern_return_t result) {
     if (pid <= 0) {
         if (error) *error = @"pid must be positive";
         return MACH_PORT_NULL;
+    }
+    if (pid == getpid()) {
+        mach_port_t task = mach_task_self();
+        kern_return_t result = mach_port_mod_refs(task, task, MACH_PORT_RIGHT_SEND, 1);
+        if (result != KERN_SUCCESS) {
+            if (error) *error = MCPMachError(result);
+            return MACH_PORT_NULL;
+        }
+        return task;
     }
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t result = task_for_pid(mach_task_self(), pid, &task);
