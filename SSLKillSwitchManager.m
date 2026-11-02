@@ -69,7 +69,8 @@ static NSString *const kMCPSSLKillSwitchDestName = @"libmcp_sslks.dylib";
     if (!rem) return nil;
 
     NSDictionary *appInfo = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:nil];
-    NSString *dataContainer = [appInfo[@"data_container_path"] isKindOfClass:[NSString class]] ? appInfo[@"data_container_path"] : nil;
+    id rawContainer = appInfo[@"data_container"] ?: appInfo[@"data_container_path"];
+    NSString *dataContainer = [rawContainer isKindOfClass:[NSString class]] ? rawContainer : nil;
     if (dataContainer.length > 0) {
         NSString *statusFile = [dataContainer stringByAppendingPathComponent:@"tmp/.mcp_sslks_status.json"];
         NSString *outStr = nil, *runErr = nil;

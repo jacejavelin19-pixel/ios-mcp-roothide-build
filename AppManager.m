@@ -2301,7 +2301,10 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                 dataContainer = [((NSURL *)dataURL).path stringByStandardizingPath];
             }
         }
-        if (dataContainer.length) info[@"data_container"] = dataContainer;
+        if (dataContainer.length) {
+            info[@"data_container"] = dataContainer;
+            info[@"data_container_path"] = dataContainer;
+        }
 
         // App Group / shared container paths.
         if ([proxy respondsToSelector:@selector(groupContainerURLs)]) {

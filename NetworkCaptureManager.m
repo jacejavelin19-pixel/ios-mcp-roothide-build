@@ -24,7 +24,8 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
         if (error) *error = appErr ?: [NSString stringWithFormat:@"App not found: %@", bundleId];
         return nil;
     }
-    NSString *container = [info[@"data_container_path"] isKindOfClass:[NSString class]] ? info[@"data_container_path"] : nil;
+    id rawContainer = info[@"data_container"] ?: info[@"data_container_path"];
+    NSString *container = [rawContainer isKindOfClass:[NSString class]] ? rawContainer : nil;
     if (!container.length) {
         if (error) *error = [NSString stringWithFormat:@"App %@ has no data_container_path", bundleId];
         return nil;

@@ -791,7 +791,8 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
 
     NSString *bundlePath = [appInfo[@"bundle_path"] isKindOfClass:[NSString class]] ? appInfo[@"bundle_path"] : nil;
     NSString *mainExec = [appInfo[@"executable_path"] isKindOfClass:[NSString class]] ? appInfo[@"executable_path"] : nil;
-    NSString *dataContainer = [appInfo[@"data_container_path"] isKindOfClass:[NSString class]] ? appInfo[@"data_container_path"] : nil;
+    id rawContainer = appInfo[@"data_container"] ?: appInfo[@"data_container_path"];
+    NSString *dataContainer = [rawContainer isKindOfClass:[NSString class]] ? rawContainer : nil;
     if (!bundlePath.length || !mainExec.length || !dataContainer.length) {
         if (error) *error = [NSString stringWithFormat:@"App %@ is missing bundle_path, executable_path, or data_container_path", bundleId];
         return nil;
@@ -986,7 +987,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
 
     NSString *bundlePath = appInfo[@"bundle_path"] ?: @"";
     NSString *mainExec = appInfo[@"executable_path"] ?: @"";
-    NSString *dataContainer = appInfo[@"data_container_path"] ?: @"";
+    NSString *dataContainer = appInfo[@"data_container"] ?: appInfo[@"data_container_path"] ?: @"";
 
     pid_t pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
     BOOL wasRunning = (pid > 0);
@@ -1250,7 +1251,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
         if (error) *error = appErr ?: @"App not found";
         return nil;
     }
-    NSString *dataContainer = appInfo[@"data_container_path"];
+    NSString *dataContainer = appInfo[@"data_container"] ?: appInfo[@"data_container_path"];
     if (!dataContainer.length) {
         if (error) *error = @"App has no data_container_path";
         return nil;
@@ -1314,7 +1315,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
         if (error) *error = appErr ?: @"App not found";
         return nil;
     }
-    NSString *dataContainer = appInfo[@"data_container_path"] ?: @"";
+    NSString *dataContainer = appInfo[@"data_container"] ?: appInfo[@"data_container_path"] ?: @"";
     NSString *statusPath = [dataContainer stringByAppendingPathComponent:@"tmp/.mcp_stealth_status.json"];
     NSString *cfgPath = [dataContainer stringByAppendingPathComponent:@"tmp/.mcp_stealth_cfg.json"];
 

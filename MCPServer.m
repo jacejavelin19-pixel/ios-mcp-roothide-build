@@ -3037,7 +3037,7 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"frida_memory_scan",
-            @"description": @"Scan readable memory ranges inside a Gadget-instrumented process using Frida Gum Memory.scanSync pattern syntax (hex bytes with optional '??' wildcards, or UTF-8 text).",
+            @"description": @"Scan readable memory ranges inside a Gadget-instrumented process using Frida Gum Memory.scanSync pattern syntax (hex bytes with optional ?\? wildcards, or UTF-8 text).",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
