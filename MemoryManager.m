@@ -1,6 +1,10 @@
 #import "MemoryManager.h"
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+
+// The iOS SDK intentionally omits the mach_vm MIG declarations.
+extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *);
+extern kern_return_t mach_vm_write(vm_map_t, mach_vm_address_t, vm_offset_t, mach_msg_type_number_t);
+extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
 
 static NSString *MCPMachError(kern_return_t result) {
     return [NSString stringWithFormat:@"%s (%d)", mach_error_string(result), result];
