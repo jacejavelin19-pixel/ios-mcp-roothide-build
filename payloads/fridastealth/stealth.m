@@ -7,7 +7,6 @@
 #import <errno.h>
 #import <fcntl.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <netinet/in.h>
@@ -38,7 +37,7 @@
 #define PT_DENY_ATTACH 31
 #endif
 
-extern kern_return_t mach_vm_region(vm_map_read_t target_task,
+extern kern_return_t mach_vm_region(vm_map_t target_task,
                                     mach_vm_address_t *address,
                                     mach_vm_size_t *size,
                                     vm_region_flavor_t flavor,
@@ -145,7 +144,7 @@ static kern_return_t (*orig_vm_region_64)(vm_map_t target_task,
                                           vm_region_info_t info,
                                           mach_msg_type_number_t *infoCnt,
                                           mach_port_t *object_name) = NULL;
-static kern_return_t (*orig_mach_vm_region)(vm_map_read_t target_task,
+static kern_return_t (*orig_mach_vm_region)(vm_map_t target_task,
                                             mach_vm_address_t *address,
                                             mach_vm_size_t *size,
                                             vm_region_flavor_t flavor,
@@ -918,7 +917,7 @@ static kern_return_t hook_vm_region_64(vm_map_t target_task,
     return kr;
 }
 
-static kern_return_t hook_mach_vm_region(vm_map_read_t target_task,
+static kern_return_t hook_mach_vm_region(vm_map_t target_task,
                                          mach_vm_address_t *address,
                                          mach_vm_size_t *size,
                                          vm_region_flavor_t flavor,
