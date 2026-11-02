@@ -8,6 +8,7 @@
 #import "TextInputManager.h"
 #import "FileSystemManager.h"
 #import "PlistPatchManager.h"
+#import "MemoryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
 #import "MCPOCRRequestContext.h"
@@ -19,6 +20,7 @@
 #import <unistd.h>
 #import <fcntl.h>
 #import <errno.h>
+#import <math.h>
 #import <stdlib.h>
 #import <sys/utsname.h>
 #import <sys/statvfs.h>
@@ -777,6 +779,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeListDir:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeReadFile:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executePlistValue:(id)reqId args:(NSDictionary *)args write:(BOOL)write;
+- (NSDictionary *)executeMemory:(id)reqId args:(NSDictionary *)args operation:(NSString *)operation;
 - (NSDictionary *)executeWriteFile:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args;
@@ -2533,6 +2536,18 @@ static NSString *MCPLogId(id reqId) {
             @"description": @"Atomically set a dictionary keypath, preserving the property-list format. Requires write access.",
             @"inputSchema": @{@"type": @"object", @"properties": @{@"path": @{@"type": @"string"}, @"keypath": @{@"type": @"string"}, @"value": @{}}, @"required": @[@"path", @"keypath", @"value"]}
         },
+        @{
+            @"name": @"read_memory", @"description": @"Read a bounded region of another process into base64. Requires an obtainable task port.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"pid": @{@"type": @"integer"}, @"address": @{@"type": @"string"}, @"length": @{@"type": @"integer"}}, @"required": @[@"pid", @"address", @"length"]}
+        },
+        @{
+            @"name": @"write_memory", @"description": @"Write base64 bytes to a process. Requires an obtainable task port and writable memory.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"pid": @{@"type": @"integer"}, @"address": @{@"type": @"string"}, @"data": @{@"type": @"string"}}, @"required": @[@"pid", @"address", @"data"]}
+        },
+        @{
+            @"name": @"search_memory", @"description": @"Search a bounded address range for base64 bytes. Requires an obtainable task port.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"pid": @{@"type": @"integer"}, @"address": @{@"type": @"string"}, @"end": @{@"type": @"string"}, @"data": @{@"type": @"string"}}, @"required": @[@"pid", @"address", @"end", @"data"]}
+        },
         // ---- Reverse-engineering: app info, filesystem, logs ----
         @{
             @"name": @"get_app_info",
@@ -2772,6 +2787,8 @@ static NSString *MCPLogId(id reqId) {
         return [self executePlistValue:reqId args:args write:NO];
     } else if ([toolName isEqualToString:@"set_plist_value"]) {
         return [self executePlistValue:reqId args:args write:YES];
+    } else if ([toolName isEqualToString:@"read_memory"] || [toolName isEqualToString:@"write_memory"] || [toolName isEqualToString:@"search_memory"]) {
+        return [self executeMemory:reqId args:args operation:toolName];
     } else if ([toolName isEqualToString:@"write_file"]) {
         return [self executeWriteFile:reqId args:args];
     } else if ([toolName isEqualToString:@"get_syslog"]) {
@@ -4428,6 +4445,48 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
         return [self mcpSuccess:reqId text:(err ?: @"Failed to read app info") isError:YES];
     }
     return [self mcpSuccess:reqId structuredContent:info];
+}
+
+static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
+    if (!text.length || [text hasPrefix:@"-"] || [text hasPrefix:@"+"] || [text rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound) return NO;
+    const char *s = text.UTF8String;
+    if (!s || !*s) return NO;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(s, &end, 0);
+    if (errno || !end || *end != '\0') return NO;
+    *address = (uint64_t)value;
+    return YES;
+}
+
+- (NSDictionary *)executeMemory:(id)reqId args:(NSDictionary *)args operation:(NSString *)operation {
+    NSString *addressText = nil, *paramError = nil;
+    double pidValue = 0;
+    if (!MCPNumberFromArgs(args, @"pid", 0, YES, &pidValue, &paramError) ||
+        !MCPStringFromArgs(args, @"address", YES, &addressText, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
+    uint64_t address = 0;
+    if (pidValue <= 0 || pidValue > INT32_MAX || floor(pidValue) != pidValue || !MCPParseMemoryAddress(addressText, &address)) return [self mcpError:reqId code:-32602 message:@"Invalid pid or address"];
+    NSString *err = nil;
+    NSDictionary *result = nil;
+    if ([operation isEqualToString:@"read_memory"]) {
+        double length = 0;
+        if (!MCPNumberFromArgs(args, @"length", 0, YES, &length, &paramError) || length <= 0 || length > 1048576 || floor(length) != length) return [self mcpError:reqId code:-32602 message:paramError ?: @"Invalid length"];
+        result = [[MemoryManager sharedInstance] readPID:(pid_t)pidValue address:address length:(NSUInteger)length error:&err];
+    } else {
+        NSString *encoded = nil;
+        if (!MCPStringFromArgs(args, @"data", YES, &encoded, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
+        NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+        if (!data) return [self mcpError:reqId code:-32602 message:@"Invalid base64 data"];
+        if ([operation isEqualToString:@"write_memory"]) result = [[MemoryManager sharedInstance] writePID:(pid_t)pidValue address:address data:data error:&err];
+        else {
+            NSString *endText = nil;
+            uint64_t end = 0;
+            if (!MCPStringFromArgs(args, @"end", YES, &endText, &paramError) || !MCPParseMemoryAddress(endText, &end)) return [self mcpError:reqId code:-32602 message:paramError ?: @"Invalid end address"];
+            result = [[MemoryManager sharedInstance] searchPID:(pid_t)pidValue data:data start:address end:end error:&err];
+        }
+    }
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"Memory operation failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
 }
 
 - (NSDictionary *)executePlistValue:(id)reqId args:(NSDictionary *)args write:(BOOL)write {
