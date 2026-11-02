@@ -66,6 +66,14 @@ int main(int argc, char **argv) {
             if (stream) fclose(stream); else close(fds[0]);
             NSString *crossError = nil;
             NSDictionary *remote = parsed == 1 ? [manager readPID:child address:remoteAddress length:sizeof(uint64_t) error:&crossError] : nil;
+            uint64_t original = 0x123456789abcdef0ULL;
+            NSData *originalData = [NSData dataWithBytes:&original length:sizeof(original)];
+            NSDictionary *remoteSearch = remote ? [manager searchPID:child data:originalData start:remoteAddress end:remoteAddress + sizeof(original) error:&crossError] : nil;
+            NSString *remoteAddressText = [NSString stringWithFormat:@"0x%llx", remoteAddress];
+            uint64_t changed = 0xfedcba9876543210ULL;
+            NSData *changedData = [NSData dataWithBytes:&changed length:sizeof(changed)];
+            NSDictionary *remoteWrite = remoteSearch ? [manager writePID:child address:remoteAddress data:changedData error:&crossError] : nil;
+            NSDictionary *remoteReadBack = remoteWrite ? [manager readPID:child address:remoteAddress length:sizeof(changed) error:&crossError] : nil;
             kill(child, SIGTERM);
             waitpid(child, NULL, 0);
             if (!remote) { fprintf(stderr, "cross-process read failed: %s\n", crossError.UTF8String ?: "target did not report address"); return 9; }
@@ -74,7 +82,12 @@ int main(int argc, char **argv) {
             if (remoteData.length != sizeof(actual)) return 10;
             memcpy(&actual, remoteData.bytes, sizeof(actual));
             if (actual != 0x123456789abcdef0ULL) { fprintf(stderr, "cross-process read mismatch\n"); return 11; }
-            puts("PASS cross-process read from dedicated child");
+            if (![remoteSearch[@"matches"] containsObject:remoteAddressText] || !remoteWrite || !remoteReadBack) {
+                fprintf(stderr, "cross-process search/write failed: %s\n", crossError.UTF8String ?: "no match"); return 12;
+            }
+            NSData *written = [[NSData alloc] initWithBase64EncodedString:remoteReadBack[@"data"] options:0];
+            if (![written isEqualToData:changedData]) { fprintf(stderr, "cross-process write mismatch\n"); return 13; }
+            puts("PASS cross-process read/write/search against dedicated child");
         }
         return 0;
     }
