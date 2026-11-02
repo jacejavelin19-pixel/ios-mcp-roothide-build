@@ -4467,24 +4467,35 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     uint64_t address = 0;
     if (pidValue <= 0 || pidValue > INT32_MAX || floor(pidValue) != pidValue || !MCPParseMemoryAddress(addressText, &address)) return [self mcpError:reqId code:-32602 message:@"Invalid pid or address"];
     NSString *err = nil;
-    NSDictionary *result = nil;
+    NSMutableArray<NSString *> *helperArgs = [NSMutableArray array];
+    NSString *pidText = [NSString stringWithFormat:@"%d", (int)pidValue];
     if ([operation isEqualToString:@"read_memory"]) {
         double length = 0;
         if (!MCPNumberFromArgs(args, @"length", 0, YES, &length, &paramError) || length <= 0 || length > 1048576 || floor(length) != length) return [self mcpError:reqId code:-32602 message:paramError ?: @"Invalid length"];
-        result = [[MemoryManager sharedInstance] readPID:(pid_t)pidValue address:address length:(NSUInteger)length error:&err];
+        [helperArgs addObjectsFromArray:@[@"read", pidText, addressText, [NSString stringWithFormat:@"%lu", (unsigned long)length]]];
     } else {
         NSString *encoded = nil;
         if (!MCPStringFromArgs(args, @"data", YES, &encoded, &paramError)) return [self mcpError:reqId code:-32602 message:paramError];
         NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
-        if (!data) return [self mcpError:reqId code:-32602 message:@"Invalid base64 data"];
-        if ([operation isEqualToString:@"write_memory"]) result = [[MemoryManager sharedInstance] writePID:(pid_t)pidValue address:address data:data error:&err];
+        if (!data || !data.length || data.length > 65536) return [self mcpError:reqId code:-32602 message:@"Invalid base64 data or payload exceeds 65536 bytes"];
+        if ([operation isEqualToString:@"write_memory"]) [helperArgs addObjectsFromArray:@[@"write", pidText, addressText, encoded]];
         else {
             NSString *endText = nil;
             uint64_t end = 0;
             if (!MCPStringFromArgs(args, @"end", YES, &endText, &paramError) || !MCPParseMemoryAddress(endText, &end)) return [self mcpError:reqId code:-32602 message:paramError ?: @"Invalid end address"];
-            result = [[MemoryManager sharedInstance] searchPID:(pid_t)pidValue data:data start:address end:end error:&err];
+            [helperArgs addObjectsFromArray:@[@"search", pidText, addressText, endText, encoded]];
         }
     }
+    NSString *output = nil;
+    int exitCode = -1;
+    NSString *helperPath = MCPResolvedJailbreakPath(@"/usr/libexec/ios-mcp/mcp-memory");
+    BOOL launched = MCPRunProcess(helperPath, helperArgs, MCPJailbreakEnvironment(), 30, 2 * 1024 * 1024, &output, &exitCode, &err);
+    if (!launched) return [self mcpSuccess:reqId text:(err ?: @"Memory helper could not be launched") isError:YES];
+    NSData *responseData = [output dataUsingEncoding:NSUTF8StringEncoding];
+    id response = responseData ? [NSJSONSerialization JSONObjectWithData:responseData options:0 error:NULL] : nil;
+    if (![response isKindOfClass:[NSDictionary class]]) return [self mcpSuccess:reqId text:@"Memory helper returned invalid JSON" isError:YES];
+    if (exitCode != 0 || ![response[@"ok"] boolValue]) return [self mcpSuccess:reqId text:([response[@"error"] isKindOfClass:[NSString class]] ? response[@"error"] : @"Memory helper failed") isError:YES];
+    NSDictionary *result = [response[@"result"] isKindOfClass:[NSDictionary class]] ? response[@"result"] : nil;
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"Memory operation failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
