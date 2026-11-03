@@ -2,17 +2,24 @@
 #ifdef MCP_ROOTHIDE
 #include <roothide.h>
 #endif
+#import <arpa/inet.h>
 #import <dispatch/dispatch.h>
 #import <errno.h>
 #import <fcntl.h>
+#import <netinet/in.h>
 #import <signal.h>
 #import <spawn.h>
 #import <string.h>
+#import <sys/socket.h>
 #import <sys/stat.h>
+#import <sys/un.h>
 #import <sys/wait.h>
 #import <unistd.h>
 
 extern char **environ;
+
+#define MCP_HELPERD_SOCK_PATH "/var/mobile/Library/Caches/ios-mcp-work/.helperd.sock"
+#define MCP_HELPERD_TCP_PORT  48091
 
 // SpringBoard may have closed stdio descriptors 0/1/2. Move pipe FDs >= 3 so
 // posix_spawn dup2/close actions never clobber child stdout/stderr pipes.
@@ -23,6 +30,167 @@ static BOOL MCPKeepFDAboveStdio(int *fd) {
     if (moved < 0) return NO;
     close(*fd);
     *fd = moved;
+    return YES;
+}
+
+static BOOL MCPWriteAllSocket(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return YES;
+}
+
+static BOOL MCPReadExactSocket(int fd, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return NO;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return YES;
+}
+
+int MCPConnectHelperDaemon(void) {
+    int tcpFD = socket(AF_INET, SOCK_STREAM, 0);
+    if (tcpFD >= 0) {
+        fcntl(tcpFD, F_SETFD, FD_CLOEXEC);
+        int yes = 1;
+        setsockopt(tcpFD, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+        struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+        setsockopt(tcpFD, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(tcpFD, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(MCP_HELPERD_TCP_PORT);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(tcpFD, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            MCPKeepFDAboveStdio(&tcpFD);
+            return tcpFD;
+        }
+        close(tcpFD);
+    }
+
+    int unixFD = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (unixFD >= 0) {
+        fcntl(unixFD, F_SETFD, FD_CLOEXEC);
+        int yes = 1;
+        setsockopt(unixFD, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+        struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+        setsockopt(unixFD, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(unixFD, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strlcpy(addr.sun_path, MCP_HELPERD_SOCK_PATH, sizeof(addr.sun_path));
+        if (connect(unixFD, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            MCPKeepFDAboveStdio(&unixFD);
+            return unixFD;
+        }
+        close(unixFD);
+    }
+    return -1;
+}
+
+static BOOL MCPRunProcessViaHelperDaemon(NSString *launchPath,
+                                         NSArray<NSString *> *arguments,
+                                         NSDictionary<NSString *, NSString *> *environmentOverrides,
+                                         NSTimeInterval timeout,
+                                         NSUInteger maxOutputBytes,
+                                         NSData **outputData,
+                                         BOOL *truncatedOut,
+                                         int *exitCode,
+                                         NSString **errorMessage) {
+    int sock = MCPConnectHelperDaemon();
+    if (sock < 0) {
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn denied in SpringBoard and mcp-helperd is unreachable for %@", launchPath];
+        return NO;
+    }
+
+    NSTimeInterval effectiveTimeout = MAX(timeout, 1.0);
+    int rcvSec = (int)ceil(effectiveTimeout) + 5;
+    if (rcvSec < 5) rcvSec = 5;
+    struct timeval rcvTv = {.tv_sec = rcvSec, .tv_usec = 0};
+    struct timeval sndTv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvTv, sizeof(rcvTv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
+
+    NSMutableDictionary *req = [NSMutableDictionary dictionary];
+    req[@"launch_path"] = launchPath ?: @"";
+    req[@"arguments"] = arguments ?: @[];
+    if (environmentOverrides.count > 0) {
+        req[@"environment"] = environmentOverrides;
+    }
+    req[@"timeout"] = @(effectiveTimeout);
+    req[@"max_output_bytes"] = @(maxOutputBytes > 0 ? maxOutputBytes : (512 * 1024));
+
+    NSData *reqData = [NSJSONSerialization dataWithJSONObject:req options:0 error:nil];
+    if (!reqData || reqData.length == 0 || reqData.length > 4 * 1024 * 1024) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Failed to serialize helperd spawn request";
+        return NO;
+    }
+
+    uint32_t netReqLen = htonl((uint32_t)reqData.length);
+    if (!MCPWriteAllSocket(sock, &netReqLen, sizeof(netReqLen)) ||
+        !MCPWriteAllSocket(sock, reqData.bytes, reqData.length)) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Failed to send spawn request to mcp-helperd";
+        return NO;
+    }
+
+    uint32_t netRespLen = 0;
+    if (!MCPReadExactSocket(sock, &netRespLen, sizeof(netRespLen))) {
+        close(sock);
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Command timed out after %.0fs", effectiveTimeout];
+        return NO;
+    }
+
+    uint32_t respLen = ntohl(netRespLen);
+    if (respLen == 0 || respLen > 32 * 1024 * 1024) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Invalid response length from mcp-helperd";
+        return NO;
+    }
+
+    NSMutableData *respBytes = [NSMutableData dataWithLength:respLen];
+    if (!respBytes || !MCPReadExactSocket(sock, respBytes.mutableBytes, respLen)) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Failed to read response payload from mcp-helperd";
+        return NO;
+    }
+    close(sock);
+
+    NSDictionary *resp = [NSJSONSerialization JSONObjectWithData:respBytes options:0 error:nil];
+    if (![resp isKindOfClass:[NSDictionary class]]) {
+        if (errorMessage) *errorMessage = @"Malformed JSON response from mcp-helperd";
+        return NO;
+    }
+
+    BOOL ok = [resp[@"ok"] respondsToSelector:@selector(boolValue)] && [resp[@"ok"] boolValue];
+    if (!ok) {
+        NSString *err = [resp[@"error"] isKindOfClass:[NSString class]] ? resp[@"error"] : @"mcp-helperd execution failed";
+        if (errorMessage) *errorMessage = err;
+        return NO;
+    }
+
+    int code = [resp[@"exit_code"] respondsToSelector:@selector(intValue)] ? [resp[@"exit_code"] intValue] : -1;
+    BOOL trunc = [resp[@"truncated"] respondsToSelector:@selector(boolValue)] && [resp[@"truncated"] boolValue];
+    NSString *b64 = [resp[@"output_base64"] isKindOfClass:[NSString class]] ? resp[@"output_base64"] : @"";
+    NSData *decoded = b64.length > 0 ? [[NSData alloc] initWithBase64EncodedString:b64 options:0] : [NSData data];
+
+    if (outputData) *outputData = decoded ?: [NSData data];
+    if (truncatedOut) *truncatedOut = trunc;
+    if (exitCode) *exitCode = code;
     return YES;
 }
 
@@ -275,6 +443,32 @@ BOOL MCPRunProcess(NSString *launchPath,
 
     if (spawnStatus != 0) {
         close(pipeFDs[0]);
+        if (spawnStatus == EPERM || spawnStatus == EACCES) {
+            NSData *proxiedData = nil;
+            BOOL proxiedTruncated = NO;
+            int proxiedExit = -1;
+            if (MCPRunProcessViaHelperDaemon(launchPath,
+                                             arguments,
+                                             environmentOverrides,
+                                             timeout,
+                                             maxOutputBytes,
+                                             &proxiedData,
+                                             &proxiedTruncated,
+                                             &proxiedExit,
+                                             errorMessage)) {
+                NSString *decoded = [[NSString alloc] initWithData:proxiedData encoding:NSUTF8StringEncoding];
+                if (!decoded) {
+                    decoded = [[NSString alloc] initWithData:proxiedData encoding:NSISOLatin1StringEncoding] ?: @"(binary output)";
+                }
+                if (proxiedTruncated) {
+                    decoded = [decoded stringByAppendingString:@"\n... (output truncated)"];
+                }
+                if (output) *output = decoded ?: @"";
+                if (exitCode) *exitCode = proxiedExit;
+                return YES;
+            }
+            return NO;
+        }
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn failed for %@: %s", launchPath, strerror(spawnStatus)];
         return NO;
     }
@@ -432,6 +626,17 @@ BOOL MCPRunProcessData(NSString *launchPath,
 
     if (spawnStatus != 0) {
         close(pipeFDs[0]);
+        if (spawnStatus == EPERM || spawnStatus == EACCES) {
+            return MCPRunProcessViaHelperDaemon(launchPath,
+                                                arguments,
+                                                environmentOverrides,
+                                                timeout,
+                                                maxOutputBytes,
+                                                outputData,
+                                                truncatedOut,
+                                                exitCode,
+                                                errorMessage);
+        }
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn failed for %@: %s", launchPath, strerror(spawnStatus)];
         return NO;
     }

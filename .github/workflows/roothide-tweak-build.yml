@@ -108,7 +108,7 @@ jobs:
           set -euo pipefail
           make clean
 
-          for sub in AppSync AppSync/appinst mcp-roothelper mcp-ldid mcp-memory mcp-keychain mcp-appmod mcp-root mcp-logreader; do
+          for sub in AppSync AppSync/appinst mcp-roothelper mcp-ldid mcp-memory mcp-keychain mcp-appmod mcp-helperd mcp-root mcp-logreader; do
             echo "==> Building subproject: $sub"
             make -C "$sub" THEOS_PACKAGE_SCHEME=roothide clean
             make -C "$sub" THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 DEBUG=0 STRIP=1
@@ -240,6 +240,7 @@ jobs:
               'usr/libexec/ios-mcp/mcp-memory',
               'usr/libexec/ios-mcp/mcp-keychain',
               'usr/libexec/ios-mcp/mcp-appmod',
+              'usr/libexec/ios-mcp/mcp-helperd',
               'usr/libexec/ios-mcp/mcp-ocr-worker',
               'usr/lib/ios-mcp/libmcp_sslks.dylib',
               'usr/lib/ios-mcp/libmcp_netcap.dylib',

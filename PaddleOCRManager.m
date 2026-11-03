@@ -33,6 +33,7 @@ static BOOL MCPKeepFDAboveStdio(int *fd) {
     int _stderrFD;
     NSMutableData *_diagnostics;
     int _exitStatus;
+    BOOL _proxiedWorker;
 }
 + (instancetype)sharedInstance {
     static PaddleOCRManager *instance;
@@ -41,7 +42,7 @@ static BOOL MCPKeepFDAboveStdio(int *fd) {
     return instance;
 }
 - (instancetype)init {
-    if ((self = [super init])) { _gate = [NSLock new]; _fd = -1; _pid = -1; _stderrFD = -1; }
+    if ((self = [super init])) { _gate = [NSLock new]; _fd = -1; _pid = -1; _stderrFD = -1; _proxiedWorker = NO; }
     return self;
 }
 - (void)drainDiagnostics {
@@ -56,26 +57,99 @@ static BOOL MCPKeepFDAboveStdio(int *fd) {
     [self drainDiagnostics];
     if (_fd >= 0) { close(_fd); _fd = -1; }
     if (_pid > 0) {
-        pid_t status;
-        do { status = waitpid(_pid, &_exitStatus, WNOHANG); } while (status < 0 && errno == EINTR);
-        if (status == 0) {
-            kill(_pid, SIGKILL);
-            // Work is actually gone before unlock; never signal a reaped/reused PID.
-            while (waitpid(_pid, &_exitStatus, 0) < 0 && errno == EINTR) {}
+        if (!_proxiedWorker) {
+            pid_t status;
+            do { status = waitpid(_pid, &_exitStatus, WNOHANG); } while (status < 0 && errno == EINTR);
+            if (status == 0) {
+                kill(_pid, SIGKILL);
+                // Work is actually gone before unlock; never signal a reaped/reused PID.
+                while (waitpid(_pid, &_exitStatus, 0) < 0 && errno == EINTR) {}
+            }
         }
         _pid = -1;
+        _proxiedWorker = NO;
     }
     [self drainDiagnostics];
     if (_stderrFD >= 0) { close(_stderrFD); _stderrFD = -1; }
 }
+- (BOOL)startProxiedWorker:(NSString **)error {
+    int sock = MCPConnectHelperDaemon();
+    if (sock < 0) {
+        if (error) *error = @"PaddleOCR: worker launch failed (posix_spawn denied and mcp-helperd unreachable)";
+        return NO;
+    }
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    uint32_t magic = htonl(0x4F435231U);
+    const uint8_t *mp = (const uint8_t *)&magic;
+    size_t mrem = sizeof(magic);
+    while (mrem > 0) {
+        ssize_t n = write(sock, mp, mrem);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            close(sock);
+            if (error) *error = @"PaddleOCR: failed to send OCR1 handshake to mcp-helperd";
+            return NO;
+        }
+        mp += (size_t)n;
+        mrem -= (size_t)n;
+    }
+
+    uint32_t netPid = 0;
+    uint8_t *pp = (uint8_t *)&netPid;
+    size_t prem = sizeof(netPid);
+    while (prem > 0) {
+        ssize_t n = read(sock, pp, prem);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            close(sock);
+            if (error) *error = @"PaddleOCR: failed to read worker PID from mcp-helperd";
+            return NO;
+        }
+        pp += (size_t)n;
+        prem -= (size_t)n;
+    }
+
+    uint32_t workerPid = ntohl(netPid);
+    if (workerPid == 0) {
+        close(sock);
+        if (error) *error = @"PaddleOCR: mcp-helperd failed to launch mcp-ocr-worker";
+        return NO;
+    }
+
+    int yes = 1;
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+    fcntl(sock, F_SETFD, FD_CLOEXEC);
+
+    _pid = (pid_t)workerPid;
+    _fd = sock;
+    _stderrFD = -1;
+    _proxiedWorker = YES;
+    [MCPLogger log:@"[OCR] engine=paddleocr worker_started pid=%d proxied=yes provider=CPUExecutionProvider", _pid];
+    return YES;
+}
 - (BOOL)startWorker:(NSString **)error {
     if (_pid > 0) {
-        pid_t result;
-        do { result = waitpid(_pid, NULL, WNOHANG); } while (result < 0 && errno == EINTR);
-        if (result == 0) return YES;
-        _pid = -1;
-        if (_fd >= 0) { close(_fd); _fd = -1; }
-        if (_stderrFD >= 0) { close(_stderrFD); _stderrFD = -1; }
+        if (_proxiedWorker) {
+            if (_fd >= 0) {
+                struct pollfd p = {_fd, POLLIN, 0};
+                int pr = poll(&p, 1, 0);
+                if (pr >= 0 && !(p.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                    return YES;
+                }
+            }
+            [self stopWorker];
+        } else {
+            pid_t result;
+            do { result = waitpid(_pid, NULL, WNOHANG); } while (result < 0 && errno == EINTR);
+            if (result == 0) return YES;
+            _pid = -1;
+            if (_fd >= 0) { close(_fd); _fd = -1; }
+            if (_stderrFD >= 0) { close(_stderrFD); _stderrFD = -1; }
+        }
     }
     NSString *path = MCPResolvedJailbreakPath(@"/usr/libexec/ios-mcp/mcp-ocr-worker");
     NSString *resources = MCPResolvedJailbreakPath(@"/usr/share/ios-mcp/paddleocr");
@@ -121,11 +195,15 @@ static BOOL MCPKeepFDAboveStdio(int *fd) {
     close(diagnostics[1]);
     if (status) {
         close(pair[0]); close(diagnostics[0]); _pid = -1;
+        if (status == EPERM || status == EACCES) {
+            return [self startProxiedWorker:error];
+        }
         if (error) *error = [NSString stringWithFormat:@"PaddleOCR: worker launch failed: %s", strerror(status)];
         return NO;
     }
     _fd = pair[0];
     _stderrFD = diagnostics[0];
+    _proxiedWorker = NO;
     [MCPLogger log:@"[OCR] engine=paddleocr worker_started pid=%d provider=CPUExecutionProvider", _pid];
     return YES;
 }

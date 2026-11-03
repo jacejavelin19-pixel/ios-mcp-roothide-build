@@ -77,6 +77,7 @@ after-stage::
 	$(ECHO_NOTHING)cp mcp-memory/.theos/obj/mcp-memory "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-memory"$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-keychain/.theos/obj/mcp-keychain "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-keychain"$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-appmod/.theos/obj/mcp-appmod "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-appmod"$(ECHO_END)
+	$(ECHO_NOTHING)cp mcp-helperd/.theos/obj/mcp-helperd "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-helperd"$(ECHO_END)
 	@# Standalone pure-Apple-SDK companion payload dylibs injected per-app (SSL Kill Switch, Network Capture, Frida Stealth).
 	$(ECHO_NOTHING)cp payloads/sslkillswitch/.theos/obj/libmcp_sslks.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_sslks.dylib"$(ECHO_END)
 	$(ECHO_NOTHING)cp payloads/netcapture/.theos/obj/libmcp_netcap.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_netcap.dylib"$(ECHO_END)

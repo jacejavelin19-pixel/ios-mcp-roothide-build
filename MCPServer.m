@@ -528,6 +528,7 @@ static NSDictionary *MCPJailbreakInfo(BOOL debug) {
             @"mcpMemory": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-memory"),
             @"mcpKeychain": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-keychain"),
             @"mcpAppMod": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-appmod"),
+            @"mcpHelperd": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-helperd"),
             @"mcpOcrWorker": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-ocr-worker")
         };
         info[@"payloads"] = @{

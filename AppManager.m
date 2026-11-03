@@ -146,6 +146,10 @@ static BOOL MCPScheduleSpringBoardRestart(NSString **error) {
         char *const argv[] = {"killall", "-9", "SpringBoard", NULL};
         int status = posix_spawn(&pid, spawnPath.fileSystemRepresentation, NULL, NULL, argv, NULL);
         if (status != 0) {
+            if (status == EPERM || status == EACCES) {
+                MCPRunProcess(spawnPath, @[@"-9", @"SpringBoard"], MCPJailbreakEnvironment(), 5, 4096, NULL, NULL, NULL);
+                return;
+            }
             APP_LOG(@"Failed to spawn SpringBoard restart via %@: %s", MCPAppLogSafePath(spawnPath), strerror(status));
             return;
         }
@@ -532,6 +536,23 @@ static BOOL MCPWriteFileToShellPath(NSString *sourcePath, NSString *destPath, NS
         close(sourceFD);
         close(stdinPipe[1]);
         close(outputPipe[0]);
+        if (spawnStatus == EPERM || spawnStatus == EACCES) {
+            NSString *copyCmd = [NSString stringWithFormat:@"mkdir -p %@ && cp -f %@ %@ && chmod 0644 %@",
+                                 MCPShellQuote(parent),
+                                 MCPShellQuote(sourcePath),
+                                 MCPShellQuote(destPath),
+                                 MCPShellQuote(destPath)];
+            int copyExit = -1;
+            BOOL copyOK = MCPRunProcess(shellPath,
+                                        @[@"-lc", copyCmd],
+                                        MCPJailbreakEnvironment(),
+                                        30,
+                                        64 * 1024,
+                                        output,
+                                        &copyExit,
+                                        errorMessage);
+            return copyOK && copyExit == 0;
+        }
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn shell failed: %s", strerror(spawnStatus)];
         return NO;
     }

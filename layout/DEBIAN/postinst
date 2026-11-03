@@ -21,7 +21,7 @@ fix_perms() {
             chmod 0755 "${base}/usr/bin/${bin}" 2>/dev/null || true
         fi
     done
-    for helper in mcp-memory mcp-keychain mcp-appmod mcp-ocr-worker; do
+    for helper in mcp-memory mcp-keychain mcp-appmod mcp-helperd mcp-ocr-worker; do
         if [ -f "${base}/usr/libexec/ios-mcp/${helper}" ]; then
             chown 0:0 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true
             chmod 0755 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true
@@ -29,9 +29,52 @@ fix_perms() {
     done
 }
 
+start_helperd() {
+    base="$1"
+    helper="${base}/usr/libexec/ios-mcp/mcp-helperd"
+    if [ -x "$helper" ]; then
+        ld_dir="${base}/Library/LaunchDaemons"
+        mkdir -p "$ld_dir" 2>/dev/null || true
+        cat > "${ld_dir}/com.witchan.ios-mcp.helperd.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.witchan.ios-mcp.helperd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>${helper}</string>
+	</array>
+	<key>UserName</key>
+	<string>mobile</string>
+	<key>GroupName</key>
+	<string>mobile</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>__Patched</key>
+	<true/>
+</dict>
+</plist>
+EOF
+        chown 0:0 "${ld_dir}/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
+        chmod 0644 "${ld_dir}/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
+        "$helper" --daemon </dev/null >/dev/null 2>&1 || true
+        return 0
+    fi
+    return 1
+}
+
 if [ -n "$JB_BASE" ]; then
     fix_perms "$JB_BASE"
 fi
 fix_perms ""
+
+if [ -n "$JB_BASE" ] && start_helperd "$JB_BASE"; then
+    exit 0
+fi
+start_helperd "" || true
 
 exit 0

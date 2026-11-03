@@ -28,6 +28,9 @@ FOUNDATION_EXPORT BOOL MCPRunProcessData(NSString *launchPath,
 /// Resolve the bundled setuid mcp-root helper path, or nil/empty when unavailable.
 FOUNDATION_EXPORT NSString *MCPRootHelperPath(void);
 
+/// Connect to the local unsandboxed mcp-helperd spawn broker (returns socket FD >= 0 or -1).
+FOUNDATION_EXPORT int MCPConnectHelperDaemon(void);
+
 /// Run a command as root via the bundled mcp-root helper, capturing UTF-8 text output.
 FOUNDATION_EXPORT BOOL MCPRunRootProcess(NSString *launchPath,
                                          NSArray<NSString *> *arguments,
