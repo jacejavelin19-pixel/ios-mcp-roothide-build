@@ -21,8 +21,15 @@ mcp-ldid_CFLAGS += -I$(MCP_LDID_SOURCE_DIR) -I$(MCP_LDID_VENDOR_DIR)/usr/include
 mcp-ldid_CCFLAGS += -std=c++11 -stdlib=libc++ -I$(MCP_LDID_SOURCE_DIR) -I$(MCP_LDID_VENDOR_DIR)/usr/include -fvisibility=hidden -Wno-vla-cxx-extension -Wno-unused-but-set-variable -Wno-unused-function -DLDID_VERSION=\"$(MCP_LDID_VERSION)\"
 mcp-ldid_LDFLAGS += $(MCP_LDID_VENDOR_DIR)/usr/lib/libcrypto.a $(MCP_LDID_VENDOR_DIR)/usr/lib/libplist-2.0.a
 mcp-ldid_LIBRARIES = xml2 z iconv
+mcp-ldid_CODESIGN_FLAGS = -Sentitlements.plist
 mcp-ldid_INSTALL_PATH = /usr/bin
 mcp-ldid_USE_MODULES = 0
+
+ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+mcp-ldid_CFLAGS += -DMCP_ROOTHIDE=1
+mcp-ldid_CCFLAGS += -DMCP_ROOTHIDE=1
+mcp-ldid_LIBRARIES += roothide
+endif
 
 before-all::
 	@if [ ! -f "$(MCP_LDID_VENDOR_DIR)/usr/lib/libcrypto.a" ] || [ ! -f "$(MCP_LDID_VENDOR_DIR)/usr/lib/libplist-2.0.a" ]; then \

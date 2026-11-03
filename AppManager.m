@@ -1517,6 +1517,10 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     if (MCPIsExecutableFile(bundledLdidPath)) {
         [ldidCandidates addObject:bundledLdidPath];
     }
+    NSString *systemLdidPath = MCPResolvedJailbreakPath(@"/usr/bin/ldid");
+    if (MCPIsExecutableFile(systemLdidPath) && ![ldidCandidates containsObject:systemLdidPath]) {
+        [ldidCandidates addObject:systemLdidPath];
+    }
     NSString *mcpRootPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
     NSString *sudoPath = MCPResolvedJailbreakPath(@"/usr/bin/sudo");
     NSString *chmodPath = MCPResolvedJailbreakPath(@"/bin/chmod");
@@ -1670,40 +1674,51 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         }
 
         NSString *bootstrapSignTarget = MCPBootstrapArgumentPath(signTarget);
+        NSString *directSignArg = entitlementsPath.length > 0 ? [@"-S" stringByAppendingString:entitlementsPath] : @"-s";
+        NSMutableArray<NSArray<NSString *> *> *argVariants = [NSMutableArray array];
+        [argVariants addObject:@[directSignArg, signTarget]];
+        if (![signArg isEqualToString:directSignArg] || ![bootstrapSignTarget isEqualToString:signTarget]) {
+            [argVariants addObject:@[signArg, bootstrapSignTarget]];
+        }
         BOOL signedTarget = NO;
         NSString *lastOutput = nil;
         NSString *lastSpawnError = nil;
         int lastExitCode = -1;
 
         for (NSString *ldidPath in ldidCandidates) {
-            NSString *output = nil;
-            NSString *spawnError = nil;
-            int exitCode = -1;
-            BOOL finished = runPrivilegedCommand(ldidPath,
-                                                 @[signArg, bootstrapSignTarget],
-                                                 30,
-                                                 128 * 1024,
-                                                 &output,
-                                                 &exitCode,
-                                                 &spawnError);
-            if (finished && exitCode == 0) {
-                APP_LOG(@"Fakesigned %@ with %@ (%@)",
-                        resolvedBundleId ?: bundleId ?: @"<unknown>",
+            for (NSArray<NSString *> *ldidArgs in argVariants) {
+                NSString *output = nil;
+                NSString *spawnError = nil;
+                int exitCode = -1;
+                BOOL finished = runPrivilegedCommand(ldidPath,
+                                                     ldidArgs,
+                                                     30,
+                                                     128 * 1024,
+                                                     &output,
+                                                     &exitCode,
+                                                     &spawnError);
+                if (finished && exitCode == 0) {
+                    APP_LOG(@"Fakesigned %@ with %@ (%@)",
+                            resolvedBundleId ?: bundleId ?: @"<unknown>",
+                            ldidPath.lastPathComponent,
+                            MCPAppLogSafePath(signTarget));
+                    signedTarget = YES;
+                    break;
+                }
+
+                lastOutput = output;
+                lastSpawnError = spawnError;
+                lastExitCode = exitCode;
+                APP_LOG(@"mcp-ldid failed for %@ via %@ (spawnError=%@ exit=%d outputBytes=%lu)",
+                        MCPAppLogSafePath(signTarget),
                         ldidPath.lastPathComponent,
-                        MCPAppLogSafePath(signTarget));
-                signedTarget = YES;
+                        MCPAppLogRedactedText(spawnError ?: @"none"),
+                        exitCode,
+                        (unsigned long)MCPAppLogUTF8Length(output));
+            }
+            if (signedTarget) {
                 break;
             }
-
-            lastOutput = output;
-            lastSpawnError = spawnError;
-            lastExitCode = exitCode;
-            APP_LOG(@"mcp-ldid failed for %@ via %@ (spawnError=%@ exit=%d outputBytes=%lu)",
-                    MCPAppLogSafePath(signTarget),
-                    ldidPath.lastPathComponent,
-                    MCPAppLogRedactedText(spawnError ?: @"none"),
-                    exitCode,
-                    (unsigned long)MCPAppLogUTF8Length(output));
         }
 
         if (entitlementsPath.length > 0) {

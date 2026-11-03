@@ -661,12 +661,90 @@ static int AppInstRunMcpLdid(NSArray<NSString *> *args, NSString **stdOut, NSStr
 	return 175;
 }
 
+static NSString *AppInstKernelPath(NSString *path) {
+	if (path.length == 0) return path;
+	if ([path hasPrefix:@"/rootfs/"]) {
+		return [path substringFromIndex:7];
+	}
+	return path;
+}
+
+static int AppInstRunLdidAtPath(NSString *ldidPath, NSArray<NSString *> *args, NSString **stdOut, NSString **stdErr) {
+	if (ldidPath.length == 0) return 175;
+	if (getenv("APPINST_DEBUG_PATHS")) {
+		fprintf(stderr, "[appinst] using ldid path: %s\n", ldidPath.UTF8String ?: "");
+	}
+	NSMutableArray<NSString *> *argsM = args.mutableCopy ?: [NSMutableArray array];
+	[argsM insertObject:ldidPath.lastPathComponent atIndex:0];
+	if (getenv("APPINST_DEBUG_PATHS")) {
+		fprintf(stderr, "[appinst] spawning ldid with args: %s\n",
+		        [[argsM componentsJoinedByString:@" | "] UTF8String] ?: "");
+	}
+	NSUInteger argCount = argsM.count;
+	char **argsC = (char **)calloc(argCount + 1, sizeof(char *));
+	for (NSUInteger i = 0; i < argCount; i++) {
+		argsC[i] = strdup(argsM[i].UTF8String ?: "");
+	}
+
+	int outPipe[2] = {-1, -1};
+	int errPipe[2] = {-1, -1};
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	pipe(outPipe);
+	pipe(errPipe);
+	posix_spawn_file_actions_adddup2(&actions, outPipe[1], STDOUT_FILENO);
+	posix_spawn_file_actions_adddup2(&actions, errPipe[1], STDERR_FILENO);
+	posix_spawn_file_actions_addclose(&actions, outPipe[0]);
+	posix_spawn_file_actions_addclose(&actions, errPipe[0]);
+
+	pid_t pid = 0;
+	int spawnError = posix_spawn(&pid, ldidPath.fileSystemRepresentation, &actions, NULL, argsC, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	close(outPipe[1]);
+	close(errPipe[1]);
+
+	for (NSUInteger i = 0; i < argCount; i++) {
+		free(argsC[i]);
+	}
+	free(argsC);
+
+	if (spawnError != 0) {
+		close(outPipe[0]);
+		close(errPipe[0]);
+		if (stdErr) *stdErr = [NSString stringWithFormat:@"posix_spawn failed: %s", strerror(spawnError)];
+		return spawnError;
+	}
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) < 0) {
+		close(outPipe[0]);
+		close(errPipe[0]);
+		if (stdErr) *stdErr = [NSString stringWithFormat:@"waitpid failed: %s", strerror(errno)];
+		return 175;
+	}
+
+	if (stdOut) *stdOut = AppInstReadStringFromFD(outPipe[0]);
+	if (stdErr) *stdErr = AppInstReadStringFromFD(errPipe[0]);
+	close(outPipe[0]);
+	close(errPipe[0]);
+
+	if (WIFEXITED(status)) {
+		return WEXITSTATUS(status);
+	}
+	if (WIFSIGNALED(status)) {
+		return 128 + WTERMSIG(status);
+	}
+	return 175;
+}
+
 static int AppInstSignAdhoc(NSString *filePath, NSDictionary *entitlements) {
 	NSString *entitlementsPath = nil;
-	NSString *signArg = @"-s";
+	NSString *bootstrapSignArg = @"-s";
+	NSString *directSignArg = @"-s";
 	NSString *mcpLdidOutput = nil;
 	NSString *mcpLdidError = nil;
-	NSString *signTargetPath = AppInstBootstrapArgumentPath(filePath);
+	NSString *bootstrapTargetPath = AppInstBootstrapArgumentPath(filePath);
+	NSString *directTargetPath = AppInstKernelPath(filePath);
 
 	if (entitlements) {
 		NSData *entitlementsXML = [NSPropertyListSerialization dataWithPropertyList:entitlements
@@ -679,11 +757,52 @@ static int AppInstSignAdhoc(NSString *filePath, NSDictionary *entitlements) {
 			entitlementsPath = [[temporaryDirectory stringByAppendingPathComponent:[NSUUID UUID].UUIDString]
 			                   stringByAppendingPathExtension:@"plist"];
 			[entitlementsXML writeToFile:entitlementsPath atomically:NO];
-			signArg = [@"-S" stringByAppendingString:AppInstBootstrapArgumentPath(entitlementsPath)];
+			bootstrapSignArg = [@"-S" stringByAppendingString:AppInstBootstrapArgumentPath(entitlementsPath)];
+			directSignArg = [@"-S" stringByAppendingString:AppInstKernelPath(entitlementsPath)];
 		}
 	}
 
-	int mcpLdidRet = AppInstRunMcpLdid(@[signArg, signTargetPath], &mcpLdidOutput, &mcpLdidError);
+	NSMutableArray<NSArray<NSString *> *> *argVariants = [NSMutableArray array];
+	[argVariants addObject:@[directSignArg, directTargetPath]];
+	if (![bootstrapSignArg isEqualToString:directSignArg] || ![bootstrapTargetPath isEqualToString:directTargetPath]) {
+		[argVariants addObject:@[bootstrapSignArg, bootstrapTargetPath]];
+	}
+
+	NSMutableArray<NSString *> *ldidTools = [NSMutableArray array];
+	NSString *primaryLdid = AppInstMcpLdidPath();
+	if (primaryLdid.length > 0) {
+		[ldidTools addObject:primaryLdid];
+	}
+#ifdef MCP_ROOTHIDE
+	NSString *mirrorSystemLdid = AppInstRoothideMirrorPath(@"/usr/bin/ldid");
+	if (AppInstPathExists(mirrorSystemLdid) && ![ldidTools containsObject:mirrorSystemLdid]) {
+		[ldidTools addObject:mirrorSystemLdid];
+	}
+#endif
+	NSString *resolvedSystemLdid = AppInstResolvedJailbreakPath(@"/usr/bin/ldid");
+	if (AppInstPathExists(resolvedSystemLdid) && ![ldidTools containsObject:resolvedSystemLdid]) {
+		[ldidTools addObject:resolvedSystemLdid];
+	}
+
+	int mcpLdidRet = AppInstRunMcpLdid(argVariants.firstObject, &mcpLdidOutput, &mcpLdidError);
+	if (mcpLdidRet != 0) {
+		for (NSString *toolPath in ldidTools) {
+			for (NSArray<NSString *> *candidateArgs in argVariants) {
+				NSString *outStr = nil;
+				NSString *errStr = nil;
+				mcpLdidRet = AppInstRunLdidAtPath(toolPath, candidateArgs, &outStr, &errStr);
+				mcpLdidOutput = outStr;
+				mcpLdidError = errStr;
+				if (mcpLdidRet == 0) {
+					break;
+				}
+			}
+			if (mcpLdidRet == 0) {
+				break;
+			}
+		}
+	}
+
 	if (entitlementsPath.length > 0) {
 		[[NSFileManager defaultManager] removeItemAtPath:entitlementsPath error:nil];
 	}
