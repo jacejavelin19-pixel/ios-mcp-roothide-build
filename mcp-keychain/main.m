@@ -142,11 +142,14 @@ int main(int argc, const char *argv[]) {
                         @"items": items
                     }
                 };
-            } else if (status == errSecItemNotFound) {
+            } else if (status == errSecItemNotFound || (status == errSecSuccess && itemRef == NULL)) {
+                // kSecMatchLimitAll can return errSecSuccess with a NULL result
+                // (instead of errSecItemNotFound) when nothing matches; treat
+                // both as "no items" rather than falling through to the error path.
                 response = @{
                     @"ok": @YES,
-                    @"status": @(status),
-                    @"osstatus": @(status),
+                    @"status": @(errSecItemNotFound),
+                    @"osstatus": @(errSecItemNotFound),
                     @"result": @{
                         @"count": @0,
                         @"items": @[]
