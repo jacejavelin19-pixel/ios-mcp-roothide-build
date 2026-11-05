@@ -533,26 +533,54 @@ static BOOL MCPWriteFileToShellPath(NSString *sourcePath, NSString *destPath, NS
     close(outputPipe[1]);
 
     if (spawnStatus != 0) {
-        close(sourceFD);
         close(stdinPipe[1]);
         close(outputPipe[0]);
         if (spawnStatus == EPERM || spawnStatus == EACCES) {
-            NSString *copyCmd = [NSString stringWithFormat:@"mkdir -p %@ && cp -f %@ %@ && chmod 0644 %@",
-                                 MCPShellQuote(parent),
-                                 MCPShellQuote(sourcePath),
-                                 MCPShellQuote(destPath),
-                                 MCPShellQuote(destPath)];
-            int copyExit = -1;
-            BOOL copyOK = MCPRunProcess(shellPath,
-                                        @[@"-lc", copyCmd],
-                                        MCPJailbreakEnvironment(),
-                                        30,
-                                        64 * 1024,
-                                        output,
-                                        &copyExit,
-                                        errorMessage);
-            return copyOK && copyExit == 0;
+            // Spawning a shell directly from this process can be sandbox-denied
+            // (iOS 18.x SpringBoard-embedded tweak context). Routing the copy
+            // through an external `cp`/MCPRunProcess here is wrong too: that
+            // executes via the unsandboxed helper broker, which runs inside the
+            // RootHide jbroot-virtualized filesystem view and cannot see paths
+            // (like the HTTP upload directory) that only this process's own,
+            // unvirtualized view resolves. Copy the already-open source fd
+            // directly in this process instead, which shares sourcePath's view.
+            NSString *mkdirError = nil;
+            if (![[NSFileManager defaultManager] createDirectoryAtPath:parent
+                                            withIntermediateDirectories:YES
+                                                             attributes:nil
+                                                                  error:nil]) {
+                mkdirError = [NSString stringWithFormat:@"Failed to create %@", parent];
+            }
+            int destFD = open(destPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (destFD < 0) {
+                close(sourceFD);
+                if (errorMessage) *errorMessage = mkdirError ?: [NSString stringWithFormat:@"Failed to open destination %@: %s", destPath, strerror(errno)];
+                return NO;
+            }
+            BOOL copyFailed = NO;
+            uint8_t copyBuffer[65536];
+            while (1) {
+                ssize_t n = read(sourceFD, copyBuffer, sizeof(copyBuffer));
+                if (n < 0) { copyFailed = YES; break; }
+                if (n == 0) break;
+                ssize_t written = 0;
+                while (written < n) {
+                    ssize_t w = write(destFD, copyBuffer + written, (size_t)(n - written));
+                    if (w <= 0) { copyFailed = YES; break; }
+                    written += w;
+                }
+                if (copyFailed) break;
+            }
+            close(sourceFD);
+            close(destFD);
+            if (copyFailed) {
+                if (errorMessage) *errorMessage = [NSString stringWithFormat:@"In-process copy failed: %s", strerror(errno)];
+                return NO;
+            }
+            if (output) *output = @"";
+            return YES;
         }
+        close(sourceFD);
         if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn shell failed: %s", strerror(spawnStatus)];
         return NO;
     }
