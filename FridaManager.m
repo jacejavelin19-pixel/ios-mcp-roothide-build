@@ -591,7 +591,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
 }
 
 - (NSString *)sessionsDirectory {
-    NSString *dir = [kMCPPreservedFridaDir stringByAppendingPathComponent:@"sessions"];
+    NSString *dir = [MCPResolvedJailbreakPath(kMCPPreservedFridaDir) stringByAppendingPathComponent:@"sessions"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return dir;
 }
@@ -622,27 +622,33 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
 }
 
 - (NSString *)ensurePreservedGadgetAvailable:(NSString **)error {
+    // kMCPPreservedGadgetPath/kMCPPreservedGadgetXZPath are logical (pre-RootHide)
+    // paths; resolve them against the current .jbroot-* root on every call rather
+    // than assuming a fixed location, since the jbroot id can change across
+    // reinstalls/respring cycles.
+    NSString *resolvedGadgetPath = MCPResolvedJailbreakPath(kMCPPreservedGadgetPath);
+    NSString *resolvedGadgetXZPath = MCPResolvedJailbreakPath(kMCPPreservedGadgetXZPath);
     NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:kMCPPreservedGadgetPath]) {
-        return kMCPPreservedGadgetPath;
+    if ([fm fileExistsAtPath:resolvedGadgetPath]) {
+        return resolvedGadgetPath;
     }
-    if ([fm fileExistsAtPath:kMCPPreservedGadgetXZPath]) {
+    if ([fm fileExistsAtPath:resolvedGadgetXZPath]) {
         NSString *outStr = nil, *runErr = nil;
         int code = -1;
         BOOL ok = MCPRunRootProcess(@"/usr/libexec/ios-mcp/mcp-appmod",
-                                    @[@"decompress-xz", kMCPPreservedGadgetXZPath, kMCPPreservedGadgetPath],
+                                    @[@"decompress-xz", resolvedGadgetXZPath, resolvedGadgetPath],
                                     60.0,
                                     256 * 1024,
                                     &outStr,
                                     &code,
                                     &runErr);
-        if (ok && code == 0 && [fm fileExistsAtPath:kMCPPreservedGadgetPath]) {
-            return kMCPPreservedGadgetPath;
+        if (ok && code == 0 && [fm fileExistsAtPath:resolvedGadgetPath]) {
+            return resolvedGadgetPath;
         }
         if (error) *error = [NSString stringWithFormat:@"Failed to decompress preserved gadget.dylib.xz: %@", outStr ?: runErr ?: @"error"];
         return nil;
     }
-    if (error) *error = [NSString stringWithFormat:@"Preserved Frida Gadget not found at %@", kMCPPreservedGadgetPath];
+    if (error) *error = [NSString stringWithFormat:@"Preserved Frida Gadget not found at %@", resolvedGadgetPath];
     return nil;
 }
 
@@ -728,8 +734,8 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
         destPath = MCPResolvedJailbreakPath(destPath);
     }
 
-    if ([destPath isEqualToString:kMCPPreservedGadgetPath] ||
-        [destPath isEqualToString:kMCPPreservedGadgetXZPath]) {
+    if ([destPath isEqualToString:MCPResolvedJailbreakPath(kMCPPreservedGadgetPath)] ||
+        [destPath isEqualToString:MCPResolvedJailbreakPath(kMCPPreservedGadgetXZPath)]) {
         if (error) *error = @"Refusing to overwrite preserved gadget.dylib / gadget.dylib.xz in place; provide a distinct output_path";
         return nil;
     }
