@@ -737,6 +737,35 @@ static int AppInstRunLdidAtPath(NSString *ldidPath, NSArray<NSString *> *args, N
 	return 175;
 }
 
+// On RootHide the kernel (pmap_cs) only trusts a Mach-O whose cdhash is in the
+// jailbreak dynamic trust cache. dpkg-installed binaries get there via RootHide's
+// dpkg hook, but an app we install and ad-hoc re-sign here does not, so it is
+// SIGKILL'd at exec. Register the freshly-signed binary's cdhash via jbctl. This
+// must run after every (re)sign, because signing changes the cdhash. appinst runs
+// as root during install, which jbctl trustcache add requires.
+static void AppInstRegisterTrust(NSString *filePath) {
+	if (filePath.length == 0) return;
+	NSString *jbctlPath = AppInstResolvedJailbreakPath(@"/usr/bin/jbctl");
+	if (!AppInstPathExists(jbctlPath)) {
+		jbctlPath = @"/usr/bin/jbctl";
+		if (!AppInstPathExists(jbctlPath)) {
+			fprintf(stderr, "[appinst] jbctl not found; cannot register trust for %s\n", filePath.UTF8String ?: "");
+			return;
+		}
+	}
+	NSString *target = AppInstKernelPath(filePath);
+	NSString *outStr = nil;
+	NSString *errStr = nil;
+	int rc = AppInstRunLdidAtPath(jbctlPath, @[@"trustcache", @"add", target], &outStr, &errStr);
+	if (rc != 0) {
+		fprintf(stderr, "[appinst] jbctl trustcache add failed (rc=%d) for %s: %s %s\n",
+		        rc, target.UTF8String ?: "",
+		        outStr.UTF8String ?: "", errStr.UTF8String ?: "");
+	} else if (getenv("APPINST_DEBUG_PATHS")) {
+		fprintf(stderr, "[appinst] registered trust for %s\n", target.UTF8String ?: "");
+	}
+}
+
 static int AppInstSignAdhoc(NSString *filePath, NSDictionary *entitlements) {
 	NSString *entitlementsPath = nil;
 	NSString *bootstrapSignArg = @"-s";
@@ -812,6 +841,9 @@ static int AppInstSignAdhoc(NSString *filePath, NSDictionary *entitlements) {
 		if (mcpLdidError.length > 0) fprintf(stderr, "%s\n", mcpLdidError.UTF8String);
 		return 175;
 	}
+
+	// Sign succeeded and the cdhash is now final; register it so the kernel trusts it.
+	AppInstRegisterTrust(filePath);
 
 	return 0;
 }

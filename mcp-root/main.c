@@ -33,6 +33,7 @@ typedef enum {
     MCP_ALLOWED_COMMAND_MEMORY,
     MCP_ALLOWED_COMMAND_KEYCHAIN,
     MCP_ALLOWED_COMMAND_APPMOD,
+    MCP_ALLOWED_COMMAND_JBCTL,
 } MCPAllowedCommand;
 
 static void print_usage(const char *program) {
@@ -354,6 +355,33 @@ static int validate_id_arguments(int argc, char *argv[]) {
     return 1;
 }
 
+static int validate_jbctl_arguments(int argc, char *argv[]) {
+    // Only the non-destructive trustcache operations are permitted:
+    //   jbctl trustcache add <absolute macho path>
+    //   jbctl trustcache info
+    // Never clear/update (would drop every jailbreak cdhash or reboot).
+    if (argc < 3 || strcmp(argv[2], "trustcache") != 0) {
+        fprintf(stderr, "jbctl usage is restricted to trustcache add/info\n");
+        return 0;
+    }
+    if (argc == 4 && strcmp(argv[3], "add") == 0) {
+        fprintf(stderr, "jbctl trustcache add requires a macho path\n");
+        return 0;
+    }
+    if (argc == 5 && strcmp(argv[3], "add") == 0) {
+        if (argv[4][0] != '/') {
+            fprintf(stderr, "jbctl trustcache add path must be absolute: %s\n", argv[4]);
+            return 0;
+        }
+        return 1;
+    }
+    if (argc == 4 && strcmp(argv[3], "info") == 0) {
+        return 1;
+    }
+    fprintf(stderr, "jbctl trustcache subcommand is not permitted\n");
+    return 0;
+}
+
 typedef enum {
     MCP_DPKG_OPERATION_NONE = 0,
     MCP_DPKG_OPERATION_INSTALL,
@@ -485,6 +513,8 @@ static MCPAllowedCommand classify_allowed_command(const char *command_path) {
         {"/usr/libexec/ios-mcp/mcp-memory", MCP_ALLOWED_COMMAND_MEMORY},
         {"/usr/libexec/ios-mcp/mcp-keychain", MCP_ALLOWED_COMMAND_KEYCHAIN},
         {"/usr/libexec/ios-mcp/mcp-appmod", MCP_ALLOWED_COMMAND_APPMOD},
+        {"/usr/bin/jbctl", MCP_ALLOWED_COMMAND_JBCTL},
+        {"/basebin/jbctl", MCP_ALLOWED_COMMAND_JBCTL},
     };
     size_t i;
 
@@ -532,6 +562,9 @@ int main(int argc, char *argv[]) {
         return 126;
     }
     if (allowedCommand == MCP_ALLOWED_COMMAND_ID && !validate_id_arguments(argc, argv)) {
+        return 126;
+    }
+    if (allowedCommand == MCP_ALLOWED_COMMAND_JBCTL && !validate_jbctl_arguments(argc, argv)) {
         return 126;
     }
     if (allowedCommand == MCP_ALLOWED_COMMAND_DPKG && !validate_dpkg_arguments(argc, argv)) {

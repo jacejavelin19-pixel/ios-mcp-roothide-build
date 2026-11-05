@@ -274,6 +274,31 @@ static BOOL MCPAMWriteFreshVnode(NSData *data,
     return YES;
 }
 
+// After (re)signing, the binary's cdhash changed, so the kernel (RootHide pmap_cs)
+// no longer trusts it and will SIGKILL it at launch. Register the new cdhash in the
+// jailbreak trust cache via jbctl. The cdhash is content-derived, so registering the
+// staged copy here covers the identical bytes once they are moved into place.
+// mcp-appmod runs as root (via mcp-root), which jbctl trustcache add requires.
+static void MCPAMRegisterTrust(NSString *workDir, NSString *stageFileName) {
+    NSString *jbctlPath = MCPAMResolveJBTool(@"/usr/bin/jbctl");
+    if (!MCPAMIsExecutable(jbctlPath)) {
+        jbctlPath = MCPAMResolveJBTool(@"/basebin/jbctl");
+    }
+    if (!MCPAMIsExecutable(jbctlPath)) {
+        fprintf(stderr, "mcp-appmod: jbctl not found; cannot register trust for %s\n", stageFileName.UTF8String ?: "");
+        return;
+    }
+    NSString *stagePath = [workDir stringByAppendingPathComponent:stageFileName];
+    int code = -1;
+    NSData *out = nil;
+    NSString *errText = nil;
+    NSString *runErr = nil;
+    if (!MCPAMRunCommandInDir(jbctlPath, @[@"trustcache", @"add", stagePath], nil, &code, &out, &errText, &runErr) || code != 0) {
+        fprintf(stderr, "mcp-appmod: jbctl trustcache add failed (code=%d) for %s: %s %s\n",
+                code, stagePath.UTF8String ?: "", (errText ?: @"").UTF8String, (runErr ?: @"").UTF8String);
+    }
+}
+
 static BOOL MCPAMSignStageBinary(NSString *workDir,
                                  NSString *stageFileName,
                                  NSDictionary * _Nullable entitlements,
@@ -316,12 +341,14 @@ static BOOL MCPAMSignStageBinary(NSString *workDir,
         NSString *fallbackLdid = MCPAMResolveJBTool(@"/usr/bin/ldid");
         if (MCPAMIsExecutable(fallbackLdid) && ![fallbackLdid isEqualToString:ldidPath]) {
             if (MCPAMRunCommandInDir(fallbackLdid, @[signFlag, stageFileName], workDir, &exitCode, &outData, &errText, error) && exitCode == 0) {
+                MCPAMRegisterTrust(workDir, stageFileName);
                 return YES;
             }
         }
         if (error) *error = [NSString stringWithFormat:@"ldid exited %d: %@", exitCode, errText ?: @""];
         return NO;
     }
+    MCPAMRegisterTrust(workDir, stageFileName);
     return YES;
 }
 
