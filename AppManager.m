@@ -863,6 +863,66 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         }
     }
 
+    // Fallback: /usr/bin/uiopen --bundleid <bundleId>. LSApplicationWorkspace
+    // openApplicationWithBundleID: returns NO on iOS 18.x RootHide for ad-hoc
+    // signed user-containerized apps even though uiopen succeeds for the same
+    // bundle, and the legacy SBUIController path above no longer exists on
+    // modern SpringBoard.
+    if (!ok) {
+        NSString *uiopenPath = MCPResolvedJailbreakPath(@"/usr/bin/uiopen");
+        if (!MCPIsExecutableFile(uiopenPath)) {
+            uiopenPath = @"/usr/bin/uiopen";
+        }
+        if (MCPIsExecutableFile(uiopenPath)) {
+            NSString *uiopenOut = nil;
+            NSString *uiopenErr = nil;
+            int uiopenExit = -1;
+            BOOL spawned = MCPRunProcess(uiopenPath,
+                                          @[@"--bundleid", bundleId],
+                                          MCPJailbreakEnvironment(),
+                                          10,
+                                          64 * 1024,
+                                          &uiopenOut,
+                                          &uiopenExit,
+                                          &uiopenErr);
+            if (spawned && uiopenExit == 0) {
+                APP_LOG(@"Launched %@ via uiopen --bundleid", bundleId);
+                ok = YES;
+                errMsg = nil;
+            } else {
+                APP_LOG(@"uiopen --bundleid %@ failed exit=%d err=%@", bundleId, uiopenExit, uiopenErr ?: @"-");
+            }
+        }
+    }
+
+    // Fallback: the app's own registered custom URL scheme, if it has one.
+    // Covers the case where uiopen itself is unavailable or blocked.
+    if (!ok) {
+        NSDictionary *appInfo = [self appInfoForBundleId:bundleId error:nil];
+        NSString *bundlePath = appInfo[@"bundle_path"];
+        if (bundlePath.length > 0) {
+            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+            NSArray *urlTypes = plist[@"CFBundleURLTypes"];
+            if ([urlTypes isKindOfClass:[NSArray class]] && urlTypes.count > 0 &&
+                [urlTypes[0] isKindOfClass:[NSDictionary class]]) {
+                NSArray *schemes = urlTypes[0][@"CFBundleURLSchemes"];
+                if ([schemes isKindOfClass:[NSArray class]] && schemes.count > 0 &&
+                    [schemes[0] isKindOfClass:[NSString class]]) {
+                    NSString *scheme = schemes[0];
+                    NSString *urlStr = [NSString stringWithFormat:@"%@://", scheme];
+                    NSString *openErr = nil;
+                    if ([self openURL:urlStr error:&openErr]) {
+                        APP_LOG(@"Launched %@ via custom URL scheme %@", bundleId, urlStr);
+                        ok = YES;
+                        errMsg = nil;
+                    } else {
+                        APP_LOG(@"Custom URL scheme launch for %@ failed: %@", bundleId, openErr ?: @"-");
+                    }
+                }
+            }
+        }
+    }
+
     if (!ok) {
         if (error) *error = errMsg;
         return NO;
