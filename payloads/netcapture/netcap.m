@@ -125,7 +125,6 @@ static NSArray<Class> *(*orig_netcap_protocolClasses)(id self, SEL _cmd) = NULL;
 static NSURLSession *(*orig_netcap_sessionWithConfig)(id self, SEL _cmd, NSURLSessionConfiguration *cfg, id delegate, NSOperationQueue *queue) = NULL;
 static NSURLSession *(*orig_netcap_sessionWithConfigOnly)(id self, SEL _cmd, NSURLSessionConfiguration *cfg) = NULL;
 static NSURLSession *(*orig_sharedSession)(id self, SEL _cmd) = NULL;
-static void (*orig_netcap_taskResume)(id self, SEL _cmd) = NULL;
 
 @implementation MCPNetCapURLProtocol
 

@@ -542,6 +542,7 @@ static int hook_cap_SSL_write(void *ssl, const void *buf, int num) {
                 }
             }
         } @catch (NSException *ex) {
+            (void)ex;
         } @finally {
             MEDepth--;
         }
@@ -605,6 +606,7 @@ static int hook_cap_SSL_read(void *ssl, void *buf, int num) {
                 MCPCapAppendRecord(record);
             }
         } @catch (NSException *ex) {
+            (void)ex;
         } @finally {
             MEDepth--;
         }
