@@ -27,7 +27,19 @@ case "$1" in
         rm -f "/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
         for jb_cand in /var/containers/Bundle/Application/.jbroot-*; do
             if [ -d "$jb_cand" ]; then
-                rm -f "${jb_cand}/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
+                rm -f "${jb_cand}/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" \
+                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp-work" \
+                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp-uploads" \
+                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp-appmod" \
+                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp" \
+                      "${jb_cand}/var/mobile/Library/Logs/iOSMCP" 2>/dev/null || true
+                rm -rf "${jb_cand}/var/mobile/Library/Caches/ios-mcp-work" \
+                       "${jb_cand}/var/mobile/Library/Caches/ios-mcp-uploads" \
+                       "${jb_cand}/var/mobile/Library/Caches/ios-mcp-appmod" \
+                       "${jb_cand}/var/mobile/Library/Caches/ios-mcp" \
+                       "${jb_cand}/var/mobile/Library/Logs/iOSMCP" \
+                       "${jb_cand}/var/mobile/Library/ios-mcp/engine-sessions" \
+                       "${jb_cand}/var/mobile/Library/ios-mcp/frida/sessions" 2>/dev/null || true
             fi
         done
 
@@ -36,11 +48,18 @@ case "$1" in
                /var/mobile/Library/Caches/ios-mcp-uploads \
                /var/mobile/Library/Caches/ios-mcp-appmod \
                /var/mobile/Library/Caches/ios-mcp \
-               /var/mobile/Library/Logs/iOSMCP 2>/dev/null || true
+               /var/mobile/Library/Logs/iOSMCP \
+               /private/var/mobile/Library/Caches/ios-mcp-work \
+               /private/var/mobile/Library/Caches/ios-mcp-uploads \
+               /private/var/mobile/Library/Caches/ios-mcp-appmod \
+               /private/var/mobile/Library/Caches/ios-mcp \
+               /private/var/mobile/Library/Logs/iOSMCP 2>/dev/null || true
 
         # 3. Remove engine-sessions and frida/sessions while preserving /var/mobile/Library/ios-mcp/frida/gadget.dylib*
         rm -rf /var/mobile/Library/ios-mcp/engine-sessions \
-               /var/mobile/Library/ios-mcp/frida/sessions 2>/dev/null || true
+               /var/mobile/Library/ios-mcp/frida/sessions \
+               /private/var/mobile/Library/ios-mcp/engine-sessions \
+               /private/var/mobile/Library/ios-mcp/frida/sessions 2>/dev/null || true
         ;;
 esac
 

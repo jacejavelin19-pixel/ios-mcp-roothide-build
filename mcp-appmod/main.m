@@ -1653,6 +1653,27 @@ int main(int argc, const char *argv[]) {
                 }
             }
 
+            NSString *dataContainerRoot = @"/var/mobile/Containers/Data/Application";
+            for (NSString *uuidDir in [fm contentsOfDirectoryAtPath:dataContainerRoot error:nil]) {
+                if ([uuidDir hasPrefix:@"."]) continue;
+                NSString *tmpPath = [[dataContainerRoot stringByAppendingPathComponent:uuidDir] stringByAppendingPathComponent:@"tmp"];
+                if (!MCPAMPathExists(tmpPath)) continue;
+                for (NSString *tmpEntry in [fm contentsOfDirectoryAtPath:tmpPath error:nil]) {
+                    if ([tmpEntry isEqualToString:@".mcpe_cfg.json"] ||
+                        [tmpEntry isEqualToString:@".mcp_stealth_cfg.json"] ||
+                        [tmpEntry isEqualToString:@".mcp_stealth_status.json"] ||
+                        [tmpEntry isEqualToString:@".mcpcap.jsonl"] ||
+                        [tmpEntry isEqualToString:@".mcp_netcap.jsonl"] ||
+                        [tmpEntry hasPrefix:@".me_"] ||
+                        [tmpEntry hasPrefix:@".fc_"]) {
+                        NSString *tp = [tmpPath stringByAppendingPathComponent:tmpEntry];
+                        if (unlink(tp.fileSystemRepresentation) == 0) {
+                            [deletedFiles addObject:tp];
+                        }
+                    }
+                }
+            }
+
             for (NSString *appPath in appBundles) {
                 if (!MCPAMPathExists(appPath)) continue;
                 for (NSString *entry in [fm contentsOfDirectoryAtPath:appPath error:nil]) {

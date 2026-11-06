@@ -2,6 +2,12 @@
 # Intentionally NOT using `set -e`: every step in prerm is best-effort (`|| true`)
 # so package removal via Sileo or dpkg never fails or hangs.
 
+case "$1" in
+    upgrade|failed-upgrade)
+        exit 0
+        ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
 
 JB_BASE=""
@@ -17,11 +23,20 @@ if [ -z "$JB_BASE" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr/b
     JB_BASE="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo "")"
 fi
 
-# 1. Stop and bootout com.witchan.ios-mcp.helperd from launchd (bounded & backgrounded)
+# 1. Stop and bootout com.witchan.ios-mcp.helperd from launchd (bounded & fully detached)
 if command -v launchctl >/dev/null 2>&1; then
-    ( timeout 8 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true ) &
+    ( timeout 5 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true ) </dev/null >/dev/null 2>&1 &
 fi
-killall -9 mcp-helperd >/dev/null 2>&1 || pkill -9 -f mcp-helperd >/dev/null 2>&1 || true
+
+# Kill mcp-helperd immediately unless mcp-helperd is in our parent chain
+_anc="$(ps -o comm= -p $PPID 2>/dev/null || echo "")"
+case "$_anc" in
+    *mcp-helperd*)
+        ;;
+    *)
+        killall -9 mcp-helperd >/dev/null 2>&1 || pkill -9 -f mcp-helperd >/dev/null 2>&1 || true
+        ;;
+esac
 
 # 2. Resolve mcp-appmod while it is still installed and run cleanup-all
 APPMOD=""
@@ -36,11 +51,14 @@ elif [ -x /usr/libexec/ios-mcp/mcp-appmod ]; then
     APPMOD="/usr/libexec/ios-mcp/mcp-appmod"
 fi
 
+CLEANED_BY_APPMOD=0
 if [ -n "$APPMOD" ] && [ -x "$APPMOD" ]; then
-    timeout 25 "$APPMOD" cleanup-all >/dev/null 2>&1 || true
+    if timeout 15 "$APPMOD" cleanup-all </dev/null >/dev/null 2>&1; then
+        CLEANED_BY_APPMOD=1
+    fi
 fi
 
-# 3. Shell fallback sweep for TweakInject and any remaining per-app staged artifacts
+# 3. Direct TweakInject sweep + fallback bundle/container sweep
 for ti_dir in "${JB_BASE}/usr/lib/TweakInject" "/usr/lib/TweakInject" "${JB_BASE}/Library/MobileSubstrate/DynamicLibraries"; do
     if [ -n "$ti_dir" ] && [ -d "$ti_dir" ]; then
         rm -f "${ti_dir}"/00_libApple* \
@@ -56,37 +74,35 @@ for ti_dir in "${JB_BASE}/usr/lib/TweakInject" "/usr/lib/TweakInject" "${JB_BASE
     fi
 done
 
-for app_dir in /var/containers/Bundle/Application/*/*.app; do
-    [ -d "$app_dir" ] || continue
-    if [ -d "${app_dir}/Frameworks" ]; then
-        rm -f "${app_dir}/Frameworks"/libAppleCoreSVG_* \
-              "${app_dir}/Frameworks"/libAppleMediaKit_* \
-              "${app_dir}/Frameworks"/libAppleAudioDSP_* \
-              "${app_dir}/Frameworks"/libAppleAVSync_* \
-              "${app_dir}/Frameworks"/libAppleCoreTLS_* \
-              "${app_dir}/Frameworks"/libmcp_* 2>/dev/null || true
-    fi
-    for orig_file in "${app_dir}"/*.mcp_orig; do
-        [ -f "$orig_file" ] || continue
-        main_bin="${orig_file%.mcp_orig}"
-        if [ -n "$APPMOD" ] && [ -x "$APPMOD" ]; then
-            "$APPMOD" remove-dylib "$main_bin" --restore-orig >/dev/null 2>&1 || mv -f "$orig_file" "$main_bin" 2>/dev/null || true
-        else
-            mv -f "$orig_file" "$main_bin" 2>/dev/null || true
+if [ "$CLEANED_BY_APPMOD" -eq 0 ]; then
+    for app_dir in /var/containers/Bundle/Application/*/*.app; do
+        [ -d "$app_dir" ] || continue
+        if [ -d "${app_dir}/Frameworks" ]; then
+            rm -f "${app_dir}/Frameworks"/libAppleCoreSVG_* \
+                  "${app_dir}/Frameworks"/libAppleMediaKit_* \
+                  "${app_dir}/Frameworks"/libAppleAudioDSP_* \
+                  "${app_dir}/Frameworks"/libAppleAVSync_* \
+                  "${app_dir}/Frameworks"/libAppleCoreTLS_* \
+                  "${app_dir}/Frameworks"/libmcp_* 2>/dev/null || true
         fi
-        rm -f "$orig_file" 2>/dev/null || true
+        for orig_file in "${app_dir}"/*.mcp_orig; do
+            [ -f "$orig_file" ] || continue
+            main_bin="${orig_file%.mcp_orig}"
+            mv -f "$orig_file" "$main_bin" 2>/dev/null || true
+            rm -f "$orig_file" 2>/dev/null || true
+        done
     done
-done
 
-for data_dir in /var/mobile/Containers/Data/Application/*; do
-    [ -d "${data_dir}/tmp" ] || continue
-    rm -f "${data_dir}/tmp/.mcpe_cfg.json" \
-          "${data_dir}/tmp/.mcp_stealth_cfg.json" \
-          "${data_dir}/tmp/.mcp_stealth_status.json" \
-          "${data_dir}/tmp/.mcpcap.jsonl" \
-          "${data_dir}/tmp/.mcp_netcap.jsonl" \
-          "${data_dir}/tmp"/.me_* \
-          "${data_dir}/tmp"/.fc_* 2>/dev/null || true
-done
+    for data_dir in /var/mobile/Containers/Data/Application/*; do
+        [ -d "${data_dir}/tmp" ] || continue
+        rm -f "${data_dir}/tmp/.mcpe_cfg.json" \
+              "${data_dir}/tmp/.mcp_stealth_cfg.json" \
+              "${data_dir}/tmp/.mcp_stealth_status.json" \
+              "${data_dir}/tmp/.mcpcap.jsonl" \
+              "${data_dir}/tmp/.mcp_netcap.jsonl" \
+              "${data_dir}/tmp"/.me_* \
+              "${data_dir}/tmp"/.fc_* 2>/dev/null || true
+    done
+fi
 
 exit 0

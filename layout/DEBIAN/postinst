@@ -127,7 +127,7 @@ EOF
     # by RootHide via the Program-keyed plist above regardless.
     if command -v launchctl >/dev/null 2>&1; then
         ( timeout 8 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1
-          timeout 8 launchctl bootstrap system "$plist" >/dev/null 2>&1 ) &
+          timeout 8 launchctl bootstrap system "$plist" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
     fi
 
     # Start immediately for this install session. --daemon re-spawns itself
