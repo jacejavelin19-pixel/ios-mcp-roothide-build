@@ -1,6 +1,12 @@
 #import "engine_rpc.h"
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+// The iOS SDK does not publish <mach/mach_vm.h>; declare the mach_vm_* entry
+// points directly (same approach as MemoryManager.m). The symbols exist at
+// runtime; only the public header is absent.
+extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
+extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *);
+extern kern_return_t mach_vm_write(vm_map_t, mach_vm_address_t, vm_offset_t, mach_msg_type_number_t);
+extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <dlfcn.h>
