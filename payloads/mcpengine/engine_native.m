@@ -159,7 +159,7 @@ static int MEOpen(const char *path, int flags, ...) {
 }
 static BOOL MEMatches(MEHook *h, const struct mach_header *image, const char *path) {
     if (image==MESelf || !path || !h.active || h.objcHook) return NO;
-    NSString *name=@(path);
+    NSString *name=[@(path) stringByResolvingSymlinksInPath];
     if (h.module.length) return [h.module isEqual:name] || [h.module isEqual:name.lastPathComponent];
     return [name hasPrefix:[MEBundlePath stringByAppendingString:@"/"]];
 }
@@ -178,7 +178,7 @@ static void MEApplyImage(const struct mach_header *image, intptr_t slide) {
     } @finally { MEDepth--; }
 }
 void MEInitNative(void) {
-    MEHookInit(); MEBundlePath=NSBundle.mainBundle.bundlePath;
+    MEHookInit(); MEBundlePath=NSBundle.mainBundle.bundlePath.stringByResolvingSymlinksInPath;
     Dl_info info={0}; dladdr((void *)MEInitNative,&info); MESelf=info.dli_fbase;
     _dyld_register_func_for_add_image(MEApplyImage);
 }

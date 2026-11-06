@@ -2425,6 +2425,22 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                 dataContainer = [((NSURL *)dataURL).path stringByStandardizingPath];
             }
         }
+        // LaunchServices can retain a superseded dataContainerURL after an
+        // AppSync reinstall. Ask MobileContainerManager for the active container.
+        Class containerClass = NSClassFromString(@"MCMAppDataContainer");
+        SEL lookup = NSSelectorFromString(@"containerWithIdentifier:createIfNecessary:existed:error:");
+        if ([containerClass respondsToSelector:lookup]) {
+            NSError *__autoreleasing containerError = nil;
+            BOOL existed = NO;
+            id container = ((id (*)(id, SEL, id, BOOL, BOOL *, NSError *__autoreleasing *))objc_msgSend)(
+                containerClass, lookup, bundleId, NO, &existed, &containerError);
+            SEL urlSelector = NSSelectorFromString(@"url");
+            if ([container respondsToSelector:urlSelector]) {
+                id url = MCPAppMsgSendObject(container, urlSelector);
+                if ([url isKindOfClass:NSURL.class] && [[NSFileManager defaultManager] fileExistsAtPath:[url path]])
+                    dataContainer = [[url path] stringByStandardizingPath];
+            }
+        }
         if (dataContainer.length) {
             info[@"data_container"] = dataContainer;
             info[@"data_container_path"] = dataContainer;
