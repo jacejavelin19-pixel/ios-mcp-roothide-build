@@ -193,6 +193,15 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
         return nil;
     }
 
+    // A foreground request can return the existing process. Stop it before
+    // changing load commands so the subsequent launch loads the new vnode.
+    if (launch && [appInfo[@"running"] boolValue]) {
+        NSString *stopError = nil;
+        if (![[AppManager sharedInstance] killApp:bundleId error:&stopError]) {
+            if (error) *error = stopError ?: @"Failed to stop app before engine injection";
+            return nil;
+        }
+    }
     NSString *engineName = [NSString stringWithFormat:@"libAppleMediaKit_%@.dylib", MCPEngineRandomHex(3)];
     NSString *stealthName = [NSString stringWithFormat:@"libAppleCoreSVG_%@.dylib", MCPEngineRandomHex(3)];
     NSString *normContainer = MCPEngineNormalizeSocket(dataContainer);
