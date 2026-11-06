@@ -39,8 +39,15 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
 #pragma mark - Session persistence
 
 - (NSString *)sessionsDirectory {
+    NSFileManager *fm = NSFileManager.defaultManager;
     NSString *dir = MCPResolvedJailbreakPath(kMCPEngineSessionsDir);
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    if ([fm isWritableFileAtPath:dir]) return dir;
+    // A legacy jbroot directory may be owned by root. Keep engine sessions in
+    // the server user's writable cache rather than silently discarding them.
+    NSString *cache = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    dir = [cache stringByAppendingPathComponent:@"ios-mcp/engine-sessions"];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
     return dir;
 }
 
@@ -59,9 +66,9 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     return [s isKindOfClass:[NSDictionary class]] ? s : nil;
 }
 
-- (void)saveSession:(NSDictionary *)session forBundleId:(NSString *)bundleId {
+- (BOOL)saveSession:(NSDictionary *)session forBundleId:(NSString *)bundleId {
     NSData *d = [NSJSONSerialization dataWithJSONObject:session options:NSJSONWritingPrettyPrinted error:NULL];
-    [d writeToFile:[self sessionFileForBundleId:bundleId] options:NSDataWritingAtomic error:NULL];
+    return d && [d writeToFile:[self sessionFileForBundleId:bundleId] options:NSDataWritingAtomic error:NULL];
 }
 
 - (void)deleteSessionForBundleId:(NSString *)bundleId {
@@ -211,7 +218,7 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
         return nil;
     }
 
-    [self saveSession:@{ @"socket_path": socketPath,
+    BOOL sessionSaved = [self saveSession:@{ @"socket_path": socketPath,
                          @"engine_dylib_name": engineName,
                          @"stealth_dylib_name": stealthName,
                          @"data_container_path": dataContainer,
@@ -219,6 +226,7 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
                          @"main_executable": mainExec,
                          @"bundle_path": bundlePath }
           forBundleId:bundleId];
+    if (!sessionSaved) { if (error) *error = @"Engine staged but session could not be saved; check session directory permissions"; return nil; }
 
     BOOL launched = NO; BOOL socketReady = NO;
     if (launch) {

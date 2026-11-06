@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <mach-o/dyld.h>
 
@@ -114,36 +115,55 @@ static void MEClient(int fd) {
         if (pending.length >= ME_MAX_FRAME) break;
     }
 }
-static void *MEServer(void *unused) {
+// Exported diagnostic state can be read with the existing task-memory tool
+// even when startup fails before the RPC socket exists.
+char MEStartupDiagnostic[2048] = "not started";
+static char MEStartupStage[1024];
+static void MEStartupSet(const char *stage, const char *detail) {
+    snprintf(MEStartupStage,sizeof(MEStartupStage),"%s: %s",stage,detail ?: "");
+    snprintf(MEStartupDiagnostic,sizeof(MEStartupDiagnostic),"%s",MEStartupStage);
+}
+static void *MEStartupStop(int line, int code) {
+    snprintf(MEStartupDiagnostic,sizeof(MEStartupDiagnostic),"stopped line=%d errno=%d stage=%s",line,code,MEStartupStage);
+    NSLog(@"MCP engine startup: %s",MEStartupDiagnostic);
+    return NULL;
+}
+static void *MEWorker(void *unused) {
     @autoreleasepool {
         // A missing/invalid config disables the payload without affecting launch.
         NSString *tmp = NSTemporaryDirectory().stringByResolvingSymlinksInPath;
         NSString *cfg = [tmp stringByAppendingPathComponent:@".mcpe_cfg.json"];
-        NSData *data = [NSData dataWithContentsOfFile:cfg];
-        if (!data || data.length > 16384) return NULL;
+        MEStartupSet("read config",cfg.fileSystemRepresentation);
+        NSError *readError=nil;
+        NSData *data = [NSData dataWithContentsOfFile:cfg options:0 error:&readError];
+        if (!data) MEStartupSet("config read failed",readError.description.UTF8String);
+        if (!data || data.length > 16384) return MEStartupStop(__LINE__,errno);
         id config = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
-        if (![config isKindOfClass:NSDictionary.class]) return NULL;
+        if (![config isKindOfClass:NSDictionary.class]) return MEStartupStop(__LINE__,errno);
         NSString *path = config[@"socket_path"];
-        if (![path isKindOfClass:NSString.class] || !path.isAbsolutePath) return NULL;
+        if (![path isKindOfClass:NSString.class] || !path.isAbsolutePath) return MEStartupStop(__LINE__,errno);
         path = path.stringByStandardizingPath;
-        if (![path.stringByDeletingLastPathComponent.stringByResolvingSymlinksInPath isEqual:tmp]) return NULL;
+        if (![path.stringByDeletingLastPathComponent.stringByResolvingSymlinksInPath isEqual:tmp]) return MEStartupStop(__LINE__,errno);
         struct sockaddr_un addr = {0}; addr.sun_family = AF_UNIX;
         const char *p = path.fileSystemRepresentation;
-        if (strlen(p) >= sizeof(addr.sun_path)) return NULL;
+        if (strlen(p) >= sizeof(addr.sun_path)) return MEStartupStop(__LINE__,errno);
         memcpy(addr.sun_path,p,strlen(p)+1); addr.sun_len = sizeof(addr);
+        MEStartupSet("socket preflight",p);
         struct stat st;
         if (lstat(p,&st) == 0) {
-            if (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid()) return NULL;
+            if (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid()) return MEStartupStop(__LINE__,errno);
             int probe = socket(AF_UNIX,SOCK_STREAM,0);
-            if (probe < 0) return NULL;
+            if (probe < 0) return MEStartupStop(__LINE__,errno);
             int rc = connect(probe,(struct sockaddr *)&addr,sizeof(addr));
             int err = errno; close(probe);
-            if (!rc || (err != ECONNREFUSED && err != ENOENT)) return NULL;
-            if (unlink(p) != 0) return NULL;
-        } else if (errno != ENOENT) return NULL;
+            if (!rc || (err != ECONNREFUSED && err != ENOENT)) return MEStartupStop(__LINE__,errno);
+            if (unlink(p) != 0) return MEStartupStop(__LINE__,errno);
+        } else if (errno != ENOENT) return MEStartupStop(__LINE__,errno);
         int fd = socket(AF_UNIX,SOCK_STREAM,0);
-        if (fd < 0) return NULL;
-        if (bind(fd,(struct sockaddr *)&addr,sizeof(addr)) || chmod(p,0600) || listen(fd,4)) { close(fd); return NULL; }
+        if (fd < 0) return MEStartupStop(__LINE__,errno);
+        MEStartupSet("bind/chmod/listen",p);
+        if (bind(fd,(struct sockaddr *)&addr,sizeof(addr)) || chmod(p,0600) || listen(fd,4)) { close(fd); return MEStartupStop(__LINE__,errno); }
+        MEStartupSet("listening",p);
         MEInitNative();
         for (;;) {
             int client = accept(fd,NULL,NULL);
@@ -153,9 +173,21 @@ static void *MEServer(void *unused) {
         }
         close(fd); unlink(p);
     }
-    return NULL;
+    return MEStartupStop(__LINE__,errno);
+}
+static void *MEServer(void *unused) {
+    @autoreleasepool {
+        @try { return MEWorker(unused); }
+        @catch (NSException *e) {
+            MEStartupSet("startup exception",e.description.UTF8String);
+            return MEStartupStop(__LINE__,0);
+        }
+    }
 }
 __attribute__((constructor)) static void MEStart(void) {
     pthread_t thread;
-    if (pthread_create(&thread,NULL,MEServer,NULL) == 0) pthread_detach(thread);
+    MEStartupSet("creating server thread",NULL);
+    int rc=pthread_create(&thread,NULL,MEServer,NULL);
+    if (!rc) pthread_detach(thread);
+    else MEStartupStop(__LINE__,rc);
 }
