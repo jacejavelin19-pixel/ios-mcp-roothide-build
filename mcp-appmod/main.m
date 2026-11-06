@@ -428,9 +428,9 @@ static NSString *MCPAMReadBundleIdFromAppDir(NSString *appDir) {
 }
 
 static NSString *MCPAMResolveTweakInjectDir(void) {
-    NSString *dir = MCPAMResolveJBTool(@"/usr/lib/TweakInject");
+    NSString *dir = MCPAMResolveExistingPath(@"/usr/lib/TweakInject");
     if (dir.length && MCPAMPathExists(dir)) return dir;
-    NSString *alt = MCPAMResolveJBTool(@"/Library/MobileSubstrate/DynamicLibraries");
+    NSString *alt = MCPAMResolveExistingPath(@"/Library/MobileSubstrate/DynamicLibraries");
     if (alt.length && MCPAMPathExists(alt)) return alt;
     return dir;
 }

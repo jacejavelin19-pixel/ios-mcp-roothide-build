@@ -181,10 +181,13 @@ static BOOL MEIsCompanionPath(NSString *name) {
 
 static BOOL MEMatches(MEHook *h, const struct mach_header *image, const char *path) {
     if (image==MESelf || !path || !h.active || h.objcHook) return NO;
+    if (!MEBundlePath.length) {
+        MEBundlePath = NSBundle.mainBundle.bundlePath.stringByResolvingSymlinksInPath;
+    }
     NSString *name=[@(path) stringByResolvingSymlinksInPath];
     if (MEIsCompanionPath(name)) return NO;
     if (h.module.length) return [h.module isEqual:name] || [h.module isEqual:name.lastPathComponent];
-    return [name hasPrefix:[MEBundlePath stringByAppendingString:@"/"]];
+    return MEBundlePath.length ? [name hasPrefix:[MEBundlePath stringByAppendingString:@"/"]] : NO;
 }
 
 static NSDictionary *MESlotPatchToDict(const mcp_slot_patch_t *p, NSString *imageName) {

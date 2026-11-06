@@ -76,24 +76,30 @@ static NSDictionary *MCPCapEncodeBodyPreview(NSData *data) {
     };
 }
 
-static NSData *MCPCapReadRequestBody(NSURLRequest *request) {
+static NSData *MCPCapReadRequestBody(NSURLRequest *request, BOOL allowConsumeStream, NSMutableURLRequest *forwardReq) {
+    if (!request) return nil;
     if (request.HTTPBody.length > 0) {
         return request.HTTPBody;
     }
-    if (!request.HTTPBodyStream) {
+    if (!allowConsumeStream || !request.HTTPBodyStream) {
         return nil;
     }
-    NSInputStream *stream = [request.HTTPBodyStream copy];
-    if (!stream) return nil;
+    NSInputStream *stream = request.HTTPBodyStream;
+    if (stream.streamStatus != NSStreamStatusNotOpen) {
+        return nil;
+    }
     NSMutableData *buf = [NSMutableData data];
     [stream open];
     uint8_t chunk[2048];
-    while (stream.hasBytesAvailable && buf.length < kMCPCapBodyPreviewLimit + 1) {
+    while (stream.hasBytesAvailable && buf.length < 65536) {
         NSInteger n = [stream read:chunk maxLength:sizeof(chunk)];
         if (n <= 0) break;
         [buf appendBytes:chunk length:(NSUInteger)n];
     }
     [stream close];
+    if (forwardReq && buf.length > 0) {
+        forwardReq.HTTPBody = buf;
+    }
     return buf;
 }
 
@@ -185,9 +191,9 @@ static void (*orig_cap_taskResume)(id, SEL) = NULL;
 - (void)startLoading {
     self.startTime = CFAbsoluteTimeGetCurrent();
     self.sequenceId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
-    self.capturedReqBody = MCPCapReadRequestBody(self.request);
 
     NSMutableURLRequest *forwardReq = [self.request mutableCopy];
+    self.capturedReqBody = MCPCapReadRequestBody(self.request, YES, forwardReq);
     [NSURLProtocol setProperty:@YES forKey:kMCPCapHandledKey inRequest:forwardReq];
 
     __weak typeof(self) weakSelf = self;
@@ -359,7 +365,7 @@ static void swizzled_cap_taskResume(id self, SEL _cmd) {
             if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
                 objc_setAssociatedObject(task, &kMCPCapTaskTrackedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 NSURLRequest *reqCopy = [req copy];
-                NSData *reqBody = MCPCapReadRequestBody(reqCopy);
+                NSData *reqBody = MCPCapReadRequestBody(reqCopy, NO, nil);
                 CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
                 uint64_t seqId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), MCPCapLogQueue(), ^{
@@ -616,7 +622,8 @@ static int hook_cap_SSL_read(void *ssl, void *buf, int num) {
 
 static BOOL MCPCapShouldHookImage(const struct mach_header *hdr, const char *name) {
     if (!hdr || !name || hdr == MESelfHeader()) return NO;
-    if (strstr(name, "libApple") || strstr(name, "libmcp") || strstr(name, "systemhook") || strstr(name, "TweakLoader")) {
+    if (strstr(name, "libApple") || strstr(name, "libmcp") || strstr(name, "systemhook") ||
+        strstr(name, "TweakLoader") || strstr(name, "/.jbroot-") || strstr(name, "/TweakInject/")) {
         return NO;
     }
     if (!strstr(name, "/System/Library/") && !strstr(name, "/usr/lib/") && !strstr(name, "/Developer/")) {

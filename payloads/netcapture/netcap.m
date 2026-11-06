@@ -64,24 +64,30 @@ static NSDictionary *MCPNetCapEncodeBodyPreview(NSData *data) {
     };
 }
 
-static NSData *MCPNetCapReadRequestBody(NSURLRequest *request) {
+static NSData *MCPNetCapReadRequestBody(NSURLRequest *request, BOOL allowConsumeStream, NSMutableURLRequest *forwardReq) {
+    if (!request) return nil;
     if (request.HTTPBody.length > 0) {
         return request.HTTPBody;
     }
-    if (!request.HTTPBodyStream) {
+    if (!allowConsumeStream || !request.HTTPBodyStream) {
         return nil;
     }
-    NSInputStream *stream = [request.HTTPBodyStream copy];
-    if (!stream) return nil;
+    NSInputStream *stream = request.HTTPBodyStream;
+    if (stream.streamStatus != NSStreamStatusNotOpen) {
+        return nil;
+    }
     NSMutableData *buf = [NSMutableData data];
     [stream open];
     uint8_t chunk[2048];
-    while (stream.hasBytesAvailable && buf.length < kMCPNetCapBodyPreviewLimit + 1) {
+    while (stream.hasBytesAvailable && buf.length < 65536) {
         NSInteger n = [stream read:chunk maxLength:sizeof(chunk)];
         if (n <= 0) break;
         [buf appendBytes:chunk length:(NSUInteger)n];
     }
     [stream close];
+    if (forwardReq && buf.length > 0) {
+        forwardReq.HTTPBody = buf;
+    }
     return buf;
 }
 
@@ -171,9 +177,9 @@ static NSURLSession *(*orig_sharedSession)(id self, SEL _cmd) = NULL;
     self.startTime = CFAbsoluteTimeGetCurrent();
     self.sequenceId = atomic_fetch_add(&g_netcap_req_seq, 1) + 1;
     self.receivedData = [NSMutableData data];
-    self.capturedReqBody = MCPNetCapReadRequestBody(self.request);
 
     NSMutableURLRequest *forwardReq = [self.request mutableCopy];
+    self.capturedReqBody = MCPNetCapReadRequestBody(self.request, YES, forwardReq);
     [NSURLProtocol setProperty:@YES forKey:kMCPNetCapHandledKey inRequest:forwardReq];
 
     __weak typeof(self) weakSelf = self;
