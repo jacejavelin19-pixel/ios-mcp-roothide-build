@@ -18,6 +18,19 @@ if [ -z "$JB_BASE" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr" 
     JB_BASE="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo "")"
 fi
 
+is_helperd_ancestor() {
+    _p="$$"
+    for _step in 1 2 3 4 5 6 7 8; do
+        [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null || break
+        _comm="$(ps -o comm= -p "$_p" 2>/dev/null || echo "")"
+        case "$_comm" in
+            *mcp-helperd*) return 0 ;;
+        esac
+        _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || echo "")"
+    done
+    return 1
+}
+
 case "$1" in
     remove|purge|abort-install|disappear|"")
         # 1. Remove runtime-generated LaunchDaemon plist in jbroot
@@ -27,12 +40,7 @@ case "$1" in
         rm -f "/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
         for jb_cand in /var/containers/Bundle/Application/.jbroot-*; do
             if [ -d "$jb_cand" ]; then
-                rm -f "${jb_cand}/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" \
-                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp-work" \
-                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp-uploads" \
-                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp-appmod" \
-                      "${jb_cand}/var/mobile/Library/Caches/ios-mcp" \
-                      "${jb_cand}/var/mobile/Library/Logs/iOSMCP" 2>/dev/null || true
+                rm -f "${jb_cand}/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
                 rm -rf "${jb_cand}/var/mobile/Library/Caches/ios-mcp-work" \
                        "${jb_cand}/var/mobile/Library/Caches/ios-mcp-uploads" \
                        "${jb_cand}/var/mobile/Library/Caches/ios-mcp-appmod" \
@@ -60,6 +68,19 @@ case "$1" in
                /var/mobile/Library/ios-mcp/frida/sessions \
                /private/var/mobile/Library/ios-mcp/engine-sessions \
                /private/var/mobile/Library/ios-mcp/frida/sessions 2>/dev/null || true
+
+        # 4. If dpkg -r was invoked through mcp-helperd, finish tearing down helperd 1s after dpkg exits 0
+        if is_helperd_ancestor; then
+            ( sleep 1
+              rm -rf /var/mobile/Library/Caches/ios-mcp-work \
+                     /private/var/mobile/Library/Caches/ios-mcp-work \
+                     "${JB_BASE}/var/mobile/Library/Caches/ios-mcp-work" 2>/dev/null || true
+              if command -v launchctl >/dev/null 2>&1; then
+                  timeout 5 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true
+              fi
+              killall -9 mcp-helperd >/dev/null 2>&1 || pkill -9 -f mcp-helperd >/dev/null 2>&1 || true
+            ) </dev/null >/dev/null 2>&1 &
+        fi
         ;;
 esac
 

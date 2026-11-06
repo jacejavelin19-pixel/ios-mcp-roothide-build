@@ -121,18 +121,34 @@ EOF
     chmod 0644 "$plist" 2>/dev/null || true
 
     # Register with launchd so it also comes up now, in launchd's own (system)
-    # namespace where the daemon's socket is reachable by the server. Wrapped in
-    # `timeout` and backgrounded so a slow/blocking launchctl can never hang the
-    # install; failures here do not fail the install. Boot-time load is handled
-    # by RootHide via the Program-keyed plist above regardless.
-    if command -v launchctl >/dev/null 2>&1; then
-        ( timeout 8 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1
-          timeout 8 launchctl bootstrap system "$plist" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
-    fi
+    # namespace where the daemon's socket is reachable by the server. When dpkg
+    # is running inside mcp-helperd's own launchd job, defer daemon replacement by
+    # 1s so launchd/MCPKillPreviousHelperDaemon does not SIGKILL dpkg mid-configure.
+    _in_helperd=0
+    _p="$$"
+    for _step in 1 2 3 4 5 6 7 8; do
+        [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null || break
+        _comm="$(ps -o comm= -p "$_p" 2>/dev/null || echo "")"
+        case "$_comm" in
+            *mcp-helperd*) _in_helperd=1; break ;;
+        esac
+        _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || echo "")"
+    done
 
-    # Start immediately for this install session. --daemon re-spawns itself
-    # detached via posix_spawn and returns at once, so this never blocks dpkg.
-    "$helper_abs" --daemon </dev/null >/dev/null 2>&1 || true
+    if [ "$_in_helperd" -eq 1 ]; then
+        ( sleep 1
+          "$helper_abs" --daemon </dev/null >/dev/null 2>&1 || true
+          if command -v launchctl >/dev/null 2>&1; then
+              timeout 5 launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
+          fi
+        ) </dev/null >/dev/null 2>&1 &
+    else
+        if command -v launchctl >/dev/null 2>&1; then
+            ( timeout 8 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1
+              timeout 8 launchctl bootstrap system "$plist" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+        fi
+        "$helper_abs" --daemon </dev/null >/dev/null 2>&1 || true
+    fi
     return 0
 }
 

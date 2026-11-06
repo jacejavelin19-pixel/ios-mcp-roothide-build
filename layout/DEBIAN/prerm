@@ -23,20 +23,28 @@ if [ -z "$JB_BASE" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr/b
     JB_BASE="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo "")"
 fi
 
-# 1. Stop and bootout com.witchan.ios-mcp.helperd from launchd (bounded & fully detached)
-if command -v launchctl >/dev/null 2>&1; then
-    ( timeout 5 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true ) </dev/null >/dev/null 2>&1 &
-fi
+is_helperd_ancestor() {
+    _p="$$"
+    for _step in 1 2 3 4 5 6 7 8; do
+        [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null || break
+        _comm="$(ps -o comm= -p "$_p" 2>/dev/null || echo "")"
+        case "$_comm" in
+            *mcp-helperd*) return 0 ;;
+        esac
+        _p="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || echo "")"
+    done
+    return 1
+}
 
-# Kill mcp-helperd immediately unless mcp-helperd is in our parent chain
-_anc="$(ps -o comm= -p $PPID 2>/dev/null || echo "")"
-case "$_anc" in
-    *mcp-helperd*)
-        ;;
-    *)
-        killall -9 mcp-helperd >/dev/null 2>&1 || pkill -9 -f mcp-helperd >/dev/null 2>&1 || true
-        ;;
-esac
+# 1. Stop and bootout com.witchan.ios-mcp.helperd from launchd when not running inside helperd's job
+#    (when dpkg -r is invoked from inside helperd, postrm detaches the bootout+kill so launchd
+#    does not SIGKILL dpkg mid-transaction).
+if ! is_helperd_ancestor; then
+    if command -v launchctl >/dev/null 2>&1; then
+        ( timeout 5 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true ) </dev/null >/dev/null 2>&1 &
+    fi
+    killall -9 mcp-helperd >/dev/null 2>&1 || pkill -9 -f mcp-helperd >/dev/null 2>&1 || true
+fi
 
 # 2. Resolve mcp-appmod while it is still installed and run cleanup-all
 APPMOD=""

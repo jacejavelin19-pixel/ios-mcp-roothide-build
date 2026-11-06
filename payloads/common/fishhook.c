@@ -48,23 +48,34 @@ typedef struct segment_command_64 segment_command_t;
 typedef struct section_64 section_t;
 typedef struct nlist_64 nlist_t;
 
-#define MCP_COMM_PAGE_TPRO_WRITE_ENABLE  ((const volatile uint64_t *)0x0fffffffc0d0ULL)
-#define MCP_COMM_PAGE_TPRO_WRITE_DISABLE ((const volatile uint64_t *)0x0fffffffc0d8ULL)
+#define MCP_COMM_PAGE_TPRO_WRITE_ENABLE  ((const volatile uint64_t *)0x0000000fffffc0d0ULL)
+#define MCP_COMM_PAGE_TPRO_WRITE_DISABLE ((const volatile uint64_t *)0x0000000fffffc0d8ULL)
+
+typedef void (*mcp_tpro_toggle_fn)(void);
+typedef bool (*mcp_tpro_writable_fn)(void);
 
 static inline int mcp_tpro_enable_write(void) {
 #if defined(__arm64__) || defined(__aarch64__)
+    static mcp_tpro_toggle_fn s_rw_fn = NULL;
+    static mcp_tpro_writable_fn s_check_fn = NULL;
+    static int s_resolved = 0;
+    if (!s_resolved) {
+        s_rw_fn = (mcp_tpro_toggle_fn)dlsym(RTLD_DEFAULT, "os_thread_self_restrict_tpro_to_rw");
+        s_check_fn = (mcp_tpro_writable_fn)dlsym(RTLD_DEFAULT, "_os_thread_self_tpro_is_writeable");
+        s_resolved = 1;
+    }
+    if (s_rw_fn) {
+        if (s_check_fn && s_check_fn()) {
+            return 1;
+        }
+        s_rw_fn();
+        return s_check_fn ? (s_check_fn() ? 1 : 0) : 1;
+    }
     uint64_t val = *MCP_COMM_PAGE_TPRO_WRITE_ENABLE;
     if (!val) return 0;
     __asm__ volatile("msr S3_6_C15_C1_5, %0\nisb sy" :: "r"(val) : "memory");
-    typedef bool (*tpro_writable_fn)(void);
-    static tpro_writable_fn s_fn = NULL;
-    static int s_resolved = 0;
-    if (!s_resolved) {
-        s_fn = (tpro_writable_fn)dlsym(RTLD_DEFAULT, "_os_thread_self_tpro_is_writeable");
-        s_resolved = 1;
-    }
-    if (s_fn) {
-        return s_fn() ? 1 : 0;
+    if (s_check_fn) {
+        return s_check_fn() ? 1 : 0;
     }
     return 1;
 #else
@@ -74,6 +85,16 @@ static inline int mcp_tpro_enable_write(void) {
 
 static inline void mcp_tpro_disable_write(void) {
 #if defined(__arm64__) || defined(__aarch64__)
+    static mcp_tpro_toggle_fn s_ro_fn = NULL;
+    static int s_resolved = 0;
+    if (!s_resolved) {
+        s_ro_fn = (mcp_tpro_toggle_fn)dlsym(RTLD_DEFAULT, "os_thread_self_restrict_tpro_to_ro");
+        s_resolved = 1;
+    }
+    if (s_ro_fn) {
+        s_ro_fn();
+        return;
+    }
     uint64_t val = *MCP_COMM_PAGE_TPRO_WRITE_DISABLE;
     if (!val) return;
     __asm__ volatile("msr S3_6_C15_C1_5, %0\nisb sy" :: "r"(val) : "memory");

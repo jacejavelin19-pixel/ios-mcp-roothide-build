@@ -902,9 +902,10 @@ int main(int argc, const char *argv[]) {
                     return 0;
                 }
 
-                // 2. Stage main binary, inject LC_LOAD_DYLIB, and re-sign preserving entitlements
+                // 2. Stage main binary (starting from clean .mcp_orig if present), inject LC_LOAD_DYLIB, and re-sign preserving entitlements
                 NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
-                NSData *mainData = [NSData dataWithContentsOfFile:binaryPath];
+                NSString *origBackup = [binaryPath stringByAppendingString:@".mcp_orig"];
+                NSData *mainData = [NSData dataWithContentsOfFile:MCPAMPathExists(origBackup) ? origBackup : binaryPath];
                 if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
                     return MCPAMFail(@"failed to stage main binary");
                 }
@@ -1229,9 +1230,16 @@ int main(int argc, const char *argv[]) {
                     return 0;
                 }
 
-                // 4. LC_LOAD_DYLIB: stealth FIRST, engine SECOND; re-sign main.
+                // 4. LC_LOAD_DYLIB: stealth FIRST, engine SECOND (starting from clean .mcp_orig if present); re-sign main.
+                for (NSString *fwEntry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil]) {
+                    if (([fwEntry hasPrefix:@"libAppleCoreSVG_"] && ![fwEntry isEqualToString:stealthName]) ||
+                        ([fwEntry hasPrefix:@"libAppleMediaKit_"] && ![fwEntry isEqualToString:engineName])) {
+                        unlink([[frameworksDir stringByAppendingPathComponent:fwEntry] fileSystemRepresentation]);
+                    }
+                }
                 NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
-                NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
+                NSString *origBackup = [mainExec stringByAppendingString:@".mcp_orig"];
+                NSData *mainData = [NSData dataWithContentsOfFile:MCPAMPathExists(origBackup) ? origBackup : mainExec];
                 if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
                     return MCPAMFail(@"failed to stage main executable");
                 }
