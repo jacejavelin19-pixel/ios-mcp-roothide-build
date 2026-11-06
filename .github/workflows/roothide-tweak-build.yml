@@ -114,7 +114,7 @@ jobs:
             make -C "$sub" THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 DEBUG=0 STRIP=1
           done
 
-          for payload in payloads/sslkillswitch payloads/netcapture payloads/fridastealth; do
+          for payload in payloads/sslkillswitch payloads/netcapture payloads/fridastealth payloads/mcpengine; do
             echo "==> Building standalone Apple-SDK payload: $payload"
             env -u THEOS_PACKAGE_SCHEME make -C "$payload" clean
             env -u THEOS_PACKAGE_SCHEME make -C "$payload" FINALPACKAGE=1 DEBUG=0 STRIP=1
