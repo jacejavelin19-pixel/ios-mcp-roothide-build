@@ -1,0 +1,47 @@
+#!/bin/sh
+# Intentionally NOT using `set -e`: every step in postrm is best-effort (`|| true`)
+# so package removal or purge via Sileo or dpkg never fails or hangs.
+# CRITICAL: Never delete /var/mobile/Library/ios-mcp/frida/gadget.dylib or gadget.dylib.xz.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
+
+JB_BASE=""
+if [ -n "$DPKG_ROOT" ] && [ -d "$DPKG_ROOT/usr" ]; then
+    JB_BASE="$DPKG_ROOT"
+elif command -v jbroot >/dev/null 2>&1; then
+    _jb="$(jbroot / 2>/dev/null)"
+    if [ -n "$_jb" ] && [ -d "${_jb}/usr" ]; then
+        JB_BASE="$(cd "$_jb" 2>/dev/null && pwd || echo "")"
+    fi
+fi
+if [ -z "$JB_BASE" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr" ]; then
+    JB_BASE="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo "")"
+fi
+
+case "$1" in
+    remove|purge|abort-install|disappear|"")
+        # 1. Remove runtime-generated LaunchDaemon plist in jbroot
+        if [ -n "$JB_BASE" ]; then
+            rm -f "${JB_BASE}/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
+        fi
+        rm -f "/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
+        for jb_cand in /var/containers/Bundle/Application/.jbroot-*; do
+            if [ -d "$jb_cand" ]; then
+                rm -f "${jb_cand}/Library/LaunchDaemons/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
+            fi
+        done
+
+        # 2. Remove runtime work/upload/appmod caches and logs
+        rm -rf /var/mobile/Library/Caches/ios-mcp-work \
+               /var/mobile/Library/Caches/ios-mcp-uploads \
+               /var/mobile/Library/Caches/ios-mcp-appmod \
+               /var/mobile/Library/Caches/ios-mcp \
+               /var/mobile/Library/Logs/iOSMCP 2>/dev/null || true
+
+        # 3. Remove engine-sessions and frida/sessions while preserving /var/mobile/Library/ios-mcp/frida/gadget.dylib*
+        rm -rf /var/mobile/Library/ios-mcp/engine-sessions \
+               /var/mobile/Library/ios-mcp/frida/sessions 2>/dev/null || true
+        ;;
+esac
+
+exit 0

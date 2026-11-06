@@ -384,6 +384,168 @@ static NSDictionary *MCPAMExtractExistingEntitlements(NSString *binaryPath) {
     return @{};
 }
 
+static BOOL MCPAMIsMachOEncrypted(NSString *path) {
+    if (!path.length || !MCPAMPathExists(path)) return NO;
+    NSDictionary *info = MCPInspectMachOAtPath(path, NULL);
+    if (![info[@"slices"] isKindOfClass:[NSArray class]]) return NO;
+    for (NSDictionary *slice in (NSArray *)info[@"slices"]) {
+        NSDictionary *enc = slice[@"encryption"];
+        if ([enc isKindOfClass:[NSDictionary class]] && [enc[@"encrypted"] boolValue]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// If a FairPlay-encrypted binary had a .mcp_orig backup from an earlier disk-patch attempt,
+// restore .mcp_orig immediately without re-signing so its original Apple FairPlay signature is intact.
+static BOOL MCPAMIsBinaryEncryptedAndHealIfNeeded(NSString *binaryPath) {
+    NSString *origPath = [binaryPath stringByAppendingString:@".mcp_orig"];
+    if (MCPAMPathExists(origPath) && MCPAMIsMachOEncrypted(origPath)) {
+        struct stat st;
+        BOOL hasStat = (stat(binaryPath.fileSystemRepresentation, &st) == 0);
+        mode_t mode = hasStat ? (st.st_mode & 07777) : 0755;
+        uid_t uid = hasStat ? st.st_uid : 0;
+        gid_t gid = hasStat ? st.st_gid : 0;
+        NSData *origBytes = [NSData dataWithContentsOfFile:origPath];
+        if (origBytes.length) {
+            MCPAMWriteFreshVnode(origBytes, binaryPath, mode, uid, gid, hasStat, NULL);
+            unlink(origPath.fileSystemRepresentation);
+        }
+        return YES;
+    }
+    return MCPAMIsMachOEncrypted(binaryPath);
+}
+
+static NSString *MCPAMReadBundleIdFromAppDir(NSString *appDir) {
+    if (!appDir.length) return nil;
+    NSString *infoPath = [appDir stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+    if ([info[@"CFBundleIdentifier"] isKindOfClass:[NSString class]] && [info[@"CFBundleIdentifier"] length] > 0) {
+        return info[@"CFBundleIdentifier"];
+    }
+    return nil;
+}
+
+static NSString *MCPAMResolveTweakInjectDir(void) {
+    NSString *dir = MCPAMResolveJBTool(@"/usr/lib/TweakInject");
+    if (dir.length && MCPAMPathExists(dir)) return dir;
+    NSString *alt = MCPAMResolveJBTool(@"/Library/MobileSubstrate/DynamicLibraries");
+    if (alt.length && MCPAMPathExists(alt)) return alt;
+    return dir;
+}
+
+static BOOL MCPAMStageToTweakInject(NSData *signedDylibData,
+                                    NSString *orderPrefix,
+                                    NSString *dylibName,
+                                    NSString *bundleId,
+                                    NSData * _Nullable companionConfigData,
+                                    NSData * _Nullable companionJSData,
+                                    NSString **outTweakDylibPath,
+                                    NSString **error) {
+    NSString *tiDir = MCPAMResolveTweakInjectDir();
+    if (!tiDir.length || !MCPAMPathExists(tiDir)) {
+        if (error) *error = @"TweakInject directory not found in jbroot";
+        return NO;
+    }
+    NSString *prefixedName = orderPrefix.length
+        ? [NSString stringWithFormat:@"%@_%@", orderPrefix, dylibName]
+        : dylibName;
+    NSString *stem = [prefixedName stringByDeletingPathExtension];
+    NSString *dylibDest = [tiDir stringByAppendingPathComponent:prefixedName];
+    NSString *plistDest = [tiDir stringByAppendingPathComponent:[stem stringByAppendingString:@".plist"]];
+
+    NSDictionary *filterPlist = @{
+        @"Filter": @{
+            @"Bundles": @[bundleId ?: @""]
+        }
+    };
+    NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:filterPlist
+                                                                   format:NSPropertyListXMLFormat_v1_0
+                                                                  options:0
+                                                                    error:NULL];
+    if (!plistData.length) {
+        if (error) *error = @"failed to serialize TweakInject filter plist";
+        return NO;
+    }
+    if (!MCPAMWriteFreshVnode(signedDylibData, dylibDest, 0755, 0, 0, YES, error)) {
+        return NO;
+    }
+    if (!MCPAMWriteFreshVnode(plistData, plistDest, 0644, 0, 0, YES, error)) {
+        return NO;
+    }
+    if (companionConfigData.length) {
+        NSString *cfgDest = [tiDir stringByAppendingPathComponent:[stem stringByAppendingString:@".config"]];
+        MCPAMWriteFreshVnode(companionConfigData, cfgDest, 0644, 0, 0, YES, NULL);
+    }
+    if (companionJSData.length) {
+        NSString *jsDest = [tiDir stringByAppendingPathComponent:[stem stringByAppendingString:@".js"]];
+        MCPAMWriteFreshVnode(companionJSData, jsDest, 0644, 0, 0, YES, NULL);
+    }
+    if (outTweakDylibPath) *outTweakDylibPath = dylibDest;
+    return YES;
+}
+
+static NSArray<NSString *> *MCPAMUnstageFromTweakInject(NSString * _Nullable bundleId,
+                                                        NSArray<NSString *> * _Nullable dylibNames,
+                                                        NSArray<NSString *> * _Nullable prefixes) {
+    NSMutableArray<NSString *> *deleted = [NSMutableArray array];
+    NSString *tiDir = MCPAMResolveTweakInjectDir();
+    if (!tiDir.length || !MCPAMPathExists(tiDir)) return deleted;
+    NSArray<NSString *> *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tiDir error:nil];
+    NSMutableSet<NSString *> *stemsToRemove = [NSMutableSet set];
+
+    for (NSString *entry in entries) {
+        BOOL matchName = NO;
+        for (NSString *dn in (dylibNames ?: @[])) {
+            if (!dn.length || [dn isEqualToString:@"-"]) continue;
+            NSString *dnStem = [dn stringByDeletingPathExtension];
+            if ([entry containsString:dnStem]) {
+                matchName = YES;
+                break;
+            }
+        }
+        if (!matchName && prefixes.count > 0 && bundleId.length == 0) {
+            for (NSString *pfx in prefixes) {
+                if ([entry containsString:pfx]) {
+                    matchName = YES;
+                    break;
+                }
+            }
+        }
+        if (!matchName && bundleId.length > 0 && [entry hasSuffix:@".plist"]) {
+            BOOL isMCP = NO;
+            for (NSString *pfx in (prefixes ?: @[@"libAppleCoreSVG_", @"libAppleMediaKit_", @"libAppleAudioDSP_", @"libAppleAVSync_", @"libAppleCoreTLS_"])) {
+                if ([entry containsString:pfx]) {
+                    isMCP = YES;
+                    break;
+                }
+            }
+            if (isMCP) {
+                NSString *plistPath = [tiDir stringByAppendingPathComponent:entry];
+                NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+                NSArray *bundles = [pl[@"Filter"] isKindOfClass:[NSDictionary class]] ? pl[@"Filter"][@"Bundles"] : nil;
+                if ([bundles isKindOfClass:[NSArray class]] && [bundles containsObject:bundleId]) {
+                    matchName = YES;
+                }
+            }
+        }
+        if (matchName) {
+            [stemsToRemove addObject:[entry stringByDeletingPathExtension]];
+        }
+    }
+
+    for (NSString *stem in stemsToRemove) {
+        for (NSString *ext in @[@".dylib", @".plist", @".config", @".js"]) {
+            NSString *p = [tiDir stringByAppendingPathComponent:[stem stringByAppendingString:ext]];
+            if (MCPAMPathExists(p) && unlink(p.fileSystemRepresentation) == 0) {
+                [deleted addObject:p];
+            }
+        }
+    }
+    return deleted;
+}
+
 static BOOL MCPAMEnsureOrigBackup(NSString *binaryPath, mode_t mode, uid_t uid, gid_t gid, BOOL hasStat, NSString **error) {
     NSString *origPath = [binaryPath stringByAppendingString:@".mcp_orig"];
     if (MCPAMPathExists(origPath)) return YES;
@@ -690,12 +852,17 @@ int main(int argc, const char *argv[]) {
             chmod(frameworksDir.fileSystemRepresentation, 0755);
             chown(frameworksDir.fileSystemRepresentation, st.st_uid, st.st_gid);
 
+            BOOL isEncrypted = MCPAMIsBinaryEncryptedAndHealIfNeeded(binaryPath);
+            NSString *bundleId = MCPAMReadBundleIdFromAppDir(appDir);
+
             NSString *err = nil;
-            if (!MCPAMEnsureOrigBackup(binaryPath, origMode, st.st_uid, st.st_gid, YES, &err)) {
-                return MCPAMFail(err);
+            if (!isEncrypted) {
+                if (!MCPAMEnsureOrigBackup(binaryPath, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
             }
 
-            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(binaryPath);
+            NSDictionary *origEnt = isEncrypted ? nil : MCPAMExtractExistingEntitlements(binaryPath);
             NSString *workDir = MCPAMCreateWorkDir(&err);
             if (!workDir) return MCPAMFail(err);
 
@@ -714,6 +881,25 @@ int main(int argc, const char *argv[]) {
                 NSString *finalDylibPath = [frameworksDir stringByAppendingPathComponent:destName];
                 if (!MCPAMWriteFreshVnode(signedDylib, finalDylibPath, 0755, st.st_uid, st.st_gid, YES, &err)) {
                     return MCPAMFail(err);
+                }
+
+                if (isEncrypted && bundleId.length > 0) {
+                    NSString *tiPath = nil;
+                    if (!MCPAMStageToTweakInject(signedDylib, @"02", destName, bundleId, nil, nil, &tiPath, &err)) {
+                        return MCPAMFail(err ?: @"failed to stage dylib to TweakInject");
+                    }
+                    MCPAMEmitJSON(@{
+                        @"ok": @YES,
+                        @"result": @{
+                            @"binary_path": binaryPath,
+                            @"staged_dylib_path": finalDylibPath,
+                            @"tweak_inject_path": tiPath ?: @"",
+                            @"load_command_path": tiPath ?: finalDylibPath,
+                            @"injection_mode": @"tweak_inject",
+                            @"signed": @YES
+                        }
+                    });
+                    return 0;
                 }
 
                 // 2. Stage main binary, inject LC_LOAD_DYLIB, and re-sign preserving entitlements
@@ -776,20 +962,61 @@ int main(int argc, const char *argv[]) {
             mode_t origMode = (st.st_mode & 07777) ?: 0755;
             NSString *appDir = [binaryPath stringByDeletingLastPathComponent];
             NSString *frameworksDir = [appDir stringByAppendingPathComponent:@"Frameworks"];
+            BOOL isEncrypted = MCPAMIsBinaryEncryptedAndHealIfNeeded(binaryPath);
+            NSString *bundleId = MCPAMReadBundleIdFromAppDir(appDir);
 
             NSString *err = nil;
             NSMutableArray<NSString *> *deletedFiles = [NSMutableArray array];
+            NSArray<NSString *> *tiDeleted = MCPAMUnstageFromTweakInject(
+                bundleId,
+                dylibMatch.length ? @[dylibMatch.lastPathComponent] : @[],
+                nil
+            );
+            [deletedFiles addObjectsFromArray:tiDeleted];
+
+            if (isEncrypted) {
+                if (deleteStaged && dylibMatch.length > 0) {
+                    NSString *cand = [frameworksDir stringByAppendingPathComponent:dylibMatch.lastPathComponent];
+                    if (MCPAMPathExists(cand) && unlink(cand.fileSystemRepresentation) == 0) {
+                        [deletedFiles addObject:cand];
+                    }
+                }
+                MCPAMEmitJSON(@{
+                    @"ok": @YES,
+                    @"result": @{
+                        @"binary_path": binaryPath,
+                        @"deleted_staged_files": deletedFiles,
+                        @"injection_mode": @"tweak_inject"
+                    }
+                });
+                return 0;
+            }
 
             if (restoreOrig) {
                 NSString *origPath = [binaryPath stringByAppendingString:@".mcp_orig"];
                 if (!MCPAMPathExists(origPath)) {
                     return MCPAMFail(@"no .mcp_orig backup found to restore");
                 }
-                NSData *origData = [NSData dataWithContentsOfFile:origPath];
-                if (!MCPAMWriteFreshVnode(origData, binaryPath, origMode, st.st_uid, st.st_gid, YES, &err)) {
-                    return MCPAMFail(err);
+                NSDictionary *origEnt = MCPAMExtractExistingEntitlements(origPath);
+                NSString *workDir = MCPAMCreateWorkDir(&err);
+                if (!workDir) return MCPAMFail(err);
+                @try {
+                    NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
+                    NSData *origData = [NSData dataWithContentsOfFile:origPath];
+                    if (!origData.length || ![origData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
+                        return MCPAMFail(@"failed to stage .mcp_orig backup");
+                    }
+                    if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) {
+                        return MCPAMFail(err);
+                    }
+                    NSData *signedOrig = [NSData dataWithContentsOfFile:stageMain];
+                    if (!MCPAMWriteFreshVnode(signedOrig, binaryPath, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                        return MCPAMFail(err);
+                    }
+                    unlink(origPath.fileSystemRepresentation);
+                } @finally {
+                    [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
                 }
-                unlink(origPath.fileSystemRepresentation);
                 if (deleteStaged && dylibMatch.length > 0) {
                     NSString *cand = [frameworksDir stringByAppendingPathComponent:dylibMatch.lastPathComponent];
                     if (MCPAMPathExists(cand) && unlink(cand.fileSystemRepresentation) == 0) {
@@ -832,6 +1059,11 @@ int main(int argc, const char *argv[]) {
                     if (MCPAMPathExists(cand) && unlink(cand.fileSystemRepresentation) == 0) {
                         [deletedFiles addObject:cand];
                     }
+                }
+
+                NSString *origPath = [binaryPath stringByAppendingString:@".mcp_orig"];
+                if (MCPAMPathExists(origPath)) {
+                    unlink(origPath.fileSystemRepresentation);
                 }
 
                 MCPAMEmitJSON(@{
@@ -920,11 +1152,16 @@ int main(int argc, const char *argv[]) {
             chmod(frameworksDir.fileSystemRepresentation, 0755);
             chown(frameworksDir.fileSystemRepresentation, st.st_uid, st.st_gid);
 
+            BOOL isEncrypted = MCPAMIsBinaryEncryptedAndHealIfNeeded(mainExec);
+            NSString *bundleId = MCPAMReadBundleIdFromAppDir(appBundle);
+
             NSString *err = nil;
-            if (!MCPAMEnsureOrigBackup(mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
-                return MCPAMFail(err);
+            if (!isEncrypted) {
+                if (!MCPAMEnsureOrigBackup(mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
             }
-            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+            NSDictionary *origEnt = isEncrypted ? nil : MCPAMExtractExistingEntitlements(mainExec);
             NSString *workDir = MCPAMCreateWorkDir(&err);
             if (!workDir) return MCPAMFail(err);
 
@@ -962,6 +1199,34 @@ int main(int argc, const char *argv[]) {
                 NSData *cfgData = [NSJSONSerialization dataWithJSONObject:@{@"socket_path": socketPath} options:0 error:nil];
                 if (!cfgData.length || !MCPAMWriteFreshVnode(cfgData, cfgPath, 0644, st.st_uid, st.st_gid, YES, &err)) {
                     return MCPAMFail(err ?: @"failed to write engine config");
+                }
+
+                if (isEncrypted && bundleId.length > 0) {
+                    MCPAMUnstageFromTweakInject(bundleId, @[stealthName, engineName], @[@"libAppleCoreSVG_", @"libAppleMediaKit_"]);
+                    NSString *tiStealth = nil;
+                    NSString *tiEngine = nil;
+                    if (!MCPAMStageToTweakInject(signedStealth, @"00", stealthName, bundleId, nil, nil, &tiStealth, &err)) {
+                        return MCPAMFail(err ?: @"failed to stage stealth to TweakInject");
+                    }
+                    if (!MCPAMStageToTweakInject(signedEngine, @"01", engineName, bundleId, nil, nil, &tiEngine, &err)) {
+                        return MCPAMFail(err ?: @"failed to stage engine to TweakInject");
+                    }
+                    MCPAMEmitJSON(@{
+                        @"ok": @YES,
+                        @"result": @{
+                            @"main_executable": mainExec,
+                            @"stealth_dylib": destStealth,
+                            @"engine_dylib": destEngine,
+                            @"tweak_inject_stealth": tiStealth ?: @"",
+                            @"tweak_inject_engine": tiEngine ?: @"",
+                            @"engine_config": cfgPath,
+                            @"socket_path": socketPath,
+                            @"load_order": @[tiStealth ?: stealthName, tiEngine ?: engineName],
+                            @"injection_mode": @"tweak_inject",
+                            @"signed": @YES
+                        }
+                    });
+                    return 0;
                 }
 
                 // 4. LC_LOAD_DYLIB: stealth FIRST, engine SECOND; re-sign main.
@@ -1016,48 +1281,71 @@ int main(int argc, const char *argv[]) {
                 return MCPAMFail(@"main executable not found");
             }
             mode_t origMode = (st.st_mode & 07777) ?: 0755;
-            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+            BOOL isEncrypted = MCPAMIsBinaryEncryptedAndHealIfNeeded(mainExec);
+            NSString *bundleId = MCPAMReadBundleIdFromAppDir(appBundle);
+
+            NSMutableArray<NSString *> *deleted = [NSMutableArray array];
+            NSArray<NSString *> *tiDeleted = MCPAMUnstageFromTweakInject(
+                bundleId,
+                @[stealthName ?: @"", engineName ?: @""],
+                @[@"libAppleCoreSVG_", @"libAppleMediaKit_"]
+            );
+            [deleted addObjectsFromArray:tiDeleted];
 
             NSString *err = nil;
-            NSString *workDir = MCPAMCreateWorkDir(&err);
-            if (!workDir) return MCPAMFail(err);
-            @try {
-                NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
-                NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
-                if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
-                    return MCPAMFail(@"failed to stage main executable");
-                }
-                if (engineName.length > 0 && ![engineName isEqualToString:@"-"]) {
-                    MCPRemoveLoadDylibFromMachO(stageMain, engineName, NO, NULL);
-                }
-                if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
-                    MCPRemoveLoadDylibFromMachO(stageMain, stealthName, NO, NULL);
-                }
-                if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) return MCPAMFail(err);
-                NSData *signedMain = [NSData dataWithContentsOfFile:stageMain];
-                if (!MCPAMWriteFreshVnode(signedMain, mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
-                    return MCPAMFail(err);
-                }
-
-                NSString *frameworksDir = [appBundle stringByAppendingPathComponent:@"Frameworks"];
-                NSMutableArray<NSString *> *deleted = [NSMutableArray array];
-                NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-                if (stealthName.length) [candidates addObject:[frameworksDir stringByAppendingPathComponent:stealthName]];
-                if (engineName.length) [candidates addObject:[frameworksDir stringByAppendingPathComponent:engineName]];
-                NSArray<NSString *> *stagePrefixes = @[@"libAppleCoreSVG_", @"libAppleMediaKit_"];
-                for (NSString *entry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil]) {
-                    for (NSString *prefix in stagePrefixes) {
-                        if ([entry hasPrefix:prefix]) { [candidates addObject:[frameworksDir stringByAppendingPathComponent:entry]]; break; }
+            if (!isEncrypted) {
+                NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+                NSString *workDir = MCPAMCreateWorkDir(&err);
+                if (!workDir) return MCPAMFail(err);
+                @try {
+                    NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
+                    NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
+                    if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
+                        return MCPAMFail(@"failed to stage main executable");
                     }
+                    if (engineName.length > 0 && ![engineName isEqualToString:@"-"]) {
+                        MCPRemoveLoadDylibFromMachO(stageMain, engineName, NO, NULL);
+                    }
+                    if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
+                        MCPRemoveLoadDylibFromMachO(stageMain, stealthName, NO, NULL);
+                    }
+                    if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) return MCPAMFail(err);
+                    NSData *signedMain = [NSData dataWithContentsOfFile:stageMain];
+                    if (!MCPAMWriteFreshVnode(signedMain, mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                        return MCPAMFail(err);
+                    }
+                    NSString *origPath = [mainExec stringByAppendingString:@".mcp_orig"];
+                    if (MCPAMPathExists(origPath)) {
+                        unlink(origPath.fileSystemRepresentation);
+                    }
+                } @finally {
+                    [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
                 }
-                for (NSString *f in candidates) {
-                    if (MCPAMPathExists(f) && unlink(f.fileSystemRepresentation) == 0) [deleted addObject:f];
-                }
-                MCPAMEmitJSON(@{@"ok": @YES, @"result": @{@"main_executable": mainExec, @"deleted_files": deleted, @"signed": @YES}});
-                return 0;
-            } @finally {
-                [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
             }
+
+            NSString *frameworksDir = [appBundle stringByAppendingPathComponent:@"Frameworks"];
+            NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+            if (stealthName.length) [candidates addObject:[frameworksDir stringByAppendingPathComponent:stealthName]];
+            if (engineName.length) [candidates addObject:[frameworksDir stringByAppendingPathComponent:engineName]];
+            NSArray<NSString *> *stagePrefixes = @[@"libAppleCoreSVG_", @"libAppleMediaKit_"];
+            for (NSString *entry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil]) {
+                for (NSString *prefix in stagePrefixes) {
+                    if ([entry hasPrefix:prefix]) { [candidates addObject:[frameworksDir stringByAppendingPathComponent:entry]]; break; }
+                }
+            }
+            for (NSString *f in candidates) {
+                if (MCPAMPathExists(f) && unlink(f.fileSystemRepresentation) == 0) [deleted addObject:f];
+            }
+            MCPAMEmitJSON(@{
+                @"ok": @YES,
+                @"result": @{
+                    @"main_executable": mainExec,
+                    @"deleted_files": deleted,
+                    @"signed": @(!isEncrypted),
+                    @"injection_mode": isEncrypted ? @"tweak_inject" : @"lc_load_dylib"
+                }
+            });
+            return 0;
         }
 
         if ([cmd isEqualToString:@"stage-frida"]) {
@@ -1087,11 +1375,16 @@ int main(int argc, const char *argv[]) {
             chmod(frameworksDir.fileSystemRepresentation, 0755);
             chown(frameworksDir.fileSystemRepresentation, st.st_uid, st.st_gid);
 
+            BOOL isEncrypted = MCPAMIsBinaryEncryptedAndHealIfNeeded(mainExec);
+            NSString *bundleId = MCPAMReadBundleIdFromAppDir(appBundle);
+
             NSString *err = nil;
-            if (!MCPAMEnsureOrigBackup(mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
-                return MCPAMFail(err);
+            if (!isEncrypted) {
+                if (!MCPAMEnsureOrigBackup(mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
             }
-            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+            NSDictionary *origEnt = isEncrypted ? nil : MCPAMExtractExistingEntitlements(mainExec);
             NSString *workDir = MCPAMCreateWorkDir(&err);
             if (!workDir) return MCPAMFail(err);
 
@@ -1134,6 +1427,35 @@ int main(int argc, const char *argv[]) {
                 if (!MCPAMWriteFreshVnode(cfgData, destCfg, 0644, st.st_uid, st.st_gid, YES, &err) ||
                     !MCPAMWriteFreshVnode(jsData, destJS, 0644, st.st_uid, st.st_gid, YES, &err)) {
                     return MCPAMFail(err);
+                }
+
+                if (isEncrypted && bundleId.length > 0) {
+                    MCPAMUnstageFromTweakInject(bundleId, @[stealthName, gadgetName], @[@"libAppleCoreSVG_", @"libAppleAudioDSP_"]);
+                    NSString *tiStealth = nil;
+                    NSString *tiGadget = nil;
+                    if (!MCPAMStageToTweakInject(signedStealth, @"00", stealthName, bundleId, nil, nil, &tiStealth, &err)) {
+                        return MCPAMFail(err ?: @"failed to stage stealth to TweakInject");
+                    }
+                    if (!MCPAMStageToTweakInject(signedGadget, @"01", gadgetName, bundleId, cfgData, jsData, &tiGadget, &err)) {
+                        return MCPAMFail(err ?: @"failed to stage gadget to TweakInject");
+                    }
+                    MCPAMEmitJSON(@{
+                        @"ok": @YES,
+                        @"result": @{
+                            @"main_executable": mainExec,
+                            @"stealth_dylib": destStealth,
+                            @"gadget_dylib": destGadget,
+                            @"gadget_config": destCfg,
+                            @"gadget_script": destJS,
+                            @"stealth_load_command": tiStealth ?: stealthName,
+                            @"gadget_load_command": tiGadget ?: gadgetName,
+                            @"load_order": @[tiStealth ?: stealthName, tiGadget ?: gadgetName],
+                            @"scrub": scrubInfo,
+                            @"injection_mode": @"tweak_inject",
+                            @"signed": @YES
+                        }
+                    });
+                    return 0;
                 }
 
                 // 4. Inject LC_LOAD_DYLIB (stealth FIRST, gadget SECOND) & re-sign main executable
@@ -1194,78 +1516,207 @@ int main(int argc, const char *argv[]) {
                 return MCPAMFail(@"main executable not found");
             }
             mode_t origMode = (st.st_mode & 07777) ?: 0755;
-            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+            BOOL isEncrypted = MCPAMIsBinaryEncryptedAndHealIfNeeded(mainExec);
+            NSString *bundleId = MCPAMReadBundleIdFromAppDir(appBundle);
+
+            NSMutableArray<NSString *> *deleted = [NSMutableArray array];
+            NSArray<NSString *> *tiDeleted = MCPAMUnstageFromTweakInject(
+                bundleId,
+                @[stealthName ?: @"", gadgetName ?: @""],
+                @[@"libAppleCoreSVG_", @"libAppleAudioDSP_"]
+            );
+            [deleted addObjectsFromArray:tiDeleted];
 
             NSString *err = nil;
-            NSString *workDir = MCPAMCreateWorkDir(&err);
-            if (!workDir) return MCPAMFail(err);
-            @try {
-                NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
-                NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
-                if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
-                    return MCPAMFail(@"failed to stage main executable");
+            if (!isEncrypted) {
+                NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+                NSString *workDir = MCPAMCreateWorkDir(&err);
+                if (!workDir) return MCPAMFail(err);
+                @try {
+                    NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
+                    NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
+                    if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
+                        return MCPAMFail(@"failed to stage main executable");
+                    }
+                    if (gadgetName.length > 0 && ![gadgetName isEqualToString:@"-"]) {
+                        MCPRemoveLoadDylibFromMachO(stageMain, gadgetName, NO, NULL);
+                    }
+                    if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
+                        MCPRemoveLoadDylibFromMachO(stageMain, stealthName, NO, NULL);
+                    }
+                    if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) {
+                        return MCPAMFail(err);
+                    }
+                    NSData *signedMain = [NSData dataWithContentsOfFile:stageMain];
+                    if (!MCPAMWriteFreshVnode(signedMain, mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                        return MCPAMFail(err);
+                    }
+                    NSString *origPath = [mainExec stringByAppendingString:@".mcp_orig"];
+                    if (MCPAMPathExists(origPath)) {
+                        unlink(origPath.fileSystemRepresentation);
+                    }
+                } @finally {
+                    [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
                 }
-                if (gadgetName.length > 0 && ![gadgetName isEqualToString:@"-"]) {
-                    MCPRemoveLoadDylibFromMachO(stageMain, gadgetName, NO, NULL);
-                }
-                if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
-                    MCPRemoveLoadDylibFromMachO(stageMain, stealthName, NO, NULL);
-                }
-                if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) {
-                    return MCPAMFail(err);
-                }
-                NSData *signedMain = [NSData dataWithContentsOfFile:stageMain];
-                if (!MCPAMWriteFreshVnode(signedMain, mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
-                    return MCPAMFail(err);
-                }
+            }
 
-                NSString *frameworksDir = [appBundle stringByAppendingPathComponent:@"Frameworks"];
-                NSMutableArray<NSString *> *deleted = [NSMutableArray array];
-                NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-                if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
-                    [candidates addObject:[frameworksDir stringByAppendingPathComponent:stealthName]];
+            NSString *frameworksDir = [appBundle stringByAppendingPathComponent:@"Frameworks"];
+            NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+            if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
+                [candidates addObject:[frameworksDir stringByAppendingPathComponent:stealthName]];
+            }
+            if (gadgetName.length > 0 && ![gadgetName isEqualToString:@"-"]) {
+                NSString *stem = [gadgetName stringByDeletingPathExtension];
+                [candidates addObject:[frameworksDir stringByAppendingPathComponent:gadgetName]];
+                [candidates addObject:[frameworksDir stringByAppendingPathComponent:[stem stringByAppendingString:@".config"]]];
+                [candidates addObject:[frameworksDir stringByAppendingPathComponent:[stem stringByAppendingString:@".js"]]];
+            }
+            NSArray<NSString *> *stagePrefixes = @[@"libAppleCoreSVG_", @"libAppleAudioDSP_"];
+            NSArray<NSString *> *fwEntries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil];
+            for (NSString *entry in fwEntries) {
+                for (NSString *prefix in stagePrefixes) {
+                    if ([entry hasPrefix:prefix]) {
+                        [candidates addObject:[frameworksDir stringByAppendingPathComponent:entry]];
+                        break;
+                    }
                 }
-                if (gadgetName.length > 0 && ![gadgetName isEqualToString:@"-"]) {
-                    NSString *stem = [gadgetName stringByDeletingPathExtension];
-                    [candidates addObject:[frameworksDir stringByAppendingPathComponent:gadgetName]];
-                    [candidates addObject:[frameworksDir stringByAppendingPathComponent:[stem stringByAppendingString:@".config"]]];
-                    [candidates addObject:[frameworksDir stringByAppendingPathComponent:[stem stringByAppendingString:@".js"]]];
+            }
+            for (NSString *f in candidates) {
+                if (MCPAMPathExists(f) && unlink(f.fileSystemRepresentation) == 0) {
+                    [deleted addObject:f];
                 }
-                // Also sweep every file this tool could have staged, by its disguise
-                // prefixes, so orphans from earlier injects (whose randomized suffix
-                // is no longer in the session file) are cleaned up too instead of
-                // accumulating ~62 MB per leftover. These prefixes are MCP-specific
-                // (real Apple frameworks are not named "libAppleCoreSVG_<hex>"), and
-                // the LC_LOAD_DYLIB for each has already been stripped from the main
-                // Mach-O above, so nothing references them.
-                NSArray<NSString *> *stagePrefixes = @[@"libAppleCoreSVG_", @"libAppleAudioDSP_"];
-                NSArray<NSString *> *fwEntries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil];
-                for (NSString *entry in fwEntries) {
-                    for (NSString *prefix in stagePrefixes) {
-                        if ([entry hasPrefix:prefix]) {
-                            [candidates addObject:[frameworksDir stringByAppendingPathComponent:entry]];
+            }
+
+            MCPAMEmitJSON(@{
+                @"ok": @YES,
+                @"result": @{
+                    @"main_executable": mainExec,
+                    @"deleted_files": deleted,
+                    @"signed": @(!isEncrypted),
+                    @"injection_mode": isEncrypted ? @"tweak_inject" : @"lc_load_dylib"
+                }
+            });
+            return 0;
+        }
+
+        if ([cmd isEqualToString:@"cleanup-all"]) {
+            NSMutableArray<NSString *> *restoredBinaries = [NSMutableArray array];
+            NSMutableArray<NSString *> *deletedFiles = [NSMutableArray array];
+            NSArray<NSString *> *mcpPrefixes = @[
+                @"libAppleCoreSVG_",
+                @"libAppleMediaKit_",
+                @"libAppleAudioDSP_",
+                @"libAppleAVSync_",
+                @"libAppleCoreTLS_",
+                @"libmcp_"
+            ];
+            NSArray<NSString *> *tiCleaned = MCPAMUnstageFromTweakInject(nil, nil, mcpPrefixes);
+            [deletedFiles addObjectsFromArray:tiCleaned];
+
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSMutableSet<NSString *> *appBundles = [NSMutableSet set];
+
+            for (NSString *sessDir in @[@"/var/mobile/Library/ios-mcp/engine-sessions",
+                                        @"/var/mobile/Library/ios-mcp/frida/sessions"]) {
+                for (NSString *f in [fm contentsOfDirectoryAtPath:sessDir error:nil]) {
+                    if (![f hasSuffix:@".json"]) continue;
+                    NSString *sp = [sessDir stringByAppendingPathComponent:f];
+                    NSData *d = [NSData dataWithContentsOfFile:sp];
+                    if (d.length) {
+                        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                        if ([j isKindOfClass:[NSDictionary class]]) {
+                            if ([j[@"bundle_path"] isKindOfClass:[NSString class]] && [j[@"bundle_path"] length]) {
+                                [appBundles addObject:j[@"bundle_path"]];
+                            }
+                            if ([j[@"socket_path"] isKindOfClass:[NSString class]] && [j[@"socket_path"] length]) {
+                                NSString *sock = j[@"socket_path"];
+                                unlink(sock.fileSystemRepresentation);
+                                NSString *cfg = [[sock stringByDeletingLastPathComponent] stringByAppendingPathComponent:@".mcpe_cfg.json"];
+                                unlink(cfg.fileSystemRepresentation);
+                            }
+                        }
+                    }
+                    if (unlink(sp.fileSystemRepresentation) == 0) {
+                        [deletedFiles addObject:sp];
+                    }
+                }
+            }
+
+            NSString *bundleContainerRoot = @"/var/containers/Bundle/Application";
+            for (NSString *uuidDir in [fm contentsOfDirectoryAtPath:bundleContainerRoot error:nil]) {
+                if ([uuidDir hasPrefix:@"."]) continue;
+                NSString *uuidPath = [bundleContainerRoot stringByAppendingPathComponent:uuidDir];
+                for (NSString *sub in [fm contentsOfDirectoryAtPath:uuidPath error:nil]) {
+                    if ([sub hasSuffix:@".app"]) {
+                        [appBundles addObject:[uuidPath stringByAppendingPathComponent:sub]];
+                    }
+                }
+            }
+
+            for (NSString *appPath in appBundles) {
+                if (!MCPAMPathExists(appPath)) continue;
+                for (NSString *entry in [fm contentsOfDirectoryAtPath:appPath error:nil]) {
+                    if ([entry hasSuffix:@".mcp_orig"]) {
+                        NSString *origPath = [appPath stringByAppendingPathComponent:entry];
+                        NSString *mainPath = [appPath stringByAppendingPathComponent:[entry substringToIndex:entry.length - 9]];
+                        struct stat st;
+                        BOOL hasStat = (stat(mainPath.fileSystemRepresentation, &st) == 0);
+                        mode_t mode = hasStat ? (st.st_mode & 07777) : 0755;
+                        uid_t uid = hasStat ? st.st_uid : 0;
+                        gid_t gid = hasStat ? st.st_gid : 0;
+                        if (MCPAMIsMachOEncrypted(origPath)) {
+                            NSData *origBytes = [NSData dataWithContentsOfFile:origPath];
+                            if (origBytes.length) {
+                                MCPAMWriteFreshVnode(origBytes, mainPath, mode, uid, gid, hasStat, NULL);
+                                [restoredBinaries addObject:mainPath];
+                            }
+                            unlink(origPath.fileSystemRepresentation);
+                        } else {
+                            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(origPath);
+                            NSString *workDir = MCPAMCreateWorkDir(NULL);
+                            if (workDir) {
+                                NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
+                                NSData *origBytes = [NSData dataWithContentsOfFile:origPath];
+                                if (origBytes.length && [origBytes writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
+                                    if (MCPAMSignStageBinary(workDir, @"main.bin", origEnt, NULL)) {
+                                        NSData *signedBytes = [NSData dataWithContentsOfFile:stageMain];
+                                        if (signedBytes.length) {
+                                            MCPAMWriteFreshVnode(signedBytes, mainPath, mode, uid, gid, hasStat, NULL);
+                                            [restoredBinaries addObject:mainPath];
+                                        }
+                                    } else {
+                                        MCPAMWriteFreshVnode(origBytes, mainPath, mode, uid, gid, hasStat, NULL);
+                                        [restoredBinaries addObject:mainPath];
+                                    }
+                                }
+                                [fm removeItemAtPath:workDir error:nil];
+                            }
+                            unlink(origPath.fileSystemRepresentation);
+                        }
+                    }
+                }
+                NSString *fwDir = [appPath stringByAppendingPathComponent:@"Frameworks"];
+                for (NSString *fwEntry in [fm contentsOfDirectoryAtPath:fwDir error:nil]) {
+                    for (NSString *pfx in mcpPrefixes) {
+                        if ([fwEntry hasPrefix:pfx]) {
+                            NSString *p = [fwDir stringByAppendingPathComponent:fwEntry];
+                            if (unlink(p.fileSystemRepresentation) == 0) {
+                                [deletedFiles addObject:p];
+                            }
                             break;
                         }
                     }
                 }
-                for (NSString *f in candidates) {
-                    if (MCPAMPathExists(f) && unlink(f.fileSystemRepresentation) == 0) {
-                        [deleted addObject:f];
-                    }
-                }
-
-                MCPAMEmitJSON(@{
-                    @"ok": @YES,
-                    @"result": @{
-                        @"main_executable": mainExec,
-                        @"deleted_files": deleted,
-                        @"signed": @YES
-                    }
-                });
-                return 0;
-            } @finally {
-                [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
             }
+
+            MCPAMEmitJSON(@{
+                @"ok": @YES,
+                @"result": @{
+                    @"restored_binaries": restoredBinaries,
+                    @"deleted_files": deletedFiles
+                }
+            });
+            return 0;
         }
 
         if ([cmd isEqualToString:@"decompress-xz"]) {

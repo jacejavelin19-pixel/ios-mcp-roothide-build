@@ -7,8 +7,8 @@ export DEBUG = 0
 include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = libmcp_netcap
-libmcp_netcap_FILES = netcap.m
-libmcp_netcap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+libmcp_netcap_FILES = netcap.m ../common/fishhook.c
+libmcp_netcap_CFLAGS = -fobjc-arc -I../common -Wno-deprecated-declarations
 libmcp_netcap_FRAMEWORKS = Foundation CFNetwork
 libmcp_netcap_LDFLAGS = -Wl,-install_name,@executable_path/Frameworks/libmcp_netcap.dylib
 libmcp_netcap_INSTALL_PATH = /usr/lib/ios-mcp

@@ -43,15 +43,24 @@ int main(int argc, const char *argv[]) {
                                                           includeSystem:includeSystem
                                                                   error:&failure];
             }
+        } else if (strcmp(argv[1], "patch-slots") == 0 && argc == 4) {
+            NSString *encoded = [NSString stringWithUTF8String:argv[3]];
+            NSData *jsonData = encoded ? [[NSData alloc] initWithBase64EncodedString:encoded options:0] : nil;
+            id parsed = jsonData ? [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:NULL] : nil;
+            if (![parsed isKindOfClass:[NSArray class]]) {
+                failure = @"invalid base64 JSON patches array";
+            } else {
+                result = [[MemoryManager sharedInstance] patchSlotsPID:(pid_t)pid patches:(NSArray *)parsed error:&failure];
+            }
         } else if (argc < 5 || !parseUnsigned(argv[3], &address)) {
             failure = @"invalid arguments";
         } else if (strcmp(argv[1], "read") == 0 && argc == 5 && parseUnsigned(argv[4], &amount) && amount <= 1048576) {
             result = [[MemoryManager sharedInstance] readPID:(pid_t)pid address:address length:(NSUInteger)amount error:&failure];
-        } else if (strcmp(argv[1], "write") == 0 && argc == 5) {
+        } else if ((strcmp(argv[1], "write") == 0 || strcmp(argv[1], "write-protect") == 0) && argc == 5) {
             NSString *encoded = [NSString stringWithUTF8String:argv[4]];
             NSData *data = encoded ? [[NSData alloc] initWithBase64EncodedString:encoded options:0] : nil;
             if (!data) failure = @"invalid base64 data";
-            else result = [[MemoryManager sharedInstance] writePID:(pid_t)pid address:address data:data error:&failure];
+            else result = [[MemoryManager sharedInstance] protectWritePID:(pid_t)pid address:address data:data error:&failure];
         } else if (strcmp(argv[1], "search") == 0 && argc == 6 && parseUnsigned(argv[4], &amount)) {
             NSString *encoded = [NSString stringWithUTF8String:argv[5]];
             NSData *data = encoded ? [[NSData alloc] initWithBase64EncodedString:encoded options:0] : nil;

@@ -54,6 +54,9 @@ static const struct mach_header *g_stealth_header = NULL;
 static const struct mach_header *g_gadget_header = NULL;
 static mcp_addr_range_t g_stealth_text = {0, 0};
 static mcp_addr_range_t g_gadget_text = {0, 0};
+#define MCP_MAX_COMPANION_RANGES 16
+static mcp_addr_range_t g_companion_text[MCP_MAX_COMPANION_RANGES];
+static size_t g_companion_text_count = 0;
 
 static pthread_mutex_t g_stealth_lock = PTHREAD_MUTEX_INITIALIZER;
 static time_t g_cfg_last_mtime = 0;
@@ -185,6 +188,18 @@ static inline int mcp_addr_in_range(uintptr_t addr, mcp_addr_range_t r) {
     return (r.start != 0 && addr >= r.start && addr < r.end) ? 1 : 0;
 }
 
+static void mcp_register_companion_text_unlocked(const struct mach_header *hdr) {
+    if (!hdr || hdr == g_stealth_header) return;
+    mcp_addr_range_t r = mcp_compute_text_range(hdr);
+    if (r.start == 0 || r.end <= r.start) return;
+    for (size_t i = 0; i < g_companion_text_count; i++) {
+        if (g_companion_text[i].start == r.start) return;
+    }
+    if (g_companion_text_count < MCP_MAX_COMPANION_RANGES) {
+        g_companion_text[g_companion_text_count++] = r;
+    }
+}
+
 static inline int mcp_is_gadget_caller(const void *raw_ret) {
     uintptr_t a = mcp_strip_return_addr(raw_ret);
     return mcp_addr_in_range(a, g_gadget_text);
@@ -192,7 +207,13 @@ static inline int mcp_is_gadget_caller(const void *raw_ret) {
 
 static inline int mcp_is_internal_caller(const void *raw_ret) {
     uintptr_t a = mcp_strip_return_addr(raw_ret);
-    return mcp_addr_in_range(a, g_stealth_text) || mcp_addr_in_range(a, g_gadget_text);
+    if (mcp_addr_in_range(a, g_stealth_text) || mcp_addr_in_range(a, g_gadget_text)) {
+        return 1;
+    }
+    for (size_t i = 0; i < g_companion_text_count; i++) {
+        if (mcp_addr_in_range(a, g_companion_text[i])) return 1;
+    }
+    return 0;
 }
 
 static int mcp_ci_contains(const char *haystack, const char *needle) {
@@ -278,6 +299,26 @@ static int mcp_is_hidden_image_unlocked(const struct mach_header *hdr, const cha
         return 1;
     }
     if (!name || !*name) return 0;
+    const char *base = strrchr(name, '/');
+    base = base ? (base + 1) : name;
+    for (size_t i = 0; i < g_hidden_dylib_count; i++) {
+        if (g_hidden_dylib_names[i][0] &&
+            (strcasecmp(base, g_hidden_dylib_names[i]) == 0 ||
+             mcp_ci_contains(base, g_hidden_dylib_names[i]))) {
+            mcp_register_companion_text_unlocked(hdr);
+            return 1;
+        }
+    }
+    if (mcp_ci_contains(base, "libAppleMediaKit_") ||
+        mcp_ci_contains(base, "libAppleAVSync_") ||
+        mcp_ci_contains(base, "libAppleCoreTLS_") ||
+        mcp_ci_contains(base, "libAppleCoreSVG_") ||
+        mcp_ci_contains(base, "libmcpengine") ||
+        mcp_ci_contains(base, "libnetcap") ||
+        mcp_ci_contains(base, "libsslkillswitch")) {
+        mcp_register_companion_text_unlocked(hdr);
+        return 1;
+    }
     if (mcp_ci_contains(name, "libmcp_stealth") ||
         mcp_ci_contains(name, "frida") ||
         mcp_ci_contains(name, "/.jbroot-") ||
@@ -286,13 +327,6 @@ static int mcp_is_hidden_image_unlocked(const struct mach_header *hdr, const cha
         mcp_ci_contains(name, "systemhook") ||
         mcp_ci_contains(name, "roothide")) {
         return 1;
-    }
-    const char *base = strrchr(name, '/');
-    base = base ? (base + 1) : name;
-    for (size_t i = 0; i < g_hidden_dylib_count; i++) {
-        if (g_hidden_dylib_names[i][0] && strcasecmp(base, g_hidden_dylib_names[i]) == 0) {
-            return 1;
-        }
     }
     // Heuristic: staged Gadget in <App>.app/Frameworks/<stem>.dylib always has <stem>.config next to it
     if (strstr(name, "/Frameworks/") != NULL) {

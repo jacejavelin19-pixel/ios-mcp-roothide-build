@@ -38,8 +38,10 @@ NSDictionary *MEObjC(NSString *op, NSDictionary *a);
 NSDictionary *MEMemory(NSString *op, NSDictionary *a);
 NSDictionary *MENative(NSString *op, NSDictionary *a);
 NSDictionary *MEHooks(NSString *op, NSDictionary *a);
+NSDictionary *MENetCap(NSString *op, NSDictionary *a);
 void *MEResolve(NSDictionary *a);
 uintptr_t MECall(void *fn, const uintptr_t *args, unsigned count);
+const struct mach_header *MESelfHeader(void);
 
 @interface MEHook : NSObject
 @property(nonatomic, copy) NSString *key;
@@ -60,6 +62,7 @@ uintptr_t MECall(void *fn, const uintptr_t *args, unsigned count);
 @property(nonatomic, strong) NSArray<NSString *> *types;
 @property(nonatomic, strong) id overrideValue;
 @property(nonatomic, strong) NSMutableArray *events;
+@property(nonatomic, strong) NSMutableArray<NSDictionary *> *boundSlots;
 @end
 MEHook *MENewHook(NSDictionary *a);
 void MECheckObjCHook(Class owner, SEL selector);

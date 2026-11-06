@@ -1,0 +1,92 @@
+#!/bin/sh
+# Intentionally NOT using `set -e`: every step in prerm is best-effort (`|| true`)
+# so package removal via Sileo or dpkg never fails or hangs.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
+
+JB_BASE=""
+if [ -n "$DPKG_ROOT" ] && [ -d "$DPKG_ROOT/usr/bin" ]; then
+    JB_BASE="$DPKG_ROOT"
+elif command -v jbroot >/dev/null 2>&1; then
+    _jb="$(jbroot / 2>/dev/null)"
+    if [ -n "$_jb" ] && [ -d "${_jb}/usr/bin" ]; then
+        JB_BASE="$(cd "$_jb" 2>/dev/null && pwd || echo "")"
+    fi
+fi
+if [ -z "$JB_BASE" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr/bin" ]; then
+    JB_BASE="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo "")"
+fi
+
+# 1. Stop and bootout com.witchan.ios-mcp.helperd from launchd (bounded & backgrounded)
+if command -v launchctl >/dev/null 2>&1; then
+    ( timeout 8 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true ) &
+fi
+killall -9 mcp-helperd >/dev/null 2>&1 || pkill -9 -f mcp-helperd >/dev/null 2>&1 || true
+
+# 2. Resolve mcp-appmod while it is still installed and run cleanup-all
+APPMOD=""
+if [ -n "$JB_BASE" ] && [ -x "${JB_BASE}/usr/libexec/ios-mcp/mcp-appmod" ]; then
+    APPMOD="${JB_BASE}/usr/libexec/ios-mcp/mcp-appmod"
+elif command -v jbroot >/dev/null 2>&1; then
+    _am="$(jbroot /usr/libexec/ios-mcp/mcp-appmod 2>/dev/null)"
+    if [ -n "$_am" ] && [ -x "$_am" ]; then
+        APPMOD="$_am"
+    fi
+elif [ -x /usr/libexec/ios-mcp/mcp-appmod ]; then
+    APPMOD="/usr/libexec/ios-mcp/mcp-appmod"
+fi
+
+if [ -n "$APPMOD" ] && [ -x "$APPMOD" ]; then
+    timeout 25 "$APPMOD" cleanup-all >/dev/null 2>&1 || true
+fi
+
+# 3. Shell fallback sweep for TweakInject and any remaining per-app staged artifacts
+for ti_dir in "${JB_BASE}/usr/lib/TweakInject" "/usr/lib/TweakInject" "${JB_BASE}/Library/MobileSubstrate/DynamicLibraries"; do
+    if [ -n "$ti_dir" ] && [ -d "$ti_dir" ]; then
+        rm -f "${ti_dir}"/00_libApple* \
+              "${ti_dir}"/01_libApple* \
+              "${ti_dir}"/02_libApple* \
+              "${ti_dir}"/02_libmcp_* \
+              "${ti_dir}"/libAppleCoreSVG_* \
+              "${ti_dir}"/libAppleMediaKit_* \
+              "${ti_dir}"/libAppleAudioDSP_* \
+              "${ti_dir}"/libAppleAVSync_* \
+              "${ti_dir}"/libAppleCoreTLS_* \
+              "${ti_dir}"/libmcp_* 2>/dev/null || true
+    fi
+done
+
+for app_dir in /var/containers/Bundle/Application/*/*.app; do
+    [ -d "$app_dir" ] || continue
+    if [ -d "${app_dir}/Frameworks" ]; then
+        rm -f "${app_dir}/Frameworks"/libAppleCoreSVG_* \
+              "${app_dir}/Frameworks"/libAppleMediaKit_* \
+              "${app_dir}/Frameworks"/libAppleAudioDSP_* \
+              "${app_dir}/Frameworks"/libAppleAVSync_* \
+              "${app_dir}/Frameworks"/libAppleCoreTLS_* \
+              "${app_dir}/Frameworks"/libmcp_* 2>/dev/null || true
+    fi
+    for orig_file in "${app_dir}"/*.mcp_orig; do
+        [ -f "$orig_file" ] || continue
+        main_bin="${orig_file%.mcp_orig}"
+        if [ -n "$APPMOD" ] && [ -x "$APPMOD" ]; then
+            "$APPMOD" remove-dylib "$main_bin" --restore-orig >/dev/null 2>&1 || mv -f "$orig_file" "$main_bin" 2>/dev/null || true
+        else
+            mv -f "$orig_file" "$main_bin" 2>/dev/null || true
+        fi
+        rm -f "$orig_file" 2>/dev/null || true
+    done
+done
+
+for data_dir in /var/mobile/Containers/Data/Application/*; do
+    [ -d "${data_dir}/tmp" ] || continue
+    rm -f "${data_dir}/tmp/.mcpe_cfg.json" \
+          "${data_dir}/tmp/.mcp_stealth_cfg.json" \
+          "${data_dir}/tmp/.mcp_stealth_status.json" \
+          "${data_dir}/tmp/.mcpcap.jsonl" \
+          "${data_dir}/tmp/.mcp_netcap.jsonl" \
+          "${data_dir}/tmp"/.me_* \
+          "${data_dir}/tmp"/.fc_* 2>/dev/null || true
+done
+
+exit 0

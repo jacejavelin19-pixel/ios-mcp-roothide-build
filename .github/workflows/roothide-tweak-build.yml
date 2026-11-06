@@ -120,7 +120,8 @@ jobs:
             env -u THEOS_PACKAGE_SCHEME make -C "$payload" FINALPACKAGE=1 DEBUG=0 STRIP=1
           done
 
-          chmod 0755 layout/DEBIAN/postinst
+          python3 -c "from pathlib import Path; [p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n')) for p in Path('layout/DEBIAN').iterdir() if p.is_file()]"
+          chmod 0755 layout/DEBIAN/postinst layout/DEBIAN/prerm layout/DEBIAN/postrm
           make FINALPACKAGE=1 DEBUG=0 STRIP=1 THEOS_PACKAGE_SCHEME=roothide package
 
           ls -la packages/
@@ -223,8 +224,9 @@ jobs:
           with tarfile.open(fileobj=io.BytesIO(ctrl_raw)) as ctf:
               ctrl_names = {m.name.removeprefix('./'): m for m in ctf.getmembers()}
               assert 'control' in ctrl_names
-              assert 'postinst' in ctrl_names, 'DEBIAN/postinst missing from control.tar!'
-              assert (ctrl_names['postinst'].mode & 0o777) == 0o755
+              for script_name in ('postinst', 'prerm', 'postrm'):
+                  assert script_name in ctrl_names, f'DEBIAN/{script_name} missing from control.tar!'
+                  assert (ctrl_names[script_name].mode & 0o777) == 0o755, f'DEBIAN/{script_name} mode != 0755'
 
           data_raw = subprocess.check_output(['ar', 'p', str(deb), data_member])
           macho_paths = [
@@ -245,6 +247,7 @@ jobs:
               'usr/lib/ios-mcp/libmcp_sslks.dylib',
               'usr/lib/ios-mcp/libmcp_netcap.dylib',
               'usr/lib/ios-mcp/libmcp_stealth.dylib',
+              'usr/lib/ios-mcp/libmcpengine.dylib',
           ]
 
           report = {'deb': deb.name, 'size': deb.stat().st_size, 'machos': {}}

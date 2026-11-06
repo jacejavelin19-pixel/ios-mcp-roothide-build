@@ -242,7 +242,7 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
         NSString *launchErr = nil;
         launched = [[AppManager sharedInstance] launchApp:bundleId error:&launchErr];
         if (launched) {
-            for (int i = 0; i < 20 && !socketReady; i++) {
+            for (int i = 0; i < 36 && !socketReady; i++) {
                 usleep(250 * 1000);
                 NSString *pingErr = nil;
                 if ([self sendEnvelope:@{@"id":@0,@"op":@"engine.ping",@"args":@{}} socketPath:socketPath timeoutMs:1500 error:&pingErr]) {
@@ -252,12 +252,21 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
         }
     }
 
+    NSDictionary *appmodRes = [resp[@"result"] isKindOfClass:[NSDictionary class]] ? resp[@"result"] : @{};
+    NSArray *loadOrder = [appmodRes[@"load_order"] isKindOfClass:[NSArray class]]
+        ? appmodRes[@"load_order"]
+        : @[[NSString stringWithFormat:@"@executable_path/Frameworks/%@", stealthName],
+            [NSString stringWithFormat:@"@executable_path/Frameworks/%@", engineName]];
+    NSString *injMode = [appmodRes[@"injection_mode"] isKindOfClass:[NSString class]]
+        ? appmodRes[@"injection_mode"]
+        : @"lc_load_dylib";
+
     return @{ @"bundle_id": bundleId,
               @"socket_path": socketPath,
               @"engine_dylib_name": engineName,
               @"stealth_dylib_name": stealthName,
-              @"load_order": @[[NSString stringWithFormat:@"@executable_path/Frameworks/%@", stealthName],
-                               [NSString stringWithFormat:@"@executable_path/Frameworks/%@", engineName]],
+              @"load_order": loadOrder,
+              @"injection_mode": injMode,
               @"data_container_path": dataContainer,
               @"transport": @"unix_domain_socket_only",
               @"tcp_ports_opened": @0,
@@ -295,7 +304,11 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     NSMutableArray *cleanup = [NSMutableArray array];
     if ([session[@"socket_path"] isKindOfClass:[NSString class]]) [cleanup addObject:session[@"socket_path"]];
     if ([session[@"stealth_cfg_path"] isKindOfClass:[NSString class]]) [cleanup addObject:session[@"stealth_cfg_path"]];
-    if (dataContainer.length) [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcpe_cfg.json"]];
+    if (dataContainer.length) {
+        [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcpe_cfg.json"]];
+        [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcpcap.jsonl"]];
+        [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcp_netcap.jsonl"]];
+    }
     for (NSString *p in cleanup) {
         if (![[NSFileManager defaultManager] removeItemAtPath:p error:nil]) {
             NSString *o = nil, *e = nil; int c = -1;
@@ -308,6 +321,46 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     res[@"bundle_id"] = bundleId;
     res[@"removed"] = @YES;
     return res;
+}
+
+#pragma mark - Out-of-process GOT slot patcher (mcp-memory)
+
+- (NSDictionary *)applySlotPatchesOutOfProcessForBundleId:(NSString *)bundleId
+                                                  patches:(NSArray<NSDictionary *> *)patches
+                                                    error:(NSString **)error {
+    if (error) *error = nil;
+    if (![patches isKindOfClass:[NSArray class]] || patches.count == 0) {
+        return @{@"patched_count": @0, @"requested_count": @0, @"slots": @[]};
+    }
+    pid_t pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
+    if (pid <= 0) {
+        if (error) *error = [NSString stringWithFormat:@"Target %@ is not running for out-of-process GOT patch", bundleId];
+        return nil;
+    }
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:patches options:0 error:NULL];
+    NSString *b64 = [jsonData base64EncodedStringWithOptions:0];
+    if (!b64.length) {
+        if (error) *error = @"Failed to serialize pending GOT slot patches";
+        return nil;
+    }
+
+    NSString *outStr = nil, *runErr = nil;
+    int exitCode = -1;
+    BOOL ok = MCPRunRootProcess(@"/usr/libexec/ios-mcp/mcp-memory",
+                                @[@"patch-slots", [NSString stringWithFormat:@"%d", pid], b64],
+                                20.0, 256 * 1024, &outStr, &exitCode, &runErr);
+    NSDictionary *resp = outStr.length
+        ? [NSJSONSerialization JSONObjectWithData:[outStr dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL]
+        : nil;
+    if (!ok || exitCode != 0 || ![resp isKindOfClass:[NSDictionary class]] || ![resp[@"ok"] boolValue]) {
+        if (error) {
+            *error = [resp[@"error"] isKindOfClass:[NSString class]]
+                ? resp[@"error"]
+                : (runErr ?: @"mcp-memory patch-slots failed");
+        }
+        return nil;
+    }
+    return [resp[@"result"] isKindOfClass:[NSDictionary class]] ? resp[@"result"] : @{};
 }
 
 #pragma mark - Typed wrappers
@@ -337,7 +390,19 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     return [self sendOp:@"engine.hook_events" forBundleId:bundleId args:a timeoutMs:10000 error:error];
 }
 - (NSDictionary *)unhookForBundleId:(NSString *)bundleId key:(NSString *)hookKey error:(NSString **)error {
-    return [self sendOp:@"engine.unhook" forBundleId:bundleId args:@{@"hook_key": hookKey ?: @""} timeoutMs:10000 error:error];
+    NSDictionary *res = [self sendOp:@"engine.unhook" forBundleId:bundleId args:@{@"hook_key": hookKey ?: @""} timeoutMs:10000 error:error];
+    if (!res) return nil;
+    NSArray *restoreSlots = [res[@"restore_slots"] isKindOfClass:[NSArray class]] ? res[@"restore_slots"] : nil;
+    if (restoreSlots.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:restoreSlots error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"restored_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_restore"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
 }
 - (NSDictionary *)invokeForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
     return [self sendOp:@"engine.invoke" forBundleId:bundleId args:args timeoutMs:15000 error:error];
@@ -346,8 +411,62 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     NSString *op = args[@"set"] ? @"engine.set_ivar" : @"engine.get_ivar";
     return [self sendOp:op forBundleId:bundleId args:args timeoutMs:10000 error:error];
 }
+- (NSDictionary *)prepareNativeHookForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.prepare_native_hook" forBundleId:bundleId args:args timeoutMs:10000 error:error];
+}
 - (NSDictionary *)hookNativeForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
-    return [self sendOp:@"engine.hook_native" forBundleId:bundleId args:args timeoutMs:10000 error:error];
+    NSDictionary *res = [self sendOp:@"engine.hook_native" forBundleId:bundleId args:args timeoutMs:10000 error:error];
+    if (!res) return nil;
+    NSArray *pending = [res[@"pending_slots"] isKindOfClass:[NSArray class]] ? res[@"pending_slots"] : nil;
+    if (pending.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:pending error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        NSUInteger inProcCount = [res[@"patched_in_proc"] unsignedIntegerValue];
+        NSUInteger oopCount = [oopRes[@"patched_count"] unsignedIntegerValue];
+        merged[@"patched_out_of_proc"] = @(oopCount);
+        merged[@"installed"] = @((inProcCount + oopCount) > 0);
+        if (oopRes) merged[@"out_of_proc_result"] = oopRes;
+        if (oopErr.length > 0 && (inProcCount + oopCount) == 0) {
+            if (error) *error = oopErr;
+            return nil;
+        }
+        return merged;
+    }
+    return res;
+}
+- (NSDictionary *)startCaptureForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    NSDictionary *res = [self sendOp:@"engine.start_capture" forBundleId:bundleId args:(args ?: @{}) timeoutMs:15000 error:error];
+    if (!res) return nil;
+    NSArray *pending = [res[@"pending_slots"] isKindOfClass:[NSArray class]] ? res[@"pending_slots"] : nil;
+    if (pending.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:pending error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"patched_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_result"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
+}
+- (NSDictionary *)getCapturedRequestsForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.get_requests" forBundleId:bundleId args:(args ?: @{}) timeoutMs:10000 error:error];
+}
+- (NSDictionary *)stopCaptureForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    NSDictionary *res = [self sendOp:@"engine.stop_capture" forBundleId:bundleId args:(args ?: @{}) timeoutMs:10000 error:error];
+    if (!res) return nil;
+    NSArray *restoreSlots = [res[@"restore_slots"] isKindOfClass:[NSArray class]] ? res[@"restore_slots"] : nil;
+    if (restoreSlots.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:restoreSlots error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"restored_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_restore"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
 }
 - (NSDictionary *)callNativeForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
     return [self sendOp:@"engine.call" forBundleId:bundleId args:args timeoutMs:10000 error:error];

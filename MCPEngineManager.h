@@ -73,11 +73,31 @@
                              args:(NSDictionary *)args   // { handle, name, set?, value? }
                             error:(NSString **)error;
 
+/// engine.prepare_native_hook — resolve target GOT slots and compute PAC-signed
+/// replacement pointers in-process without crashing on read-only __DATA_CONST pages.
+- (NSDictionary *)prepareNativeHookForBundleId:(NSString *)bundleId
+                                          args:(NSDictionary *)args
+                                         error:(NSString **)error;
+
 /// engine.hook_native — rebind an imported symbol (fishhook) or a module export.
+/// Transparently falls back to out-of-process mach_vm_protect + mach_vm_write via
+/// mcp-memory when GOT slots reside in read-only __DATA_CONST / __AUTH_CONST.
 /// args: { symbol | address, module?, record(bool), override_return?("0x..") }
 - (NSDictionary *)hookNativeForBundleId:(NSString *)bundleId
                                    args:(NSDictionary *)args
                                   error:(NSString **)error;
+
+/// engine.start_capture / engine.get_requests / engine.stop_capture — unified
+/// NSURLSession + BoringSSL network capture inside libmcpengine.
+- (NSDictionary *)startCaptureForBundleId:(NSString *)bundleId
+                                     args:(NSDictionary *)args
+                                    error:(NSString **)error;
+- (NSDictionary *)getCapturedRequestsForBundleId:(NSString *)bundleId
+                                            args:(NSDictionary *)args
+                                           error:(NSString **)error;
+- (NSDictionary *)stopCaptureForBundleId:(NSString *)bundleId
+                                    args:(NSDictionary *)args
+                                   error:(NSString **)error;
 
 /// engine.call — invoke a native function at symbol/address with up to 8 int/ptr args.
 - (NSDictionary *)callNativeForBundleId:(NSString *)bundleId

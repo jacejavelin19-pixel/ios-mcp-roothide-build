@@ -1,6 +1,7 @@
 #import "NetworkCaptureManager.h"
 #import "AppManager.h"
 #import "DylibInjectManager.h"
+#import "MCPEngineManager.h"
 #import "MCPProcessUtil.h"
 
 static NSString *const kMCPNetCapLogicalPath = @"/usr/lib/ios-mcp/libmcp_netcap.dylib";
@@ -17,7 +18,7 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
     return instance;
 }
 
-- (NSString *)captureLogPathForBundleId:(NSString *)bundleId error:(NSString **)error {
+- (NSString *)captureContainerForBundleId:(NSString *)bundleId error:(NSString **)error {
     NSString *appErr = nil;
     NSDictionary *info = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:&appErr];
     if (!info) {
@@ -30,6 +31,18 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
         if (error) *error = [NSString stringWithFormat:@"App %@ has no data_container_path", bundleId];
         return nil;
     }
+    return container;
+}
+
+- (NSString *)primaryCaptureLogPathForBundleId:(NSString *)bundleId error:(NSString **)error {
+    NSString *container = [self captureContainerForBundleId:bundleId error:error];
+    if (!container) return nil;
+    return [container stringByAppendingPathComponent:@"tmp/.mcpcap.jsonl"];
+}
+
+- (NSString *)captureLogPathForBundleId:(NSString *)bundleId error:(NSString **)error {
+    NSString *container = [self captureContainerForBundleId:bundleId error:error];
+    if (!container) return nil;
     return [container stringByAppendingPathComponent:@"tmp/.mcp_netcap.jsonl"];
 }
 
@@ -46,38 +59,39 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
                                  relaunch:(BOOL)relaunch
                                     error:(NSString **)error {
     if (error) *error = nil;
-    NSString *logPath = [self captureLogPathForBundleId:bundleId error:error];
-    if (!logPath) return nil;
-
-    NSString *resolvedPayload = MCPResolvedJailbreakPath(kMCPNetCapLogicalPath);
-    if (![[NSFileManager defaultManager] fileExistsAtPath:resolvedPayload]) {
-        if (error) *error = [NSString stringWithFormat:@"Network capture companion dylib missing at %@", resolvedPayload];
-        return nil;
-    }
+    NSString *primaryLogPath = [self primaryCaptureLogPathForBundleId:bundleId error:error];
+    if (!primaryLogPath) return nil;
+    NSString *legacyLogPath = [self captureLogPathForBundleId:bundleId error:nil];
 
     if (clearExisting) {
-        [self deleteCaptureLogAtPath:logPath];
+        [self deleteCaptureLogAtPath:primaryLogPath];
+        if (legacyLogPath.length) [self deleteCaptureLogAtPath:legacyLogPath];
     }
 
-    NSDictionary *inj = [[DylibInjectManager sharedInstance] injectDylibForBundleId:bundleId
-                                                                          dylibPath:resolvedPayload
-                                                                           destName:kMCPNetCapDestName
-                                                                              error:error];
-    if (!inj) return nil;
-
-    BOOL relaunched = NO;
-    NSString *launchErr = nil;
-    if (relaunch) {
-        relaunched = [[AppManager sharedInstance] launchApp:bundleId error:&launchErr];
+    NSDictionary *ping = !relaunch ? [[MCPEngineManager sharedInstance] pingForBundleId:bundleId error:nil] : nil;
+    NSDictionary *inj = nil;
+    if (!ping) {
+        inj = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId
+                                                           stealthConfig:nil
+                                                                  launch:relaunch
+                                                                   error:error];
+        if (!inj) return nil;
     }
 
-    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithDictionary:inj];
+    NSString *capErr = nil;
+    NSDictionary *engineCap = [[MCPEngineManager sharedInstance] startCaptureForBundleId:bundleId
+                                                                                    args:@{@"clear": @NO}
+                                                                                   error:&capErr];
+
+    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithDictionary:(inj ?: @{})];
+    res[@"bundle_id"] = bundleId;
     res[@"capture_status"] = @"started";
-    res[@"companion_dylib"] = kMCPNetCapDestName;
-    res[@"capture_log_path"] = logPath;
+    res[@"capture_log_path"] = primaryLogPath;
+    res[@"legacy_capture_log_path"] = legacyLogPath ?: @"";
     res[@"cleared_existing"] = @(clearExisting);
-    res[@"relaunched"] = @(relaunched);
-    if (launchErr.length > 0) res[@"relaunch_warning"] = launchErr;
+    res[@"relaunched"] = @(relaunch ? [inj[@"launched"] boolValue] : NO);
+    if (engineCap) res[@"engine_capture"] = engineCap;
+    if (capErr.length > 0 && !engineCap) res[@"engine_capture_warning"] = capErr;
     return res;
 }
 
@@ -86,17 +100,38 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
                                 relaunch:(BOOL)relaunch
                                    error:(NSString **)error {
     if (error) *error = nil;
-    NSString *logPath = [self captureLogPathForBundleId:bundleId error:nil];
+    NSString *primaryLogPath = [self primaryCaptureLogPathForBundleId:bundleId error:nil];
+    NSString *legacyLogPath = [self captureLogPathForBundleId:bundleId error:nil];
 
-    NSDictionary *rem = [[DylibInjectManager sharedInstance] removeDylibForBundleId:bundleId
-                                                                          dylibName:kMCPNetCapDestName
-                                                                    restoreOriginal:NO
-                                                                       deleteStaged:YES
-                                                                              error:error];
-    if (!rem) return nil;
+    // 1. If the engine is live, stop capture & restore any BoringSSL GOT slots first.
+    NSDictionary *engineStop = [[MCPEngineManager sharedInstance] stopCaptureForBundleId:bundleId
+                                                                                    args:@{}
+                                                                                   error:nil];
 
-    if (clearLogs && logPath.length > 0) {
-        [self deleteCaptureLogAtPath:logPath];
+    // 2. Preserve log files across engine removal if clearLogs == NO.
+    NSData *savedPrimary = (!clearLogs && primaryLogPath.length) ? [NSData dataWithContentsOfFile:primaryLogPath] : nil;
+    NSData *savedLegacy = (!clearLogs && legacyLogPath.length) ? [NSData dataWithContentsOfFile:legacyLogPath] : nil;
+
+    NSString *remErr = nil;
+    NSDictionary *rem = [[MCPEngineManager sharedInstance] removeEngineForBundleId:bundleId error:&remErr];
+
+    // Also remove standalone libmcp_netcap.dylib if it was ever staged.
+    [[DylibInjectManager sharedInstance] removeDylibForBundleId:bundleId
+                                                      dylibName:kMCPNetCapDestName
+                                                restoreOriginal:NO
+                                                   deleteStaged:YES
+                                                          error:nil];
+
+    if (clearLogs) {
+        if (primaryLogPath.length) [self deleteCaptureLogAtPath:primaryLogPath];
+        if (legacyLogPath.length) [self deleteCaptureLogAtPath:legacyLogPath];
+    } else {
+        if (savedPrimary.length && primaryLogPath.length && ![[NSFileManager defaultManager] fileExistsAtPath:primaryLogPath]) {
+            [savedPrimary writeToFile:primaryLogPath options:NSDataWritingAtomic error:nil];
+        }
+        if (savedLegacy.length && legacyLogPath.length && ![[NSFileManager defaultManager] fileExistsAtPath:legacyLogPath]) {
+            [savedLegacy writeToFile:legacyLogPath options:NSDataWritingAtomic error:nil];
+        }
     }
 
     BOOL relaunched = NO;
@@ -105,36 +140,27 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
         relaunched = [[AppManager sharedInstance] launchApp:bundleId error:&launchErr];
     }
 
-    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithDictionary:rem];
+    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithDictionary:(rem ?: @{})];
+    res[@"bundle_id"] = bundleId;
     res[@"capture_status"] = @"stopped";
-    res[@"companion_dylib"] = kMCPNetCapDestName;
-    res[@"capture_log_path"] = logPath ?: @"";
+    res[@"capture_log_path"] = primaryLogPath ?: @"";
     res[@"logs_cleared"] = @(clearLogs);
     res[@"relaunched"] = @(relaunched);
+    if (engineStop) res[@"engine_stop"] = engineStop;
     if (launchErr.length > 0) res[@"relaunch_warning"] = launchErr;
     return res;
 }
 
-- (NSDictionary *)getCapturedRequestsForBundleId:(NSString *)bundleId
-                                           limit:(NSUInteger)limit
-                                       urlFilter:(NSString *)urlFilter
-                                           clear:(BOOL)clear
-                                           error:(NSString **)error {
-    if (error) *error = nil;
-    NSString *logPath = [self captureLogPathForBundleId:bundleId error:error];
-    if (!logPath) return nil;
-
-    if (limit == 0) limit = 100;
-    if (limit > 1000) limit = 1000;
-
-    NSData *rawData = [NSData dataWithContentsOfFile:logPath];
+- (NSData *)readCaptureFileDataAtPath:(NSString *)path {
+    if (!path.length) return nil;
+    NSData *rawData = [NSData dataWithContentsOfFile:path];
     if (!rawData) {
         NSData *rootData = nil;
         BOOL truncated = NO;
         int code = -1;
         NSString *runErr = nil;
         if (MCPRunRootProcessData(@"/usr/libexec/ios-mcp/mcp-appmod",
-                                  @[@"read-file", logPath, @"8388608"],
+                                  @[@"read-file", path, @"8388608"],
                                   15.0,
                                   8 * 1024 * 1024,
                                   &rootData,
@@ -144,29 +170,80 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
             rawData = rootData;
         }
     }
+    return rawData;
+}
 
-    NSMutableArray<NSDictionary *> *matched = [NSMutableArray array];
-    NSUInteger totalLines = 0;
+- (NSDictionary *)getCapturedRequestsForBundleId:(NSString *)bundleId
+                                           limit:(NSUInteger)limit
+                                       urlFilter:(NSString *)urlFilter
+                                           clear:(BOOL)clear
+                                           error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *primaryLogPath = [self primaryCaptureLogPathForBundleId:bundleId error:error];
+    if (!primaryLogPath) return nil;
+    NSString *legacyLogPath = [self captureLogPathForBundleId:bundleId error:nil];
 
-    if (rawData.length > 0) {
+    if (limit == 0) limit = 100;
+    if (limit > 1000) limit = 1000;
+
+    // Collect entries from engine RPC (if live) plus both on-disk JSONL files.
+    NSMutableArray<NSDictionary *> *allEntries = [NSMutableArray array];
+    NSDictionary *engineReqs = [[MCPEngineManager sharedInstance] getCapturedRequestsForBundleId:bundleId
+                                                                                            args:@{@"limit": @(limit), @"clear": @NO}
+                                                                                           error:nil];
+    if ([engineReqs[@"requests"] isKindOfClass:[NSArray class]]) {
+        [allEntries addObjectsFromArray:engineReqs[@"requests"]];
+    }
+
+    NSData *primaryData = [self readCaptureFileDataAtPath:primaryLogPath];
+    NSData *legacyData = [self readCaptureFileDataAtPath:legacyLogPath];
+    for (NSData *rawData in @[primaryData ?: [NSData data], legacyData ?: [NSData data]]) {
+        if (!rawData.length) continue;
         NSString *text = [[NSString alloc] initWithData:rawData encoding:NSUTF8StringEncoding];
-        if (text.length > 0) {
-            NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-            for (NSString *line in lines) {
-                if (!line.length) continue;
-                NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
-                NSDictionary *entry = lineData ? [NSJSONSerialization JSONObjectWithData:lineData options:0 error:NULL] : nil;
-                if (![entry isKindOfClass:[NSDictionary class]]) continue;
-                totalLines++;
-                if (urlFilter.length > 0) {
-                    NSString *u = [entry[@"url"] isKindOfClass:[NSString class]] ? entry[@"url"] : @"";
-                    if ([u rangeOfString:urlFilter options:NSCaseInsensitiveSearch].location == NSNotFound) {
-                        continue;
-                    }
-                }
-                [matched addObject:entry];
+        for (NSString *line in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+            if (!line.length) continue;
+            NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *entry = lineData ? [NSJSONSerialization JSONObjectWithData:lineData options:0 error:NULL] : nil;
+            if ([entry isKindOfClass:[NSDictionary class]]) {
+                [allEntries addObject:entry];
             }
         }
+    }
+
+    // Deduplicate and prefer rich nsurlsession entries when both layers saw the same URL+method
+    NSMutableSet<NSString *> *richURLMethods = [NSMutableSet set];
+    for (NSDictionary *entry in allEntries) {
+        NSString *src = entry[@"source"] ?: @"nsurlsession";
+        if ([src isEqualToString:@"nsurlsession"]) {
+            [richURLMethods addObject:[NSString stringWithFormat:@"%@|%@", entry[@"method"] ?: @"", entry[@"url"] ?: @""]];
+        }
+    }
+
+    NSMutableArray<NSDictionary *> *matched = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenKeys = [NSMutableSet set];
+    NSUInteger totalUnique = 0;
+
+    for (NSDictionary *entry in allEntries) {
+        NSString *src = entry[@"source"] ?: @"nsurlsession";
+        NSString *um = [NSString stringWithFormat:@"%@|%@", entry[@"method"] ?: @"", entry[@"url"] ?: @""];
+        if (![src isEqualToString:@"nsurlsession"] && [richURLMethods containsObject:um]) {
+            continue;
+        }
+        NSString *dedupKey = [NSString stringWithFormat:@"%@|%@|%@|%@",
+                              src, entry[@"id"] ?: @0, entry[@"method"] ?: @"", entry[@"url"] ?: @""];
+        if ([seenKeys containsObject:dedupKey]) continue;
+        [seenKeys addObject:dedupKey];
+        totalUnique++;
+
+        if (urlFilter.length > 0) {
+            NSString *u = [entry[@"url"] isKindOfClass:[NSString class]] ? entry[@"url"] : @"";
+            NSString *h = [entry[@"host"] isKindOfClass:[NSString class]] ? entry[@"host"] : @"";
+            if ([u rangeOfString:urlFilter options:NSCaseInsensitiveSearch].location == NSNotFound &&
+                [h rangeOfString:urlFilter options:NSCaseInsensitiveSearch].location == NSNotFound) {
+                continue;
+            }
+        }
+        [matched addObject:entry];
     }
 
     NSArray<NSDictionary *> *returned = matched;
@@ -177,14 +254,15 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
     }
 
     if (clear) {
-        [self deleteCaptureLogAtPath:logPath];
+        [self deleteCaptureLogAtPath:primaryLogPath];
+        if (legacyLogPath.length) [self deleteCaptureLogAtPath:legacyLogPath];
     }
 
     return @{
         @"bundle_id": bundleId,
-        @"capture_log_path": logPath,
-        @"log_exists": @(rawData != nil),
-        @"total_captured": @(totalLines),
+        @"capture_log_path": primaryLogPath,
+        @"log_exists": @((primaryData != nil) || (legacyData != nil)),
+        @"total_captured": @(totalUnique),
         @"matched_count": @(matched.count),
         @"returned_count": @(returned.count),
         @"truncated": @(truncatedCount),

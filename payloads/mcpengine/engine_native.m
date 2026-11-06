@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libkern/OSByteOrder.h>
 #include <stdarg.h>
 #include <string.h>
 #include <ptrauth.h>
@@ -16,6 +17,11 @@ static NSObject *MEHookLock;
 static unsigned MENextSlot;
 static NSString *MEBundlePath;
 static const struct mach_header *MESelf;
+
+const struct mach_header *MESelfHeader(void) {
+    return MESelf;
+}
+
 static void MEHookInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once,^{ MEHookLock = [NSObject new]; });
@@ -27,7 +33,9 @@ MEHook *MENewHook(NSDictionary *a) {
         MEHook *h = [MEHook new]; h.slot = MENextSlot++;
         h.key = [NSString stringWithFormat:@"hook:%u",h.slot];
         h.maxEvents = MELimit(a,@"max_events",256,4096);
-        h.events = [NSMutableArray array]; h.record = a[@"record"] ? [a[@"record"] boolValue] : YES;
+        h.events = [NSMutableArray array];
+        h.boundSlots = [NSMutableArray array];
+        h.record = a[@"record"] ? [a[@"record"] boolValue] : YES;
         h.overrideValue = a[@"override_return"];
         MESlots[h.slot] = h; return h;
     }
@@ -157,12 +165,62 @@ static int MEOpen(const char *path, int flags, ...) {
     } @finally { MEDepth--; errno=prior; }
     return result;
 }
+
+static BOOL MEIsCompanionPath(NSString *name) {
+    NSString *base = name.lastPathComponent;
+    if (!base.length) return NO;
+    return ([base hasPrefix:@"libApple"] ||
+            [base hasPrefix:@"00_libApple"] ||
+            [base hasPrefix:@"01_libApple"] ||
+            [base hasPrefix:@"libmcp"] ||
+            [base hasPrefix:@"systemhook"] ||
+            [base hasPrefix:@"TweakLoader"] ||
+            [name containsString:@"/.jbroot-"] ||
+            [name containsString:@"/usr/lib/TweakInject/"]);
+}
+
 static BOOL MEMatches(MEHook *h, const struct mach_header *image, const char *path) {
     if (image==MESelf || !path || !h.active || h.objcHook) return NO;
     NSString *name=[@(path) stringByResolvingSymlinksInPath];
+    if (MEIsCompanionPath(name)) return NO;
     if (h.module.length) return [h.module isEqual:name] || [h.module isEqual:name.lastPathComponent];
     return [name hasPrefix:[MEBundlePath stringByAppendingString:@"/"]];
 }
+
+static NSDictionary *MESlotPatchToDict(const mcp_slot_patch_t *p, NSString *imageName) {
+    uint64_t newLE = OSSwapHostToLittleInt64((uint64_t)p->new_val);
+    uint64_t origLE = OSSwapHostToLittleInt64((uint64_t)p->orig_val);
+    NSString *newB64 = [[NSData dataWithBytes:&newLE length:sizeof(newLE)] base64EncodedStringWithOptions:0];
+    NSString *origB64 = [[NSData dataWithBytes:&origLE length:sizeof(origLE)] base64EncodedStringWithOptions:0];
+    return @{
+        @"slot_address": MEHex(p->slot_addr),
+        @"original_value": MEHex(p->orig_val),
+        @"replacement_value": MEHex(p->new_val),
+        @"bytes_base64": newB64 ?: @"",
+        @"original_bytes_base64": origB64 ?: @"",
+        @"symbol": @(p->symbol_name),
+        @"section": @(p->section_name),
+        @"auth_got": @(p->is_auth ? YES : NO),
+        @"writable_in_proc": @(p->written_in_proc ? YES : NO),
+        @"image": imageName ?: @""
+    };
+}
+
+static void MERecordBoundSlotOnHook(MEHook *h, NSDictionary *slotDict) {
+    if (!h || !slotDict) return;
+    @synchronized(h) {
+        if (!h.boundSlots) h.boundSlots = [NSMutableArray array];
+        NSString *addr = slotDict[@"slot_address"];
+        for (NSUInteger i = 0; i < h.boundSlots.count; i++) {
+            if ([h.boundSlots[i][@"slot_address"] isEqualToString:addr]) {
+                h.boundSlots[i] = slotDict;
+                return;
+            }
+        }
+        [h.boundSlots addObject:slotDict];
+    }
+}
+
 static void MEApplyImage(const struct mach_header *image, intptr_t slide) {
     Dl_info info={0}; if (!dladdr(image,&info)) return;
     MEDepth++;
@@ -172,22 +230,81 @@ static void MEApplyImage(const struct mach_header *image, intptr_t slide) {
                 MEHook *h=MESlots[i];
                 if (!MEMatches(h,image,info.dli_fname)) continue;
                 struct mcp_rebinding binding={h.symbol.UTF8String,h.replacement,NULL};
-                mcp_rebind_symbols_image(image,slide,MESelf,&binding,1);
+                mcp_slot_collector_t collector = {0};
+                mcp_rebind_symbols_image_collect(image,slide,MESelf,&binding,1,&collector);
+                NSString *imgName = info.dli_fname ? @(info.dli_fname) : @"";
+                for (size_t k = 0; k < collector.count; k++) {
+                    MERecordBoundSlotOnHook(h, MESlotPatchToDict(&collector.patches[k], imgName));
+                }
+                mcp_slot_collector_free(&collector);
             }
         }
     } @finally { MEDepth--; }
 }
+
+static void MECollectHookSlots(MEHook *h,
+                               BOOL prepareOnly,
+                               NSArray<NSDictionary *> **outAllSlots,
+                               NSArray<NSDictionary *> **outPendingSlots,
+                               NSUInteger *outPatchedInProc) {
+    NSMutableArray<NSDictionary *> *allSlots = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *pendingSlots = [NSMutableArray array];
+    NSUInteger patchedInProc = 0;
+
+    uint32_t count = _dyld_image_count();
+    MEDepth++;
+    @try {
+        for (uint32_t i = 0; i < count; i++) {
+            const struct mach_header *image = _dyld_get_image_header(i);
+            const char *rawName = _dyld_get_image_name(i);
+            if (!image || !rawName) continue;
+            if (!MEMatches(h, image, rawName)) continue;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            struct mcp_rebinding binding = {h.symbol.UTF8String, h.replacement, NULL};
+            mcp_slot_collector_t collector = {0};
+            collector.prepare_only = prepareOnly ? 1 : 0;
+            mcp_rebind_symbols_image_collect(image, slide, MESelf, &binding, 1, &collector);
+            NSString *imgName = @(rawName);
+            for (size_t k = 0; k < collector.count; k++) {
+                NSDictionary *slotDict = MESlotPatchToDict(&collector.patches[k], imgName);
+                MERecordBoundSlotOnHook(h, slotDict);
+                [allSlots addObject:slotDict];
+                if (collector.patches[k].written_in_proc) {
+                    patchedInProc++;
+                } else {
+                    [pendingSlots addObject:slotDict];
+                }
+            }
+            mcp_slot_collector_free(&collector);
+        }
+    } @finally {
+        MEDepth--;
+    }
+
+    if (outAllSlots) *outAllSlots = allSlots;
+    if (outPendingSlots) *outPendingSlots = pendingSlots;
+    if (outPatchedInProc) *outPatchedInProc = patchedInProc;
+}
+
 void MEInitNative(void) {
     MEHookInit(); MEBundlePath=NSBundle.mainBundle.bundlePath.stringByResolvingSymlinksInPath;
     Dl_info info={0}; dladdr((void *)MEInitNative,&info); MESelf=info.dli_fbase;
     _dyld_register_func_for_add_image(MEApplyImage);
 }
+
 void MERestoreNative(MEHook *h) {
-    // Existing adapters become pass-through. The shared rebinder cannot undo
-    // chained-fixup slots by replacement address; leaving static adapters avoids
-    // corrupting a newer hook or attempting an unsupported inline patch.
-    @synchronized(h) { h.active=NO; }
+    @synchronized(h) {
+        h.active = NO;
+        for (NSDictionary *slotDict in h.boundSlots) {
+            uintptr_t slotAddr = MEWord(slotDict[@"slot_address"]);
+            uintptr_t origVal = MEWord(slotDict[@"original_value"]);
+            if (slotAddr && origVal) {
+                mcp_write_raw_slot_in_proc(slotAddr, origVal);
+            }
+        }
+    }
 }
+
 NSDictionary *MEHooks(NSString *op, NSDictionary *a) {
     if (![op isEqual:@"engine.hook_events"] && ![op isEqual:@"engine.unhook"]) return nil;
     MEHook *h=MEFind(MEString(a,@"hook_key"));
@@ -197,14 +314,38 @@ NSDictionary *MEHooks(NSString *op, NSDictionary *a) {
             return @{@"events":[h.events subarrayWithRange:NSMakeRange(h.events.count-n,n)],@"count":@(h.count),
                      @"active":@(h.active),@"dropped":@(h.count>h.events.count ? h.count-h.events.count:0)};
         }
+        NSMutableArray<NSDictionary *> *restoreSlots = [NSMutableArray array];
+        NSUInteger restoredInProc = 0;
         if (h.active && h.objcHook) {
             Method method=class_getInstanceMethod(h.owner,h.selector);
             if (method_getImplementation(method)!=(IMP)h.replacement) MEFail(@"Method changed by another hook; refusing to overwrite it");
             method_setImplementation(method,h.originalIMP);
-        } else if (h.active) MERestoreNative(h);
-        h.active=NO; return @{@"removed":@YES};
+            restoredInProc = 1;
+        } else {
+            for (NSDictionary *slotDict in h.boundSlots) {
+                uintptr_t slotAddr = MEWord(slotDict[@"slot_address"]);
+                uintptr_t origVal = MEWord(slotDict[@"original_value"]);
+                if (!slotAddr || !origVal) continue;
+                if (mcp_write_raw_slot_in_proc(slotAddr, origVal)) {
+                    restoredInProc++;
+                } else {
+                    [restoreSlots addObject:@{
+                        @"slot_address": slotDict[@"slot_address"] ?: @"0x0",
+                        @"original_value": slotDict[@"original_value"] ?: @"0x0",
+                        @"bytes_base64": slotDict[@"original_bytes_base64"] ?: @""
+                    }];
+                }
+            }
+        }
+        h.active=NO;
+        return @{
+            @"removed": @YES,
+            @"restored_in_proc": @(restoredInProc),
+            @"restore_slots": restoreSlots
+        };
     }
 }
+
 NSDictionary *MENative(NSString *op, NSDictionary *a) {
     if ([op isEqual:@"engine.call"]) {
         NSArray *values=a[@"args"] ?: @[];
@@ -216,7 +357,10 @@ NSDictionary *MENative(NSString *op, NSDictionary *a) {
 #endif
         return @{@"ret":MEHex(MECall(fn,args,(unsigned)values.count))};
     }
-    if (![op isEqual:@"engine.hook_native"]) return nil;
+    BOOL isPrepare = [op isEqual:@"engine.prepare_native_hook"];
+    BOOL isHook = [op isEqual:@"engine.hook_native"];
+    if (!isPrepare && !isHook) return nil;
+
     NSString *symbol=a[@"symbol"];
     if (a[@"address"]) {
         Dl_info info={0}; void *addr=(void *)MEWord(a[@"address"]);
@@ -227,24 +371,85 @@ NSDictionary *MENative(NSString *op, NSDictionary *a) {
     // Avoid hooking allocation/locking/runtime primitives used by diagnostics.
     NSSet *forbidden=[NSSet setWithArray:@[@"malloc",@"calloc",@"realloc",@"free",@"objc_msgSend",@"objc_retain",@"objc_release",@"pthread_mutex_lock",@"pthread_mutex_unlock"]];
     if ([forbidden containsObject:symbol]) MEFail(@"Engine runtime primitive cannot be instrumented");
-    NSDictionary *counts=@{@"open":@3,@"close":@1,@"read":@3,@"write":@3};
+    NSDictionary *counts=@{
+        @"open":@3,@"close":@1,@"read":@3,@"write":@3,
+        @"stat":@2,@"lstat":@2,@"fstat":@2,@"access":@2,
+        @"fopen":@2,@"dlopen":@2,@"SSL_read":@3,@"SSL_write":@3,
+        @"send":@4,@"recv":@4,@"connect":@3,@"unlink":@1,@"getenv":@1
+    };
     if (!a[@"arg_count"] && !counts[symbol]) MEFail(@"arg_count is required for a fixed integer/pointer native signature");
     unsigned argc=(unsigned)MELimit(a,@"arg_count",[counts[symbol] unsignedIntegerValue],8);
     if (counts[symbol] && argc != [counts[symbol] unsignedIntValue]) MEFail(@"arg_count does not match known symbol signature");
     void *original=MEResolve(@{@"symbol":symbol});
     uintptr_t overrideBits=a[@"override_return"] ? MEWord(a[@"override_return"]) : 0;
+
+    MEHook *h = nil;
     @synchronized(MEHookLock) {
-        for (unsigned i=0;i<MENextSlot;i++) if (!MESlots[i].objcHook && [MESlots[i].symbol isEqual:symbol])
-            MEFail(@"Symbol already registered; native slots cannot be reused");
+        for (unsigned i=0;i<MENextSlot;i++) {
+            if (!MESlots[i].objcHook && [MESlots[i].symbol isEqual:symbol]) {
+                if (MESlots[i].active && isHook && MESlots[i].boundSlots.count > 0 && !a[@"allow_reuse"]) {
+                    // If it was prepared via prepare_native_hook (or unhooked), allow hook_native to apply/reuse it;
+                    // only reject if already actively hooked with no pending slots unless prepare_native_hook was used.
+                }
+                h = MESlots[i];
+                break;
+            }
+        }
     }
-    MEHook *h=MENewHook(a); h.symbol=symbol; h.module=a[@"module"];
+    if (h && h.active && isHook && !a[@"from_prepare"]) {
+        // Check if any bound slot is actually active in memory; if already hooked, reject duplicate active hook
+        BOOL anyActiveInMem = NO;
+        for (NSDictionary *slotDict in h.boundSlots) {
+            uintptr_t slotAddr = MEWord(slotDict[@"slot_address"]);
+            uintptr_t replVal = MEWord(slotDict[@"replacement_value"]);
+            if (slotAddr && *(uintptr_t *)slotAddr == replVal) {
+                anyActiveInMem = YES;
+                break;
+            }
+        }
+        if (anyActiveInMem) {
+            MEFail(@"Symbol already registered; native slots cannot be reused");
+        }
+    }
+
+    if (!h) {
+        h = MENewHook(a);
+    } else {
+        @synchronized(h) {
+            h.maxEvents = MELimit(a,@"max_events",256,4096);
+            h.record = a[@"record"] ? [a[@"record"] boolValue] : YES;
+            h.overrideValue = a[@"override_return"];
+            if (!h.boundSlots) h.boundSlots = [NSMutableArray array];
+        }
+    }
+
+    h.symbol=symbol;
+    h.module=a[@"module"];
     h.overrideBits=overrideBits;
     if (h.module && ![h.module isKindOfClass:NSString.class]) MEFail(@"module must be a string");
-    h.argc=argc; h.originalFunction=original;
+    h.argc=argc;
+    h.originalFunction=original;
     h.replacement=[symbol isEqual:@"open"] ? (void *)MEOpen : MEAdapter(h.slot);
     if ([symbol isEqual:@"open"]) MEOpenHook=h;
     @synchronized(h) { h.active=YES; }
-    uint32_t count=_dyld_image_count();
-    for (uint32_t i=0;i<count;i++) MEApplyImage(_dyld_get_image_header(i),_dyld_get_image_vmaddr_slide(i));
-    return @{@"hook_key":h.key,@"installed":@YES,@"scope":@"app imports; direct/export calls unaffected"};
+
+    BOOL prepareOnly = isPrepare || [a[@"prepare_only"] boolValue];
+    NSArray<NSDictionary *> *allSlots = nil;
+    NSArray<NSDictionary *> *pendingSlots = nil;
+    NSUInteger patchedInProc = 0;
+    MECollectHookSlots(h, prepareOnly, &allSlots, &pendingSlots, &patchedInProc);
+
+    return @{
+        @"hook_key": h.key,
+        @"slot": @(h.slot),
+        @"symbol": h.symbol,
+        @"original_address": MEHex((uintptr_t)h.originalFunction),
+        @"replacement_address": MEHex((uintptr_t)h.replacement),
+        @"installed": @(!prepareOnly && (patchedInProc > 0 || pendingSlots.count == 0)),
+        @"prepared": @YES,
+        @"patched_in_proc": @(patchedInProc),
+        @"slots": allSlots ?: @[],
+        @"pending_slots": pendingSlots ?: @[],
+        @"scope": @"app imports; direct/export calls unaffected"
+    };
 }

@@ -1,12 +1,18 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <fcntl.h>
-#import <unistd.h>
-#import <stdatomic.h>
+#include "fishhook.h"
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <unistd.h>
 
 static NSString *const kMCPNetCapHandledKey = @"com.iosmcp.netcap.handled";
+static NSString *const kMCPNetCapTaskTrackedKey = @"com.iosmcp.netcap.task_tracked";
 static const NSUInteger kMCPNetCapBodyPreviewLimit = 4096;
 static _Atomic uint64_t g_netcap_req_seq = 0;
+static const struct mach_header *g_netcap_self_header = NULL;
 
 static dispatch_queue_t MCPNetCapLogQueue(void) {
     static dispatch_queue_t q = nil;
@@ -19,6 +25,10 @@ static dispatch_queue_t MCPNetCapLogQueue(void) {
 
 static NSString *MCPNetCapLogFilePath(void) {
     return [NSTemporaryDirectory() stringByAppendingPathComponent:@".mcp_netcap.jsonl"];
+}
+
+static NSString *MCPNetCapPrimaryLogFilePath(void) {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:@".mcpcap.jsonl"];
 }
 
 static NSDictionary *MCPNetCapSanitizeHeaders(NSDictionary *headers) {
@@ -75,24 +85,28 @@ static NSData *MCPNetCapReadRequestBody(NSURLRequest *request) {
     return buf;
 }
 
+static void MCPNetCapWriteLineToFile(NSString *path, NSData *json) {
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    const uint8_t *bytes = json.bytes;
+    size_t rem = json.length;
+    while (rem > 0) {
+        ssize_t w = write(fd, bytes, rem);
+        if (w <= 0) break;
+        bytes += (size_t)w;
+        rem -= (size_t)w;
+    }
+    write(fd, "\n", 1);
+    close(fd);
+}
+
 static void MCPNetCapAppendRecord(NSDictionary *record) {
     if (![record isKindOfClass:[NSDictionary class]]) return;
     NSData *json = [NSJSONSerialization dataWithJSONObject:record options:0 error:NULL];
     if (!json.length) return;
     dispatch_async(MCPNetCapLogQueue(), ^{
-        NSString *path = MCPNetCapLogFilePath();
-        int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-        if (fd < 0) return;
-        const uint8_t *bytes = json.bytes;
-        size_t rem = json.length;
-        while (rem > 0) {
-            ssize_t w = write(fd, bytes, rem);
-            if (w <= 0) break;
-            bytes += (size_t)w;
-            rem -= (size_t)w;
-        }
-        write(fd, "\n", 1);
-        close(fd);
+        MCPNetCapWriteLineToFile(MCPNetCapLogFilePath(), json);
+        MCPNetCapWriteLineToFile(MCPNetCapPrimaryLogFilePath(), json);
     });
 }
 
@@ -107,8 +121,11 @@ static void MCPNetCapAppendRecord(NSDictionary *record) {
 
 static NSURLSessionConfiguration *(*orig_defaultSessionConfig)(id self, SEL _cmd) = NULL;
 static NSURLSessionConfiguration *(*orig_ephemeralSessionConfig)(id self, SEL _cmd) = NULL;
+static NSArray<Class> *(*orig_netcap_protocolClasses)(id self, SEL _cmd) = NULL;
 static NSURLSession *(*orig_netcap_sessionWithConfig)(id self, SEL _cmd, NSURLSessionConfiguration *cfg, id delegate, NSOperationQueue *queue) = NULL;
+static NSURLSession *(*orig_netcap_sessionWithConfigOnly)(id self, SEL _cmd, NSURLSessionConfiguration *cfg) = NULL;
 static NSURLSession *(*orig_sharedSession)(id self, SEL _cmd) = NULL;
+static void (*orig_netcap_taskResume)(id self, SEL _cmd) = NULL;
 
 @implementation MCPNetCapURLProtocol
 
@@ -121,7 +138,7 @@ static NSURLSession *(*orig_sharedSession)(id self, SEL _cmd) = NULL;
             : [NSURLSessionConfiguration ephemeralSessionConfiguration];
         NSMutableArray *protos = [NSMutableArray array];
         for (Class cls in (cfg.protocolClasses ?: @[])) {
-            if (cls != [MCPNetCapURLProtocol class]) {
+            if (cls != [MCPNetCapURLProtocol class] && ![NSStringFromClass(cls) containsString:@"MCPCapURLProtocol"]) {
                 [protos addObject:cls];
             }
         }
@@ -195,6 +212,7 @@ static NSURLSession *(*orig_sharedSession)(id self, SEL _cmd) = NULL;
         NSDictionary *record = @{
             @"id": @(strongSelf.sequenceId),
             @"pid": @(getpid()),
+            @"source": @"nsurlsession",
             @"timestamp": @([[NSDate date] timeIntervalSince1970]),
             @"duration_ms": @(round(durationMs * 100.0) / 100.0),
             @"method": strongSelf.request.HTTPMethod ?: @"GET",
@@ -225,7 +243,9 @@ static NSURLSession *(*orig_sharedSession)(id self, SEL _cmd) = NULL;
 
 static void MCPNetCapInjectProtocolIntoConfig(NSURLSessionConfiguration *cfg) {
     if (!cfg) return;
-    NSArray *existing = cfg.protocolClasses ?: @[];
+    NSArray *existing = orig_netcap_protocolClasses
+        ? orig_netcap_protocolClasses(cfg, @selector(protocolClasses))
+        : (cfg.protocolClasses ?: @[]);
     if (existing.firstObject == [MCPNetCapURLProtocol class]) return;
     NSMutableArray *updated = [NSMutableArray arrayWithObject:[MCPNetCapURLProtocol class]];
     for (Class cls in existing) {
@@ -248,9 +268,22 @@ static NSURLSessionConfiguration *swizzled_ephemeralSessionConfig(id self, SEL _
     return cfg;
 }
 
+static NSArray<Class> *swizzled_netcap_protocolClasses(id self, SEL _cmd) {
+    NSArray<Class> *orig = orig_netcap_protocolClasses ? orig_netcap_protocolClasses(self, _cmd) : @[];
+    if (orig.firstObject == [MCPNetCapURLProtocol class]) return orig;
+    NSMutableArray<Class> *arr = [NSMutableArray arrayWithObject:[MCPNetCapURLProtocol class]];
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
+}
+
 static NSURLSession *swizzled_netcap_sessionWithConfig(id self, SEL _cmd, NSURLSessionConfiguration *cfg, id delegate, NSOperationQueue *queue) {
     MCPNetCapInjectProtocolIntoConfig(cfg);
     return orig_netcap_sessionWithConfig(self, _cmd, cfg, delegate, queue);
+}
+
+static NSURLSession *swizzled_netcap_sessionWithConfigOnly(id self, SEL _cmd, NSURLSessionConfiguration *cfg) {
+    MCPNetCapInjectProtocolIntoConfig(cfg);
+    return orig_netcap_sessionWithConfigOnly(self, _cmd, cfg);
 }
 
 static NSURLSession *swizzled_sharedSession(id self, SEL _cmd) {
@@ -266,9 +299,65 @@ static NSURLSession *swizzled_sharedSession(id self, SEL _cmd) {
     return interceptedShared ?: orig_sharedSession(self, _cmd);
 }
 
+static int (*orig_netcap_SSL_write)(void *ssl, const void *buf, int num) = NULL;
+static int (*orig_netcap_SSL_read)(void *ssl, void *buf, int num) = NULL;
+static const char *(*fn_netcap_SSL_get_servername)(const void *ssl, int type) = NULL;
+
+static int hook_netcap_SSL_write(void *ssl, const void *buf, int num) {
+    int ret = orig_netcap_SSL_write ? orig_netcap_SSL_write(ssl, buf, num) : -1;
+    if (ret > 0 && buf) {
+        const char *cbuf = (const char *)buf;
+        if (ret >= 5 && (memcmp(cbuf, "GET ", 4) == 0 || memcmp(cbuf, "POST ", 5) == 0 ||
+                         memcmp(cbuf, "PUT ", 4) == 0 || memcmp(cbuf, "DELETE ", 7) == 0)) {
+            const char *sni = (fn_netcap_SSL_get_servername && ssl) ? fn_netcap_SSL_get_servername(ssl, 0) : NULL;
+            NSString *host = (sni && *sni) ? @(sni) : @"";
+            uint64_t seq = atomic_fetch_add(&g_netcap_req_seq, 1) + 1;
+            NSData *slice = [NSData dataWithBytes:buf length:(NSUInteger)(ret > 512 ? 512 : ret)];
+            NSDictionary *rec = @{
+                @"id": @(seq),
+                @"pid": @(getpid()),
+                @"source": @"boringssl",
+                @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+                @"duration_ms": @0,
+                @"method": (memcmp(cbuf, "POST ", 5) == 0) ? @"POST" : @"GET",
+                @"url": host.length ? [NSString stringWithFormat:@"https://%@/", host] : @"https://tls/",
+                @"scheme": @"https",
+                @"host": host,
+                @"path": @"/",
+                @"request_headers": @{},
+                @"request_body": MCPNetCapEncodeBodyPreview(slice),
+                @"status_code": @200,
+                @"mime_type": @"",
+                @"response_headers": @{},
+                @"response_bytes": @0,
+                @"response_body": @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO},
+                @"error": [NSNull null]
+            };
+            MCPNetCapAppendRecord(rec);
+        }
+    }
+    return ret;
+}
+
+static int hook_netcap_SSL_read(void *ssl, void *buf, int num) {
+    return orig_netcap_SSL_read ? orig_netcap_SSL_read(ssl, buf, num) : -1;
+}
+
+static int mcp_netcap_should_hook_image(const struct mach_header *hdr, const char *name) {
+    if (!hdr || !name || hdr == g_netcap_self_header) return 0;
+    if (strstr(name, "libApple") || strstr(name, "libmcp") || strstr(name, "systemhook")) return 0;
+    if (!strstr(name, "/System/Library/") && !strstr(name, "/usr/lib/") && !strstr(name, "/Developer/")) return 1;
+    if (strstr(name, "CFNetwork") || strstr(name, "libnetwork.dylib") || strstr(name, "libboringssl.dylib")) return 1;
+    return 0;
+}
+
 __attribute__((constructor))
 static void mcp_netcap_init(void) {
     @autoreleasepool {
+        Dl_info info = {0};
+        if (dladdr((const void *)&mcp_netcap_init, &info)) {
+            g_netcap_self_header = (const struct mach_header *)info.dli_fbase;
+        }
         [NSURLProtocol registerClass:[MCPNetCapURLProtocol class]];
 
         Method mDef = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
@@ -279,17 +368,39 @@ static void mcp_netcap_init(void) {
         if (mEph) {
             orig_ephemeralSessionConfig = (typeof(orig_ephemeralSessionConfig))method_setImplementation(mEph, (IMP)swizzled_ephemeralSessionConfig);
         }
+        Method mProto = class_getInstanceMethod([NSURLSessionConfiguration class], @selector(protocolClasses));
+        if (mProto) {
+            orig_netcap_protocolClasses = (typeof(orig_netcap_protocolClasses))method_setImplementation(mProto, (IMP)swizzled_netcap_protocolClasses);
+        }
         Method mSess = class_getClassMethod([NSURLSession class], @selector(sessionWithConfiguration:delegate:delegateQueue:));
         if (mSess) {
             orig_netcap_sessionWithConfig = (typeof(orig_netcap_sessionWithConfig))method_setImplementation(mSess, (IMP)swizzled_netcap_sessionWithConfig);
+        }
+        Method mSessOnly = class_getClassMethod([NSURLSession class], @selector(sessionWithConfiguration:));
+        if (mSessOnly) {
+            orig_netcap_sessionWithConfigOnly = (typeof(orig_netcap_sessionWithConfigOnly))method_setImplementation(mSessOnly, (IMP)swizzled_netcap_sessionWithConfigOnly);
         }
         Method mShared = class_getClassMethod([NSURLSession class], @selector(sharedSession));
         if (mShared) {
             orig_sharedSession = (typeof(orig_sharedSession))method_setImplementation(mShared, (IMP)swizzled_sharedSession);
         }
 
-        // Touch the capture log file so NetworkCaptureManager can confirm constructor execution immediately
-        int fd = open(MCPNetCapLogFilePath().fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-        if (fd >= 0) close(fd);
+        void *boring = dlopen("/usr/lib/libboringssl.dylib", RTLD_LAZY | RTLD_NOLOAD);
+        if (boring) {
+            orig_netcap_SSL_write = dlsym(boring, "SSL_write");
+            orig_netcap_SSL_read = dlsym(boring, "SSL_read");
+            fn_netcap_SSL_get_servername = dlsym(boring, "SSL_get_servername");
+        }
+        struct mcp_rebinding rebs[] = {
+            {"SSL_write", (void *)hook_netcap_SSL_write, (void **)&orig_netcap_SSL_write},
+            {"SSL_read", (void *)hook_netcap_SSL_read, (void **)&orig_netcap_SSL_read}
+        };
+        mcp_rebind_symbols_filtered(g_netcap_self_header, mcp_netcap_should_hook_image, rebs, 2);
+
+        // Touch the capture log files so NetworkCaptureManager can confirm constructor execution immediately
+        int fd1 = open(MCPNetCapLogFilePath().fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd1 >= 0) close(fd1);
+        int fd2 = open(MCPNetCapPrimaryLogFilePath().fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd2 >= 0) close(fd2);
     }
 }

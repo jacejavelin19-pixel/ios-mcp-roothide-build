@@ -3122,9 +3122,29 @@ static NSString *MCPLogId(id reqId) {
             @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"handle": @{@"type": @"integer"}, @"name": @{@"type": @"string"}, @"value": @{}}, @"required": @[@"bundle_id", @"handle", @"name"]}
         },
         @{
-            @"name": @"engine_hook_native",
-            @"description": @"Hook an imported C symbol via fishhook symbol rebinding (no inline/JIT). Records calls; optional return override. open/close/read/write have known arg counts; other symbols need arg_count (0..8). Hooks app-bundle imports by default; 'module' selects the importing image by name/path.",
+            @"name": @"engine_prepare_native_hook",
+            @"description": @"Resolve GOT slot virtual addresses (__got, __la_symbol_ptr, __auth_got, __auth_ptr) for an imported C symbol inside the instrumented process and compute exact PAC-signed replacement pointers in-process without writing to read-only __DATA_CONST pages.",
             @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"symbol": @{@"type": @"string"}, @"address": @{@"type": @"string"}, @"module": @{@"type": @"string"}, @"arg_count": @{@"type": @"integer"}, @"record": @{@"type": @"boolean"}, @"override_return": @{@"type": @"string"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_hook_native",
+            @"description": @"Hook an imported C symbol via fishhook symbol rebinding (no inline/JIT), transparently falling back to out-of-process mach_vm_protect + mach_vm_write via mcp-memory when GOT slots reside in read-only __DATA_CONST / __AUTH_CONST. Records calls; optional return override. open/close/read/write have known arg counts; other symbols need arg_count (0..8). Hooks app-bundle imports by default; 'module' selects the importing image by name/path.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"symbol": @{@"type": @"string"}, @"address": @{@"type": @"string"}, @"module": @{@"type": @"string"}, @"arg_count": @{@"type": @"integer"}, @"record": @{@"type": @"boolean"}, @"override_return": @{@"type": @"string"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_start_capture",
+            @"description": @"Start unified in-process HTTP/HTTPS + BoringSSL (SSL_write/SSL_read) network capture inside the engine, patching read-only BoringSSL GOT slots out-of-process when needed and writing JSONL entries to <DataContainer>/tmp/.mcpcap.jsonl.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"clear": @{@"type": @"boolean"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_get_requests",
+            @"description": @"Return captured HTTP/HTTPS and BoringSSL TLS requests from the engine (.mcpcap.jsonl).",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"limit": @{@"type": @"integer"}, @"host_filter": @{@"type": @"string"}, @"url_filter": @{@"type": @"string"}, @"method_filter": @{@"type": @"string"}, @"clear": @{@"type": @"boolean"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_stop_capture",
+            @"description": @"Stop engine network capture and restore any patched BoringSSL GOT slots.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}}, @"required": @[@"bundle_id"]}
         },
         @{
             @"name": @"engine_call",
@@ -5664,6 +5684,18 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         result = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId stealthConfig:stealth launch:launch error:&err];
     } else if ([toolName isEqualToString:@"engine_remove"]) {
         result = [[MCPEngineManager sharedInstance] removeEngineForBundleId:bundleId error:&err];
+    } else if ([toolName isEqualToString:@"engine_prepare_native_hook"]) {
+        result = [[MCPEngineManager sharedInstance] prepareNativeHookForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_hook_native"]) {
+        result = [[MCPEngineManager sharedInstance] hookNativeForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_unhook"]) {
+        result = [[MCPEngineManager sharedInstance] unhookForBundleId:bundleId key:args[@"hook_key"] error:&err];
+    } else if ([toolName isEqualToString:@"engine_start_capture"]) {
+        result = [[MCPEngineManager sharedInstance] startCaptureForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_get_requests"]) {
+        result = [[MCPEngineManager sharedInstance] getCapturedRequestsForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_stop_capture"]) {
+        result = [[MCPEngineManager sharedInstance] stopCaptureForBundleId:bundleId args:args error:&err];
     } else {
         // Map the tool name to its engine.* op and forward the args verbatim
         // (the engine validates its own required arguments and ignores bundle_id).
@@ -5680,7 +5712,11 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
                        @"engine_invoke": @"engine.invoke",
                        @"engine_get_ivar": @"engine.get_ivar",
                        @"engine_set_ivar": @"engine.set_ivar",
+                       @"engine_prepare_native_hook": @"engine.prepare_native_hook",
                        @"engine_hook_native": @"engine.hook_native",
+                       @"engine_start_capture": @"engine.start_capture",
+                       @"engine_get_requests": @"engine.get_requests",
+                       @"engine_stop_capture": @"engine.stop_capture",
                        @"engine_call": @"engine.call",
                        @"engine_read_memory": @"engine.read_mem",
                        @"engine_write_memory": @"engine.write_mem",

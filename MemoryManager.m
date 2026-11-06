@@ -1,14 +1,57 @@
 #import "MemoryManager.h"
 #import <ctype.h>
+#import <dlfcn.h>
+#import <glob.h>
+#import <libkern/OSByteOrder.h>
 #import <mach/mach.h>
 #import <mach-o/loader.h>
+#import <stdbool.h>
+#import <stdlib.h>
 #import <string.h>
 #import <unistd.h>
 
 // The iOS SDK intentionally omits the mach_vm MIG declarations.
 extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *);
 extern kern_return_t mach_vm_write(vm_map_t, mach_vm_address_t, vm_offset_t, mach_msg_type_number_t);
+extern kern_return_t mach_vm_protect(vm_map_t, mach_vm_address_t, mach_vm_size_t, boolean_t, vm_prot_t);
 extern kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
+
+typedef int (*mcp_jb_set_debugged_fn)(uint64_t pid, bool fully_debugged);
+typedef kern_return_t (*mcp_hookd_vm_protect_fn)(pid_t pid, mach_vm_address_t address, mach_vm_size_t size, bool set_max, vm_prot_t new_prot);
+
+static void *MCPLoadLibJailbreak(void) {
+    static void *sHandle = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sHandle = dlopen("/basebin/libjailbreak.dylib", RTLD_LAZY);
+        if (!sHandle) {
+            glob_t g = {0};
+            if (glob("/var/containers/Bundle/Application/.jbroot-*/basebin/libjailbreak.dylib", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+                sHandle = dlopen(g.gl_pathv[0], RTLD_LAZY);
+            }
+            globfree(&g);
+        }
+    });
+    return sHandle;
+}
+
+static void MCPTryEnsureProcessDebugged(pid_t pid) {
+    void *h = MCPLoadLibJailbreak();
+    if (!h) return;
+    mcp_jb_set_debugged_fn fn = (mcp_jb_set_debugged_fn)dlsym(h, "jbclient_platform_set_process_debugged");
+    if (fn) {
+        fn((uint64_t)pid, false);
+    }
+}
+
+static kern_return_t MCPTryHookdVmProtect(pid_t pid, mach_vm_address_t addr, mach_vm_size_t size, vm_prot_t prot) {
+    void *h = MCPLoadLibJailbreak();
+    if (!h) return KERN_FAILURE;
+    mcp_hookd_vm_protect_fn fn = (mcp_hookd_vm_protect_fn)dlsym(h, "hookd_vm_protect");
+    if (!fn) fn = (mcp_hookd_vm_protect_fn)dlsym(h, "_hookd_vm_protect");
+    if (!fn) return KERN_FAILURE;
+    return fn(pid, addr, size, false, prot);
+}
 
 typedef struct {
     uint32_t version;
@@ -327,20 +370,157 @@ static NSArray<NSDictionary *> *MCPRemoteReadIvarList(mach_port_t task, uint64_t
     return @{@"address": [NSString stringWithFormat:@"0x%llx", address], @"length": @(actual), @"data": [data base64EncodedStringWithOptions:0]};
 }
 
+- (NSDictionary *)protectWriteTask:(mach_port_t)task
+                               pid:(pid_t)pid
+                           address:(uint64_t)address
+                              data:(NSData *)data
+                             error:(NSString **)error {
+    if (!data.length || data.length > 1048576 || address > UINT64_MAX - data.length) {
+        if (error) *error = @"data must contain 1..1048576 bytes and address range must not overflow";
+        return nil;
+    }
+
+    mach_vm_address_t regionAddr = (mach_vm_address_t)address;
+    mach_vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t krRegion = mach_vm_region(task, &regionAddr, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    vm_prot_t origProt = (krRegion == KERN_SUCCESS) ? info.protection : VM_PROT_READ;
+
+    uint64_t pageSize = (uint64_t)getpagesize();
+    if (!pageSize) pageSize = 16384ULL;
+    mach_vm_address_t pageStart = (mach_vm_address_t)(address & ~(pageSize - 1ULL));
+    mach_vm_address_t pageEnd = (mach_vm_address_t)((address + data.length + pageSize - 1ULL) & ~(pageSize - 1ULL));
+    mach_vm_size_t pageSpan = pageEnd - pageStart;
+
+    BOOL changedProt = NO;
+    kern_return_t writeKr = KERN_FAILURE;
+    if ((origProt & VM_PROT_WRITE) != 0) {
+        writeKr = mach_vm_write(task, address, (vm_offset_t)data.bytes, (mach_msg_type_number_t)data.length);
+    }
+
+    if (writeKr != KERN_SUCCESS) {
+        MCPTryEnsureProcessDebugged(pid);
+        kern_return_t protKr = mach_vm_protect(task, pageStart, pageSpan, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (protKr != KERN_SUCCESS) {
+            protKr = mach_vm_protect(task, pageStart, pageSpan, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+        }
+        if (protKr != KERN_SUCCESS) {
+            protKr = MCPTryHookdVmProtect(pid, pageStart, pageSpan, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        }
+        if (protKr != KERN_SUCCESS) {
+            protKr = MCPTryHookdVmProtect(pid, pageStart, pageSpan, VM_PROT_READ | VM_PROT_WRITE);
+        }
+        if (protKr == KERN_SUCCESS) {
+            changedProt = YES;
+        }
+        writeKr = mach_vm_write(task, address, (vm_offset_t)data.bytes, (mach_msg_type_number_t)data.length);
+        if (changedProt && (origProt & VM_PROT_WRITE) == 0) {
+            vm_prot_t restoreProt = origProt ? origProt : VM_PROT_READ;
+            kern_return_t rKr = mach_vm_protect(task, pageStart, pageSpan, FALSE, restoreProt);
+            if (rKr != KERN_SUCCESS) {
+                MCPTryHookdVmProtect(pid, pageStart, pageSpan, restoreProt);
+            }
+        }
+    }
+
+    if (writeKr != KERN_SUCCESS) {
+        if (error) *error = MCPMachError(writeKr);
+        return nil;
+    }
+
+    NSMutableData *verifyBuf = [NSMutableData dataWithLength:data.length];
+    mach_vm_size_t actual = 0;
+    kern_return_t readKr = mach_vm_read_overwrite(task, address, data.length, (mach_vm_address_t)verifyBuf.mutableBytes, &actual);
+    BOOL verified = (readKr == KERN_SUCCESS && actual == data.length && memcmp(verifyBuf.bytes, data.bytes, data.length) == 0);
+
+    return @{
+        @"address": [NSString stringWithFormat:@"0x%llx", address],
+        @"written": @(data.length),
+        @"verified": @(verified),
+        @"cow_protected": @(changedProt),
+        @"original_protection": MCPVMProtString(origProt)
+    };
+}
+
 - (NSDictionary *)writePID:(pid_t)pid address:(uint64_t)address data:(NSData *)data error:(NSString **)error {
+    return [self protectWritePID:pid address:address data:data error:error];
+}
+
+- (NSDictionary *)protectWritePID:(pid_t)pid address:(uint64_t)address data:(NSData *)data error:(NSString **)error {
     if (!data.length || data.length > 1048576 || address > UINT64_MAX - data.length) {
         if (error) *error = @"data must contain 1..1048576 bytes and address range must not overflow";
         return nil;
     }
     mach_port_t task = [self taskForPID:pid error:error];
     if (task == MACH_PORT_NULL) return nil;
-    kern_return_t result = mach_vm_write(task, address, (vm_offset_t)data.bytes, (mach_msg_type_number_t)data.length);
+    NSDictionary *res = [self protectWriteTask:task pid:pid address:address data:data error:error];
     mach_port_deallocate(mach_task_self(), task);
-    if (result != KERN_SUCCESS) {
-        if (error) *error = MCPMachError(result);
+    return res;
+}
+
+- (NSDictionary *)patchSlotsPID:(pid_t)pid patches:(NSArray<NSDictionary *> *)patches error:(NSString **)error {
+    if (![patches isKindOfClass:[NSArray class]]) {
+        if (error) *error = @"patches must be an array";
         return nil;
     }
-    return @{@"address": [NSString stringWithFormat:@"0x%llx", address], @"written": @(data.length)};
+    if (patches.count == 0) {
+        return @{@"pid": @(pid), @"patched_count": @0, @"total": @0, @"results": @[]};
+    }
+    mach_port_t task = [self taskForPID:pid error:error];
+    if (task == MACH_PORT_NULL) return nil;
+
+    MCPTryEnsureProcessDebugged(pid);
+    NSMutableArray<NSDictionary *> *results = [NSMutableArray arrayWithCapacity:patches.count];
+    NSUInteger patchedCount = 0;
+
+    for (NSDictionary *item in patches) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *addrStr = item[@"slot_address"] ?: item[@"address"];
+        if (![addrStr isKindOfClass:[NSString class]] || !addrStr.length) continue;
+        const char *cs = addrStr.UTF8String;
+        char *end = NULL;
+        uint64_t addr = strtoull(cs, &end, 0);
+        if (!addr) continue;
+
+        NSData *patchData = nil;
+        NSString *b64 = item[@"bytes_base64"] ?: item[@"data"];
+        if ([b64 isKindOfClass:[NSString class]] && b64.length) {
+            patchData = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+        }
+        if (!patchData.length) {
+            NSString *valStr = item[@"replacement_value"] ?: item[@"original_value"];
+            if ([valStr isKindOfClass:[NSString class]] && valStr.length) {
+                uint64_t rawVal = strtoull(valStr.UTF8String, NULL, 0);
+                uint64_t leVal = OSSwapHostToLittleInt64(rawVal);
+                patchData = [NSData dataWithBytes:&leVal length:sizeof(leVal)];
+            }
+        }
+        if (!patchData.length) continue;
+
+        NSString *slotErr = nil;
+        NSDictionary *one = [self protectWriteTask:task pid:pid address:addr data:patchData error:&slotErr];
+        if (one && [one[@"verified"] boolValue]) {
+            patchedCount++;
+            [results addObject:one];
+        } else {
+            [results addObject:@{
+                @"address": [NSString stringWithFormat:@"0x%llx", addr],
+                @"ok": @NO,
+                @"error": slotErr ?: @"patch verification failed"
+            }];
+        }
+    }
+
+    mach_port_deallocate(mach_task_self(), task);
+    return @{
+        @"pid": @(pid),
+        @"patched_count": @(patchedCount),
+        @"total": @(patches.count),
+        @"results": results
+    };
 }
 
 - (NSDictionary *)searchPID:(pid_t)pid data:(NSData *)data start:(uint64_t)start end:(uint64_t)end error:(NSString **)error {
