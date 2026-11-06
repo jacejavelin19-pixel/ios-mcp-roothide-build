@@ -880,6 +880,176 @@ int main(int argc, const char *argv[]) {
             }
         }
 
+        if ([cmd isEqualToString:@"inject-engine"]) {
+            // Stage the stealth companion (FIRST) + the custom in-process engine
+            // (SECOND) into Frameworks, insert LC_LOAD_DYLIB on all slices, re-sign
+            // (which registers trust), and write the engine's socket config. No
+            // scrub and no .js: the engine ships no Frida/Gum strings and binds its
+            // own Unix socket from its constructor by reading .mcpe_cfg.json.
+            if (argc < 9) {
+                return MCPAMFail(@"usage: mcp-appmod inject-engine <app_bundle> <main_exec> <engine_src> <stealth_src> <engine_name> <stealth_name> <socket_path>");
+            }
+            NSString *appBundle = MCPAMResolveExistingPath([NSString stringWithUTF8String:argv[2]]);
+            NSString *mainExec = MCPAMResolveExistingPath([NSString stringWithUTF8String:argv[3]]);
+            NSString *protErr = nil;
+            if (MCPAMIsProtectedTarget(mainExec, &protErr)) return MCPAMFail(protErr);
+            NSString *engineSrc = MCPAMResolveExistingPath([NSString stringWithUTF8String:argv[4]]);
+            NSString *stealthSrc = MCPAMResolveExistingPath([NSString stringWithUTF8String:argv[5]]);
+            NSString *engineName = [[NSString stringWithUTF8String:argv[6]] lastPathComponent];
+            NSString *stealthName = [[NSString stringWithUTF8String:argv[7]] lastPathComponent];
+            NSString *socketPath = [NSString stringWithUTF8String:argv[8]];
+
+            struct stat st;
+            if (stat(mainExec.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode)) {
+                return MCPAMFail(@"main executable not found");
+            }
+            mode_t origMode = (st.st_mode & 07777) ?: 0755;
+
+            NSString *frameworksDir = [appBundle stringByAppendingPathComponent:@"Frameworks"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:frameworksDir withIntermediateDirectories:YES attributes:nil error:nil];
+            chmod(frameworksDir.fileSystemRepresentation, 0755);
+            chown(frameworksDir.fileSystemRepresentation, st.st_uid, st.st_gid);
+
+            NSString *err = nil;
+            if (!MCPAMEnsureOrigBackup(mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                return MCPAMFail(err);
+            }
+            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+            NSString *workDir = MCPAMCreateWorkDir(&err);
+            if (!workDir) return MCPAMFail(err);
+
+            @try {
+                // 1. Stealth companion (loaded FIRST).
+                NSString *stageStealth = [workDir stringByAppendingPathComponent:stealthName];
+                NSData *stealthData = [NSData dataWithContentsOfFile:stealthSrc];
+                if (!stealthData.length || ![stealthData writeToFile:stageStealth options:NSDataWritingAtomic error:nil]) {
+                    return MCPAMFail(@"failed to read stealth dylib");
+                }
+                if (!MCPAMSignStageBinary(workDir, stealthName, nil, &err)) return MCPAMFail(err);
+                NSData *signedStealth = [NSData dataWithContentsOfFile:stageStealth];
+                NSString *destStealth = [frameworksDir stringByAppendingPathComponent:stealthName];
+                if (!MCPAMWriteFreshVnode(signedStealth, destStealth, 0755, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
+
+                // 2. Engine dylib (loaded SECOND). No scrub.
+                NSString *stageEngine = [workDir stringByAppendingPathComponent:engineName];
+                NSData *engineData = [NSData dataWithContentsOfFile:engineSrc];
+                if (!engineData.length || ![engineData writeToFile:stageEngine options:NSDataWritingAtomic error:nil]) {
+                    return MCPAMFail(@"failed to read engine dylib");
+                }
+                if (!MCPAMSignStageBinary(workDir, engineName, nil, &err)) return MCPAMFail(err);
+                NSData *signedEngine = [NSData dataWithContentsOfFile:stageEngine];
+                NSString *destEngine = [frameworksDir stringByAppendingPathComponent:engineName];
+                if (!MCPAMWriteFreshVnode(signedEngine, destEngine, 0755, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
+
+                // 3. Engine socket config at <DataContainer>/tmp/.mcpe_cfg.json
+                //    (the engine reads only socket_path from it).
+                NSString *cfgDir = [socketPath stringByDeletingLastPathComponent];
+                NSString *cfgPath = [cfgDir stringByAppendingPathComponent:@".mcpe_cfg.json"];
+                NSData *cfgData = [NSJSONSerialization dataWithJSONObject:@{@"socket_path": socketPath} options:0 error:nil];
+                if (!cfgData.length || !MCPAMWriteFreshVnode(cfgData, cfgPath, 0644, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err ?: @"failed to write engine config");
+                }
+
+                // 4. LC_LOAD_DYLIB: stealth FIRST, engine SECOND; re-sign main.
+                NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
+                NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
+                if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
+                    return MCPAMFail(@"failed to stage main executable");
+                }
+                NSString *stealthLC = [NSString stringWithFormat:@"@executable_path/Frameworks/%@", stealthName];
+                NSString *engineLC = [NSString stringWithFormat:@"@executable_path/Frameworks/%@", engineName];
+                if (!MCPInjectLoadDylibInMachO(stageMain, stealthLC, &err)) return MCPAMFail(err);
+                if (!MCPInjectLoadDylibInMachO(stageMain, engineLC, &err)) return MCPAMFail(err);
+                if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) return MCPAMFail(err);
+                NSData *signedMain = [NSData dataWithContentsOfFile:stageMain];
+                if (!MCPAMWriteFreshVnode(signedMain, mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
+
+                MCPAMEmitJSON(@{
+                    @"ok": @YES,
+                    @"result": @{
+                        @"main_executable": mainExec,
+                        @"stealth_dylib": destStealth,
+                        @"engine_dylib": destEngine,
+                        @"engine_config": cfgPath,
+                        @"socket_path": socketPath,
+                        @"load_order": @[stealthLC, engineLC],
+                        @"signed": @YES
+                    }
+                });
+                return 0;
+            } @finally {
+                [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
+            }
+        }
+
+        if ([cmd isEqualToString:@"unstage-engine"]) {
+            // Mirror unstage-frida: strip both LC_LOAD_DYLIB, re-sign, and sweep the
+            // staged payloads by name and by the MCP disguise prefixes.
+            if (argc < 6) {
+                return MCPAMFail(@"usage: mcp-appmod unstage-engine <app_bundle> <main_exec> <stealth_name> <engine_name>");
+            }
+            NSString *appBundle = MCPAMResolveExistingPath([NSString stringWithUTF8String:argv[2]]);
+            NSString *mainExec = MCPAMResolveExistingPath([NSString stringWithUTF8String:argv[3]]);
+            NSString *protErr = nil;
+            if (MCPAMIsProtectedTarget(mainExec, &protErr)) return MCPAMFail(protErr);
+            NSString *stealthName = [[NSString stringWithUTF8String:argv[4]] lastPathComponent];
+            NSString *engineName = [[NSString stringWithUTF8String:argv[5]] lastPathComponent];
+
+            struct stat st;
+            if (stat(mainExec.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode)) {
+                return MCPAMFail(@"main executable not found");
+            }
+            mode_t origMode = (st.st_mode & 07777) ?: 0755;
+            NSDictionary *origEnt = MCPAMExtractExistingEntitlements(mainExec);
+
+            NSString *err = nil;
+            NSString *workDir = MCPAMCreateWorkDir(&err);
+            if (!workDir) return MCPAMFail(err);
+            @try {
+                NSString *stageMain = [workDir stringByAppendingPathComponent:@"main.bin"];
+                NSData *mainData = [NSData dataWithContentsOfFile:mainExec];
+                if (!mainData.length || ![mainData writeToFile:stageMain options:NSDataWritingAtomic error:nil]) {
+                    return MCPAMFail(@"failed to stage main executable");
+                }
+                if (engineName.length > 0 && ![engineName isEqualToString:@"-"]) {
+                    MCPRemoveLoadDylibFromMachO(stageMain, engineName, NO, NULL);
+                }
+                if (stealthName.length > 0 && ![stealthName isEqualToString:@"-"]) {
+                    MCPRemoveLoadDylibFromMachO(stageMain, stealthName, NO, NULL);
+                }
+                if (!MCPAMSignStageBinary(workDir, @"main.bin", origEnt, &err)) return MCPAMFail(err);
+                NSData *signedMain = [NSData dataWithContentsOfFile:stageMain];
+                if (!MCPAMWriteFreshVnode(signedMain, mainExec, origMode, st.st_uid, st.st_gid, YES, &err)) {
+                    return MCPAMFail(err);
+                }
+
+                NSString *frameworksDir = [appBundle stringByAppendingPathComponent:@"Frameworks"];
+                NSMutableArray<NSString *> *deleted = [NSMutableArray array];
+                NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+                if (stealthName.length) [candidates addObject:[frameworksDir stringByAppendingPathComponent:stealthName]];
+                if (engineName.length) [candidates addObject:[frameworksDir stringByAppendingPathComponent:engineName]];
+                NSArray<NSString *> *stagePrefixes = @[@"libAppleCoreSVG_", @"libAppleMediaKit_"];
+                for (NSString *entry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil]) {
+                    for (NSString *prefix in stagePrefixes) {
+                        if ([entry hasPrefix:prefix]) { [candidates addObject:[frameworksDir stringByAppendingPathComponent:entry]]; break; }
+                    }
+                }
+                for (NSString *f in candidates) {
+                    if (MCPAMPathExists(f) && unlink(f.fileSystemRepresentation) == 0) [deleted addObject:f];
+                }
+                MCPAMEmitJSON(@{@"ok": @YES, @"result": @{@"main_executable": mainExec, @"deleted_files": deleted, @"signed": @YES}});
+                return 0;
+            } @finally {
+                [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
+            }
+        }
+
         if ([cmd isEqualToString:@"stage-frida"]) {
             if (argc < 11) {
                 return MCPAMFail(@"usage: mcp-appmod stage-frida <app_bundle> <main_exec> <stealth_src> <gadget_src> <cfg_src> <js_src> <stealth_name> <gadget_name> <seed>");

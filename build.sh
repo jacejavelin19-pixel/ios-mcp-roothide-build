@@ -90,6 +90,7 @@ build_subprojects() {
   (cd payloads/sslkillswitch && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
   (cd payloads/netcapture && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
   (cd payloads/fridastealth && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
+  (cd payloads/mcpengine && env -u THEOS_PACKAGE_SCHEME make clean && env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1)
   if [[ ! -f mcp-ocr-worker/.theos/obj/mcp-ocr-worker ]]; then
     if [[ ! -f third_party/paddleocr/runtime/ios/lib/libonnxruntime.a ]]; then
       print -u2 "PaddleOCR runtime missing: see docs/PADDLEOCR.md and run scripts/build_paddle_runtime.sh ios"

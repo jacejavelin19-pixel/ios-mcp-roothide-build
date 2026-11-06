@@ -72,6 +72,8 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
 - (void)triggerLocalHTTPFetch;
 - (void)seedSQLiteFixture;
 - (void)writeRuntimeStateSnapshot;
+- (uintptr_t)engineScratchAddress;
+- (NSInteger)runEngineProbe;
 
 @end
 
@@ -107,6 +109,27 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
 
 - (NSInteger)verifyPinCode:(NSInteger)pin {
     return (pin == 2359) ? 1 : 0;
+}
+
+- (uintptr_t)engineScratchAddress {
+    // Dedicated, writable 64-byte fixture allocation; never use code pages.
+    return (uintptr_t)_heapMarkerBuffer;
+}
+
+- (NSInteger)runEngineProbe {
+    NSInteger pinResult = [self verifyPinCode:0];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"engine_probe.txt"];
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        const char marker[] = "MCPTest engine native hook probe\n";
+        (void)write(fd, marker, sizeof(marker)-1);
+        close(fd);
+    }
+    NSDictionary *result = @{@"pid":@(getpid()), @"pin_result":@(pinResult),
+                              @"file_opened":@(fd >= 0), @"foreground":@([UIApplication sharedApplication].applicationState == UIApplicationStateActive)};
+    [[NSJSONSerialization dataWithJSONObject:result options:0 error:NULL]
+        writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"engine_probe.json"] atomically:YES];
+    return pinResult;
 }
 
 - (NSString *)computeVaultDigest:(NSString *)seed {
@@ -499,7 +522,8 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
         @[@"Run TLS Pin Test", NSStringFromSelector(@selector(onRunTLS))],
         @[@"Run HTTP Fetch", NSStringFromSelector(@selector(onRunHTTP))],
         @[@"Run Anti-Detection Audit", NSStringFromSelector(@selector(onRunAudit))],
-        @[@"Refresh Vault State", NSStringFromSelector(@selector(onRefreshState))]
+        @[@"Refresh Vault State", NSStringFromSelector(@selector(onRefreshState))],
+        @[@"Run Engine Probe", NSStringFromSelector(@selector(onEngineProbe))]
     ];
 
     CGFloat y = 250.0;
@@ -527,6 +551,11 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
 - (void)onRunHTTP {
     [[MCPTestVault sharedVault] triggerLocalHTTPFetch];
     self.statusLabel.text = [NSString stringWithFormat:@"PID: %d\nHTTP Fetch Triggered", getpid()];
+}
+
+- (void)onEngineProbe {
+    NSInteger result = [[MCPTestVault sharedVault] runEngineProbe];
+    self.statusLabel.text = [NSString stringWithFormat:@"PID: %d\nEngine PIN(0): %ld\nNative open/write probe complete", getpid(), (long)result];
 }
 
 - (void)onRunAudit {
@@ -561,6 +590,11 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.window.rootViewController = [[MCPTestViewController alloc] init];
     [self.window makeKeyAndVisible];
+    // UIKit owns the main run loop. Keep the display awake during an explicit
+    // engine test session; iOS still controls background suspension normally.
+    BOOL engineMode = [[[NSProcessInfo processInfo] arguments] containsObject:@"--engine-test"] ||
+        [[NSFileManager defaultManager] fileExistsAtPath:[NSTemporaryDirectory() stringByAppendingPathComponent:@".mcpe_cfg.json"]];
+    application.idleTimerDisabled = engineMode;
     return YES;
 }
 

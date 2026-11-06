@@ -15,7 +15,7 @@ BUNDLE_NAME = iosmcpprefs
 
 ios-mcp_FILES = Tweak.x MCPServer.m MCPLogger.m HIDManager.m ScreenManager.m ClipboardManager.m AppManager.m AccessibilityManager.m TextInputManager.m FileSystemManager.m LogManager.m OCRManager.m MCPProcessUtil.m MCPAXQueryContext.m MCPAXRemoteContextResolver.m MCPUIElementSerializer.m MCPUIElementsFacade.m MCPAXAttributeBridge.m MCPAXNodeSource.m
 ios-mcp_FILES += VisionOCREngine.m PaddleOCRManager.m MCPOCRRequestContext.m PlistPatchManager.m MemoryManager.m
-ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m
+ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m MCPEngineManager.m
 ios-mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations -Wno-trigraphs
 ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Vision
 ios-mcp_LIBRARIES = sqlite3
@@ -82,6 +82,8 @@ after-stage::
 	$(ECHO_NOTHING)cp payloads/sslkillswitch/.theos/obj/libmcp_sslks.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_sslks.dylib"$(ECHO_END)
 	$(ECHO_NOTHING)cp payloads/netcapture/.theos/obj/libmcp_netcap.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_netcap.dylib"$(ECHO_END)
 	$(ECHO_NOTHING)cp payloads/fridastealth/.theos/obj/libmcp_stealth.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_stealth.dylib"$(ECHO_END)
+	@# Custom in-process instrumentation engine (fishhook + ObjC runtime only; no RWX/JIT). Replaces the Frida Gadget.
+	$(ECHO_NOTHING)cp payloads/mcpengine/.theos/obj/libmcpengine.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcpengine.dylib"$(ECHO_END)
 
 after-install::
 	install.exec "killall -9 SpringBoard"

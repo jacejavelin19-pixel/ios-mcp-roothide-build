@@ -19,6 +19,7 @@
 #import "NetworkCaptureManager.h"
 #import "IL2CPPManager.h"
 #import "FridaManager.h"
+#import "MCPEngineManager.h"
 #import "SQLiteQueryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
@@ -3052,6 +3053,99 @@ static NSString *MCPLogId(id reqId) {
                 @"required": @[@"bundle_id"]
             }
         },
+        // ---- Custom in-process instrumentation engine (fishhook + ObjC runtime; no RWX/JIT; Unix-socket only) ----
+        @{
+            @"name": @"engine_inject",
+            @"description": @"Inject the custom in-process instrumentation engine (libmcpengine, stealth companion first) into a user app, re-sign + register trust, write its Unix-socket config, and launch. Unlike the Frida Gadget this hooks only via symbol rebinding + the ObjC runtime (no RWX/JIT), so it loads on iOS 18.x arm64e. Returns socket readiness.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{
+                @"bundle_id": @{@"type": @"string", @"description": @"Target user app bundle identifier."},
+                @"launch": @{@"type": @"boolean", @"description": @"Launch and probe the control socket (default true)."},
+                @"stealth_config": @{@"type": @"object", @"description": @"Optional stealth companion flags (thread_cloak, dyld_cloak, ...)."}
+            }, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_remove",
+            @"description": @"Remove the engine + stealth companion from a user app (strip LC_LOAD_DYLIB, sweep staged Frameworks files, re-sign, clean socket/config) and restore it.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_ping",
+            @"description": @"Engine liveness handshake over the Unix socket; returns engine version, pid, arch, platform, and loaded module count.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_modules",
+            @"description": @"List loaded Mach-O images inside the instrumented process (name, base, size, uuid, path, slide, segments).",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"filter": @{@"type": @"string"}, @"limit": @{@"type": @"integer"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_classes",
+            @"description": @"Enumerate live Objective-C classes in the instrumented process (name, superclass, image).",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"filter": @{@"type": @"string", @"description": @"Case-insensitive class-name substring."}, @"include_system": @{@"type": @"boolean"}, @"limit": @{@"type": @"integer"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_describe_class",
+            @"description": @"Describe one ObjC class live: instance/class methods (selector, type encoding, imp), ivars (name, type, offset), properties, protocols, superclass, metaclass.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"class": @{@"type": @"string"}}, @"required": @[@"bundle_id", @"class"]}
+        },
+        @{
+            @"name": @"engine_hook_objc",
+            @"description": @"Hook an ObjC selector (swizzle via method_setImplementation; no inline/JIT). Record call count, arguments, and return value; optionally override an integer/bool/pointer return. Use '+ selector' for class methods. <=6 fixed int/object/pointer args; float/variadic/lifecycle selectors unsupported.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{
+                @"bundle_id": @{@"type": @"string"}, @"class": @{@"type": @"string"}, @"selector": @{@"type": @"string"},
+                @"record": @{@"type": @"boolean"}, @"max_events": @{@"type": @"integer"}, @"override_return": @{@"description": @"Optional int/bool, or '0x...' pointer, to return instead of calling the original."}
+            }, @"required": @[@"bundle_id", @"class", @"selector"]}
+        },
+        @{
+            @"name": @"engine_hook_events",
+            @"description": @"Return recorded calls (ts, boxed args, boxed return) and the total observed count for a hook_key.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"hook_key": @{@"type": @"string"}, @"max_events": @{@"type": @"integer"}}, @"required": @[@"bundle_id", @"hook_key"]}
+        },
+        @{
+            @"name": @"engine_unhook",
+            @"description": @"Disable/remove a hook by hook_key (ObjC restores the saved IMP if unchanged; native adapters forward to the original).",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"hook_key": @{@"type": @"string"}}, @"required": @[@"bundle_id", @"hook_key"]}
+        },
+        @{
+            @"name": @"engine_invoke",
+            @"description": @"Invoke a selector on an object handle or a class, with boxed arguments, returning a boxed result (objects as {handle,class}). target is 'class:Name', 'handle:N', or '0x...'. Integer/bool/float/object/class/selector/pointer values supported; aggregates rejected. Runs on the socket thread (UI methods must marshal to main themselves).",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"target": @{@"type": @"string"}, @"selector": @{@"type": @"string"}, @"args": @{@"type": @"array"}}, @"required": @[@"bundle_id", @"target", @"selector"]}
+        },
+        @{
+            @"name": @"engine_get_ivar",
+            @"description": @"Read an ivar of an object handle (boxed value).",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"handle": @{@"type": @"integer"}, @"name": @{@"type": @"string"}}, @"required": @[@"bundle_id", @"handle", @"name"]}
+        },
+        @{
+            @"name": @"engine_set_ivar",
+            @"description": @"Write an ivar of an object handle.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"handle": @{@"type": @"integer"}, @"name": @{@"type": @"string"}, @"value": @{}}, @"required": @[@"bundle_id", @"handle", @"name"]}
+        },
+        @{
+            @"name": @"engine_hook_native",
+            @"description": @"Hook an imported C symbol via fishhook symbol rebinding (no inline/JIT). Records calls; optional return override. open/close/read/write have known arg counts; other symbols need arg_count (0..8). Hooks app-bundle imports by default; 'module' selects the importing image by name/path.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"symbol": @{@"type": @"string"}, @"address": @{@"type": @"string"}, @"module": @{@"type": @"string"}, @"arg_count": @{@"type": @"integer"}, @"record": @{@"type": @"boolean"}, @"override_return": @{@"type": @"string"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_call",
+            @"description": @"Call a native function at symbol/address with up to 8 fixed integer/pointer arguments ('0x...' or integers); returns the result as '0x...'. Not a variadic calling facility.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"symbol": @{@"type": @"string"}, @"address": @{@"type": @"string"}, @"module": @{@"type": @"string"}, @"args": @{@"type": @"array"}}, @"required": @[@"bundle_id"]}
+        },
+        @{
+            @"name": @"engine_read_memory",
+            @"description": @"Read in-process memory (Mach copy, up to 256 KiB) from the instrumented app; returns base64. Checks mapped/readable permissions.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"address": @{@"type": @"string"}, @"length": @{@"type": @"integer"}}, @"required": @[@"bundle_id", @"address", @"length"]}
+        },
+        @{
+            @"name": @"engine_write_memory",
+            @"description": @"Write base64 bytes (up to 256 KiB) to in-process memory of the instrumented app. Writes to executable pages are rejected.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"address": @{@"type": @"string"}, @"data_base64": @{@"type": @"string"}}, @"required": @[@"bundle_id", @"address", @"data_base64"]}
+        },
+        @{
+            @"name": @"engine_search_memory",
+            @"description": @"Search in-process memory for UTF-8 text or exact hex bytes; optionally constrain to a module and/or current page protection. Returns matching '0x...' addresses; complete:false with next_address when a budget/limit is hit.",
+            @"inputSchema": @{@"type": @"object", @"properties": @{@"bundle_id": @{@"type": @"string"}, @"pattern": @{@"type": @"string"}, @"text": @{@"type": @"string"}, @"module": @{@"type": @"string"}, @"protection": @{@"type": @"string"}, @"limit": @{@"type": @"integer"}, @"start": @{@"type": @"string"}, @"max_bytes": @{@"type": @"integer"}}, @"required": @[@"bundle_id"]}
+        },
         // ---- Reverse-engineering: app info, filesystem, logs ----
         @{
             @"name": @"get_app_info",
@@ -3350,6 +3444,8 @@ static NSString *MCPLogId(id reqId) {
         return [self executeFridaHookObjC:reqId args:args];
     } else if ([toolName isEqualToString:@"frida_memory_scan"]) {
         return [self executeFridaMemoryScan:reqId args:args];
+    } else if ([toolName hasPrefix:@"engine_"]) {
+        return [self executeEngineTool:toolName reqId:reqId args:args];
     } else if ([toolName isEqualToString:@"write_file"]) {
         return [self executeWriteFile:reqId args:args];
     } else if ([toolName isEqualToString:@"get_syslog"]) {
@@ -5551,6 +5647,52 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *err = nil;
     NSDictionary *result = [[FridaManager sharedInstance] hookObjCForBundleId:bundleId args:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"frida_hook_objc failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeEngineTool:(NSString *)toolName reqId:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = nil;
+
+    if ([toolName isEqualToString:@"engine_inject"]) {
+        BOOL launch = args[@"launch"] ? [args[@"launch"] boolValue] : YES;
+        NSDictionary *stealth = [args[@"stealth_config"] isKindOfClass:[NSDictionary class]] ? args[@"stealth_config"] : nil;
+        result = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId stealthConfig:stealth launch:launch error:&err];
+    } else if ([toolName isEqualToString:@"engine_remove"]) {
+        result = [[MCPEngineManager sharedInstance] removeEngineForBundleId:bundleId error:&err];
+    } else {
+        // Map the tool name to its engine.* op and forward the args verbatim
+        // (the engine validates its own required arguments and ignores bundle_id).
+        static NSDictionary *opMap = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            opMap = @{ @"engine_ping": @"engine.ping",
+                       @"engine_modules": @"engine.modules",
+                       @"engine_classes": @"engine.classes",
+                       @"engine_describe_class": @"engine.describe",
+                       @"engine_hook_objc": @"engine.hook_objc",
+                       @"engine_hook_events": @"engine.hook_events",
+                       @"engine_unhook": @"engine.unhook",
+                       @"engine_invoke": @"engine.invoke",
+                       @"engine_get_ivar": @"engine.get_ivar",
+                       @"engine_set_ivar": @"engine.set_ivar",
+                       @"engine_hook_native": @"engine.hook_native",
+                       @"engine_call": @"engine.call",
+                       @"engine_read_memory": @"engine.read_mem",
+                       @"engine_write_memory": @"engine.write_mem",
+                       @"engine_search_memory": @"engine.search_mem" };
+        });
+        NSString *op = opMap[toolName];
+        if (!op) return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown engine tool: %@", toolName]];
+        NSInteger timeout = ([toolName isEqualToString:@"engine_search_memory"] || [toolName isEqualToString:@"engine_classes"]) ? 30000 : 10000;
+        result = [[MCPEngineManager sharedInstance] sendOp:op forBundleId:bundleId args:args timeoutMs:timeout error:&err];
+    }
+
+    if (!result) return [self mcpSuccess:reqId text:(err ?: [toolName stringByAppendingString:@" failed"]) isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 
