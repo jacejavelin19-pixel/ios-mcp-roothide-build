@@ -1514,8 +1514,14 @@ NSDictionary *MCPScrubMachOBinaryAtPath(NSString *inputPath,
                     sliceReplacements++;
                     pos += 5;
                 } else if (MCPMatchCaseInsensitiveAt(cs, pos, limit, "gum", 3) &&
-                           (pos == 0 || !isalpha(cs[pos - 1]) || isupper(cs[pos]))) {
-                    // Prefix/CamelCase boundary prevents corrupting English words like "argument"/"arguments".
+                           pos > 0 && cs[pos - 1] == '-' &&
+                           MCPMatchCaseInsensitiveAt(cs, pos, limit, "gum-", 4)) {
+                    // Only scrub a standalone "gum-" token (e.g. a leftover "gum-*" thread/loop
+                    // name), never the "Gum" prefix of GObject type-name strings such as
+                    // "GumScript"/"GumInterceptor". Those names are resolved at runtime via
+                    // g_type_from_name(); rewriting them (the old CamelCase/isupper rule did
+                    // exactly that, 800+ times) makes GType lookup return 0 and the Gadget
+                    // segfaults in its own initializer before its control socket binds.
                     MCPApplyCasePreservingReplacement(cs + pos, repGum, 3);
                     countGum++;
                     sliceReplacements++;

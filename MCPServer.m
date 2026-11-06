@@ -2956,7 +2956,7 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"scrub_gadget_binary",
-            @"description": @"Deterministically scrub Frida/Gum signature tokens ('gum-js-loop', 'frida', 'gmain', 'gdbus', and prefix-bounded 'gum') in __TEXT,__cstring and LC_ID_DYLIB across all slices of a Gadget dylib using same-length seeded alphabetic replacements without changing section sizes or offsets, then sign via mcp-ldid -S.",
+            @"description": @"Deterministically scrub Frida/Gum signature tokens ('gum-js-loop', 'frida', 'gmain', 'gdbus', and standalone 'gum-' tokens) in __TEXT,__cstring and LC_ID_DYLIB across all slices of a Gadget dylib using same-length seeded alphabetic replacements without changing section sizes or offsets, then sign via mcp-ldid -S. The 'Gum' prefix of GObject type-name strings is deliberately preserved so the Gadget's runtime GType registration still resolves.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
