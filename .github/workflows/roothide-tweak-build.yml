@@ -294,7 +294,7 @@ jobs:
             -fobjc-arc \
             -miphoneos-version-min=15.0 \
             -isysroot "$IOS_SDK" \
-            -Wl,-headerpad_max_install_names \
+            -Wl,-headerpad_max_install_names -Wl,-no_data_const \
             -framework UIKit -framework Foundation -framework Security \
             -lsqlite3 \
             tests/test_target_app/main.m \
