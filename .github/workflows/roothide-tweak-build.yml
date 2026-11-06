@@ -301,7 +301,7 @@ jobs:
             -o "$APP_DIR/MCPTestTarget"
 
           chmod 0755 "$APP_DIR/MCPTestTarget"
-          ldid -Stests/test_target_app/entitlements.plist "$APP_DIR/MCPTestTarget"
+          ldid -Icom.iosmcp.testtarget -Stests/test_target_app/entitlements.plist "$APP_DIR/MCPTestTarget"
           lipo -info "$APP_DIR/MCPTestTarget"
           otool -L "$APP_DIR/MCPTestTarget"
           ldid -e "$APP_DIR/MCPTestTarget"

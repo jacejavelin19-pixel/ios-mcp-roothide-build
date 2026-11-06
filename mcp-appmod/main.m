@@ -331,16 +331,26 @@ static BOOL MCPAMSignStageBinary(NSString *workDir,
         signFlag = @"-Sent.plist";
     }
 
+    NSMutableArray *signArguments = [NSMutableArray arrayWithObject:signFlag];
+    NSString *applicationID = entitlements[@"application-identifier"];
+    if ([applicationID isKindOfClass:NSString.class]) {
+        NSRange dot = [applicationID rangeOfString:@"."];
+        if (dot.location != NSNotFound && dot.location + 1 < applicationID.length) {
+            NSString *identifier = [applicationID substringFromIndex:dot.location + 1];
+            [signArguments addObject:[@"-I" stringByAppendingString:identifier]];
+        }
+    }
+    [signArguments addObject:stageFileName];
     int exitCode = -1;
     NSData *outData = nil;
     NSString *errText = nil;
-    if (!MCPAMRunCommandInDir(ldidPath, @[signFlag, stageFileName], workDir, &exitCode, &outData, &errText, error)) {
+    if (!MCPAMRunCommandInDir(ldidPath, signArguments, workDir, &exitCode, &outData, &errText, error)) {
         return NO;
     }
     if (exitCode != 0) {
         NSString *fallbackLdid = MCPAMResolveJBTool(@"/usr/bin/ldid");
         if (MCPAMIsExecutable(fallbackLdid) && ![fallbackLdid isEqualToString:ldidPath]) {
-            if (MCPAMRunCommandInDir(fallbackLdid, @[signFlag, stageFileName], workDir, &exitCode, &outData, &errText, error) && exitCode == 0) {
+            if (MCPAMRunCommandInDir(fallbackLdid, signArguments, workDir, &exitCode, &outData, &errText, error) && exitCode == 0) {
                 MCPAMRegisterTrust(workDir, stageFileName);
                 return YES;
             }
