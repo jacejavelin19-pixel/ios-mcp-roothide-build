@@ -1,12 +1,24 @@
 #!/bin/sh
-set -e
+# Intentionally NOT using `set -e`: a single non-fatal failure (perms on a file
+# that is not present on this layout, a daemon start in a sandboxed context)
+# must never leave the package half-configured. Every step is best-effort.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
+
+# Resolve the jailbreak root (jbroot). RootHide randomizes it per install, so we
+# never hardcode it. Priority: dpkg's root, then the `jbroot` tool, then the
+# postinst's own location (…/<jbroot>/var/lib/dpkg/info/postinst).
 JB_BASE=""
 if [ -n "$DPKG_ROOT" ] && [ -d "$DPKG_ROOT/usr/bin" ]; then
     JB_BASE="$DPKG_ROOT"
-elif [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr/bin" ]; then
-    JB_BASE="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+elif command -v jbroot >/dev/null 2>&1; then
+    _jb="$(jbroot / 2>/dev/null)"
+    if [ -n "$_jb" ] && [ -d "${_jb}/usr/bin" ]; then
+        JB_BASE="$(cd "$_jb" 2>/dev/null && pwd || echo "")"
+    fi
+fi
+if [ -z "$JB_BASE" ] && [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/../../../usr/bin" ]; then
+    JB_BASE="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || echo "")"
 fi
 
 fix_perms() {
@@ -29,13 +41,46 @@ fix_perms() {
     done
 }
 
+# Resolve an ABSOLUTE, existing path to mcp-helperd. launchd (which spawns the
+# daemon at every boot) runs in the system namespace where /usr is the real
+# system /usr, NOT the jbroot — so the plist must carry the full jbroot path or
+# launchd silently fails to spawn it (the bug that left the daemon dead after a
+# reboot). We only ever write a path we have verified is executable.
+resolve_helper_abs() {
+    base="$1"
+    # 1. Under the resolved jbroot.
+    if [ -n "$base" ] && [ -x "${base}/usr/libexec/ios-mcp/mcp-helperd" ]; then
+        ( cd "$base" 2>/dev/null && printf '%s/usr/libexec/ios-mcp/mcp-helperd' "$(pwd)" )
+        return 0
+    fi
+    # 2. Ask the jbroot tool to resolve the logical path.
+    if command -v jbroot >/dev/null 2>&1; then
+        _p="$(jbroot /usr/libexec/ios-mcp/mcp-helperd 2>/dev/null)"
+        if [ -n "$_p" ] && [ -x "$_p" ]; then
+            printf '%s' "$_p"
+            return 0
+        fi
+    fi
+    # 3. Last resort: the logical path itself, only if it actually resolves.
+    if [ -x /usr/libexec/ios-mcp/mcp-helperd ]; then
+        printf '%s' "/usr/libexec/ios-mcp/mcp-helperd"
+        return 0
+    fi
+    return 1
+}
+
 start_helperd() {
     base="$1"
-    helper="${base}/usr/libexec/ios-mcp/mcp-helperd"
-    if [ -x "$helper" ]; then
-        ld_dir="${base}/Library/LaunchDaemons"
-        mkdir -p "$ld_dir" 2>/dev/null || true
-        cat > "${ld_dir}/com.witchan.ios-mcp.helperd.plist" <<EOF
+    helper_abs="$(resolve_helper_abs "$base")"
+    [ -n "$helper_abs" ] || return 1
+    [ -x "$helper_abs" ] || return 1
+
+    ld_dir="${base}/Library/LaunchDaemons"
+    [ -d "$ld_dir" ] || ld_dir="$(dirname "$(dirname "$(dirname "$helper_abs")")")/Library/LaunchDaemons"
+    mkdir -p "$ld_dir" 2>/dev/null || true
+    plist="${ld_dir}/com.witchan.ios-mcp.helperd.plist"
+
+    cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44,7 +89,7 @@ start_helperd() {
 	<string>com.witchan.ios-mcp.helperd</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>${helper}</string>
+		<string>${helper_abs}</string>
 	</array>
 	<key>UserName</key>
 	<string>mobile</string>
@@ -59,12 +104,21 @@ start_helperd() {
 </dict>
 </plist>
 EOF
-        chown 0:0 "${ld_dir}/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
-        chmod 0644 "${ld_dir}/com.witchan.ios-mcp.helperd.plist" 2>/dev/null || true
-        "$helper" --daemon </dev/null >/dev/null 2>&1 || true
-        return 0
+    chown 0:0 "$plist" 2>/dev/null || true
+    chmod 0644 "$plist" 2>/dev/null || true
+
+    # Register with launchd so it also comes up on every boot, in launchd's own
+    # (system) namespace where the daemon's socket is reachable by the server.
+    # Best-effort and never blocking; failures here do not fail the install.
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true
+        launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
     fi
-    return 1
+
+    # Start immediately for this install session. --daemon re-spawns itself
+    # detached via posix_spawn and returns at once, so this never blocks dpkg.
+    "$helper_abs" --daemon </dev/null >/dev/null 2>&1 || true
+    return 0
 }
 
 if [ -n "$JB_BASE" ]; then
@@ -72,9 +126,6 @@ if [ -n "$JB_BASE" ]; then
 fi
 fix_perms ""
 
-if [ -n "$JB_BASE" ] && start_helperd "$JB_BASE"; then
-    exit 0
-fi
-start_helperd "" || true
+start_helperd "$JB_BASE" || start_helperd "" || true
 
 exit 0

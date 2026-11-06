@@ -1051,6 +1051,23 @@ int main(int argc, const char *argv[]) {
                     [candidates addObject:[frameworksDir stringByAppendingPathComponent:[stem stringByAppendingString:@".config"]]];
                     [candidates addObject:[frameworksDir stringByAppendingPathComponent:[stem stringByAppendingString:@".js"]]];
                 }
+                // Also sweep every file this tool could have staged, by its disguise
+                // prefixes, so orphans from earlier injects (whose randomized suffix
+                // is no longer in the session file) are cleaned up too instead of
+                // accumulating ~62 MB per leftover. These prefixes are MCP-specific
+                // (real Apple frameworks are not named "libAppleCoreSVG_<hex>"), and
+                // the LC_LOAD_DYLIB for each has already been stripped from the main
+                // Mach-O above, so nothing references them.
+                NSArray<NSString *> *stagePrefixes = @[@"libAppleCoreSVG_", @"libAppleAudioDSP_"];
+                NSArray<NSString *> *fwEntries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:frameworksDir error:nil];
+                for (NSString *entry in fwEntries) {
+                    for (NSString *prefix in stagePrefixes) {
+                        if ([entry hasPrefix:prefix]) {
+                            [candidates addObject:[frameworksDir stringByAppendingPathComponent:entry]];
+                            break;
+                        }
+                    }
+                }
                 for (NSString *f in candidates) {
                     if (MCPAMPathExists(f) && unlink(f.fileSystemRepresentation) == 0) {
                         [deleted addObject:f];
