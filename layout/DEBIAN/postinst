@@ -80,6 +80,13 @@ start_helperd() {
     mkdir -p "$ld_dir" 2>/dev/null || true
     plist="${ld_dir}/com.witchan.ios-mcp.helperd.plist"
 
+    # Emit the plist in the same shape RootHide's own auto-starting daemons use
+    # (e.g. us.diatr.shshd): a `Program` key holding the full jbroot path, plus
+    # POSIXSpawnType/ProcessType Interactive. RootHide rewrites the jbroot prefix
+    # of `Program` in every `__Patched` plist on each jailbreak, and only loads
+    # daemons that carry this shape at boot — a plist with the path only in
+    # ProgramArguments gets its path patched but is NOT auto-bootstrapped, which
+    # is why the daemon did not come up on its own after a re-jailbreak.
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,10 +94,16 @@ start_helperd() {
 <dict>
 	<key>Label</key>
 	<string>com.witchan.ios-mcp.helperd</string>
+	<key>Program</key>
+	<string>${helper_abs}</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>${helper_abs}</string>
 	</array>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
 	<key>UserName</key>
 	<string>mobile</string>
 	<key>GroupName</key>
@@ -107,12 +120,14 @@ EOF
     chown 0:0 "$plist" 2>/dev/null || true
     chmod 0644 "$plist" 2>/dev/null || true
 
-    # Register with launchd so it also comes up on every boot, in launchd's own
-    # (system) namespace where the daemon's socket is reachable by the server.
-    # Best-effort and never blocking; failures here do not fail the install.
+    # Register with launchd so it also comes up now, in launchd's own (system)
+    # namespace where the daemon's socket is reachable by the server. Wrapped in
+    # `timeout` and backgrounded so a slow/blocking launchctl can never hang the
+    # install; failures here do not fail the install. Boot-time load is handled
+    # by RootHide via the Program-keyed plist above regardless.
     if command -v launchctl >/dev/null 2>&1; then
-        launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1 || true
-        launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
+        ( timeout 8 launchctl bootout "system/com.witchan.ios-mcp.helperd" >/dev/null 2>&1
+          timeout 8 launchctl bootstrap system "$plist" >/dev/null 2>&1 ) &
     fi
 
     # Start immediately for this install session. --daemon re-spawns itself
