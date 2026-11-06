@@ -146,7 +146,9 @@ static void mcp_rebind_indirect_section(struct mcp_rebinding rebindings[],
                     *rebindings[j].replaced = (void *)cur;
 #endif
                 }
-                uintptr_t orig_target = stripped_originals[j] ? stripped_originals[j] : cur_stripped;
+                // This slot was identified by symbol name. Its current target may
+                // already be interposed; authenticate that target, not dlsym.
+                uintptr_t orig_target = cur_stripped;
                 if (!mcp_write_slot_preserving_pac(&slots[i], orig_target, rebindings[j].replacement)) {
                     // Unbound lazy slot fallback (unauthenticated pointer slot only)
                     if ((cur >> 48) == 0 && mcp_make_writable(&slots[i], sizeof(uintptr_t))) {
