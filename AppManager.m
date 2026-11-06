@@ -7,6 +7,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
 #import "IOSMCPPreferences.h"
 #import "MCPLogger.h"
 #import <fcntl.h>
@@ -2428,6 +2429,10 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         // LaunchServices can retain a superseded dataContainerURL after an
         // AppSync reinstall. Ask MobileContainerManager for the active container.
         Class containerClass = NSClassFromString(@"MCMAppDataContainer");
+        if (!containerClass) {
+            dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+            containerClass = NSClassFromString(@"MCMAppDataContainer");
+        }
         SEL lookup = NSSelectorFromString(@"containerWithIdentifier:createIfNecessary:existed:error:");
         if ([containerClass respondsToSelector:lookup]) {
             NSError *__autoreleasing containerError = nil;
