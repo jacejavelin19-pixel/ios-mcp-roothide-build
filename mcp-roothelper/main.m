@@ -20,6 +20,7 @@ typedef NS_ENUM(int, MCPRootHelperExitCode) {
 };
 
 static void MCPRHLog(NSString *format, ...) {
+#if defined(DEBUG) && DEBUG
     va_list args;
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
@@ -27,11 +28,14 @@ static void MCPRHLog(NSString *format, ...) {
 
     if (message.length == 0) return;
     NSString *line = [message stringByAppendingString:@"\n"];
-    const char *path = "/tmp/mcp-roothelper.log";
-    FILE *fp = fopen(path, "a");
+    NSString *logPath = jbroot(@"/tmp/mcp-roothelper.log");
+    FILE *fp = fopen(logPath.fileSystemRepresentation, "a");
     if (!fp) return;
     fputs(line.UTF8String ?: "", fp);
     fclose(fp);
+#else
+    (void)format;
+#endif
 }
 
 static BOOL MCPRHShouldPassthroughDelegateOutput(void) {
@@ -236,7 +240,12 @@ static int MCPRHInstallIPA(NSString *ipaPath) {
     argv[argCount] = NULL;
 
     if (!MCPRHShouldPassthroughDelegateOutput()) {
-        const char *logPath = "/tmp/mcp-roothelper-install.log";
+#if defined(DEBUG) && DEBUG
+        NSString *jbLog = jbroot(@"/tmp/mcp-roothelper-install.log");
+        const char *logPath = jbLog.fileSystemRepresentation;
+#else
+        const char *logPath = "/dev/null";
+#endif
         int logFD = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (logFD >= 0) {
             dup2(logFD, STDOUT_FILENO);

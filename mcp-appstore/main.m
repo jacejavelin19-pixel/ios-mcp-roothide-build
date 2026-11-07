@@ -9,6 +9,9 @@
 #import <stdio.h>
 #import <string.h>
 #import <stdlib.h>
+#ifdef MCP_ROOTHIDE
+#include <roothide.h>
+#endif
 
 // Typed objc_msgSend wrappers for arm64 / arm64e strict ABI compliance
 static id MCPMsgSend0(id target, SEL sel) {
@@ -715,6 +718,10 @@ static NSString *MCPSnapshotAppDataContainer(NSString *bundleId, NSString *dataC
         if (![fm fileExistsAtPath:dataContainerPath]) return;
 
         NSString *workBase = @"/var/mobile/Library/Caches/ios-mcp-work";
+#ifdef MCP_ROOTHIDE
+        NSString *jbWorkBase = jbroot(workBase);
+        if (jbWorkBase.length > 0) workBase = jbWorkBase;
+#endif
         [fm createDirectoryAtPath:workBase withIntermediateDirectories:YES attributes:nil error:nil];
         chmod(workBase.UTF8String, 0777);
         chown(workBase.UTF8String, 501, 501);

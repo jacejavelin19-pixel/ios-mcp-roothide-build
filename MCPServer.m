@@ -1734,18 +1734,21 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *dirError = nil;
-    if (![fm createDirectoryAtPath:MCP_UPLOAD_DIR
+    NSString *uploadDir = MCPResolvedJailbreakPath(MCP_UPLOAD_DIR);
+    if (![fm createDirectoryAtPath:uploadDir
         withIntermediateDirectories:YES
                          attributes:@{NSFilePosixPermissions: @0777}
                               error:&dirError]) {
         [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to create upload directory: %@", dirError.localizedDescription ?: @"unknown"] requestLogId:requestLogId];
         return;
     }
+    chmod(uploadDir.fileSystemRepresentation, 0777);
+    chown(uploadDir.fileSystemRepresentation, 501, 501);
 
     NSString *safeName = [self uploadFileNameFromRequestPath:path headers:headers];
     NSString *uploadId = [[NSUUID UUID] UUIDString];
     NSString *fileName = [NSString stringWithFormat:@"%@-%@", uploadId, safeName];
-    NSString *destPath = [MCP_UPLOAD_DIR stringByAppendingPathComponent:fileName];
+    NSString *destPath = [uploadDir stringByAppendingPathComponent:fileName];
     int fd = open(destPath.fileSystemRepresentation, O_CREAT | O_EXCL | O_WRONLY, 0644);
     if (fd < 0) {
         [self sendErrorResponse:clientSocket status:500 message:[NSString stringWithFormat:@"Failed to open upload file: %s", strerror(errno)] requestLogId:requestLogId];

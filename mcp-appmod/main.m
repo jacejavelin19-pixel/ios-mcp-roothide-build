@@ -111,10 +111,18 @@ static BOOL MCPAMIsProtectedTarget(NSString *path, NSString **error) {
 
 static NSString *MCPAMCreateWorkDir(NSString **error) {
     NSString *base = @"/var/mobile/Library/Caches/ios-mcp-appmod";
+#ifdef MCP_ROOTHIDE
+    NSString *jbBase = jbroot(base);
+    if (jbBase.length > 0) base = jbBase;
+#endif
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
     if (![fm createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:&err]) {
         base = @"/var/tmp/ios-mcp-appmod";
+#ifdef MCP_ROOTHIDE
+        NSString *jbTmp = jbroot(base);
+        if (jbTmp.length > 0) base = jbTmp;
+#endif
         [fm createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:nil];
     }
     chmod(base.fileSystemRepresentation, 0777);
