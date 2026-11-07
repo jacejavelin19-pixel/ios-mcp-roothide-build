@@ -49,6 +49,26 @@ void MECheckObjCHook(Class owner, SEL selector) {
         }
     }
 }
+IMP MEOriginalIMPForReplacement(IMP imp) {
+    if (!imp) return NULL;
+    MEHookInit();
+    uintptr_t needle = (uintptr_t)imp;
+#if __has_feature(ptrauth_calls)
+    needle = (uintptr_t)ptrauth_strip((void *)imp, ptrauth_key_function_pointer);
+#endif
+    @synchronized(MEHookLock) {
+        for (unsigned i=0;i<MENextSlot;i++) {
+            MEHook *h=MESlots[i];
+            if (!h || !h.objcHook || !h.replacement) continue;
+            uintptr_t cand = (uintptr_t)h.replacement;
+#if __has_feature(ptrauth_calls)
+            cand = (uintptr_t)ptrauth_strip(h.replacement, ptrauth_key_function_pointer);
+#endif
+            if (cand == needle) return h.originalIMP;
+        }
+    }
+    return NULL;
+}
 static MEHook *MEFind(NSString *key) {
     MEHookInit();
     @synchronized(MEHookLock) {

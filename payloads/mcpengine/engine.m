@@ -54,6 +54,7 @@ static NSDictionary *MEDispatch(NSString *op, NSDictionary *a) {
     if (!r) r = MENetCap(op,a);
     if (!r) r = MERE(op,a);
     if (!r) r = MECrypto(op,a);
+    if (!r) r = MEAntiFraud(op,a);
     if (!r) MEFail([@"Unknown op: " stringByAppendingString:op]);
     return r;
 }
@@ -191,6 +192,9 @@ __attribute__((constructor)) static void MEStart(void) {
     pthread_t thread;
     MEStartupSet("creating server thread",NULL);
     int rc=pthread_create(&thread,NULL,MEServer,NULL);
-    if (!rc) pthread_detach(thread);
+    if (!rc) {
+        MERegisterEngineServerThread(thread);
+        pthread_detach(thread);
+    }
     else MEStartupStop(__LINE__,rc);
 }

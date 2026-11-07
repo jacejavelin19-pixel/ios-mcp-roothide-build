@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <stdint.h>
+#include <pthread.h>
 
 /* NDJSON, UTF-8, one request/response per line, persistent connections.
  * Request: {id: integer, op: "engine.*", args: object}
@@ -41,6 +42,9 @@ NSDictionary *MEHooks(NSString *op, NSDictionary *a);
 NSDictionary *MENetCap(NSString *op, NSDictionary *a);
 NSDictionary *MERE(NSString *op, NSDictionary *a);
 NSDictionary *MECrypto(NSString *op, NSDictionary *a);
+NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a);
+IMP MEOriginalIMPForReplacement(IMP imp);
+void MERegisterEngineServerThread(pthread_t thread);
 void *MEResolve(NSDictionary *a);
 uintptr_t MECall(void *fn, const uintptr_t *args, unsigned count);
 const struct mach_header *MESelfHeader(void);

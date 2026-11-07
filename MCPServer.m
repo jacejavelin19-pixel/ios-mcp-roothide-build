@@ -22,6 +22,7 @@
 #import "MCPEngineManager.h"
 #import "AppStoreManager.h"
 #import "BinaryInspector.h"
+#import "PersonaManager.h"
 #import "SQLiteQueryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
@@ -603,7 +604,22 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_crypto_events",
             @"hook_quic_http3",
             @"decode_protobuf",
-            @"replay_request_native"
+            @"replay_request_native",
+            @"stealth_syscall_shield",
+            @"spoof_device_fingerprint",
+            @"kernel_proc_cloak",
+            @"proxy_vpn_network_cloak",
+            @"hardware_canvas_gpu_audio_randomizer",
+            @"behavioral_biometrics_ghost_player",
+            @"perimeterx_akamai_datadome_kasada_tap",
+            @"threatmetrix_sardine_forter_seon_neutralizer",
+            @"apple_app_attest_devicecheck_bridge",
+            @"sync_fraud_persona",
+            @"objc_swizzle_and_dladdr_integrity_cloak",
+            @"thread_mach_port_and_stack_cloaker",
+            @"wipe_fraud_canaries",
+            @"apply_fraud_persona",
+            @"audit_fraud_surface"
         ];
     });
     return tools;
@@ -879,6 +895,21 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeAppStoreInstall:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeAppStoreDowngrade:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeAppStoreAutoRollbackDiff:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeStealthSyscallShield:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeSpoofDeviceFingerprint:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeKernelProcCloak:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeProxyVpnNetworkCloak:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeHardwareCanvasGpuAudioRandomizer:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeBehavioralBiometricsGhostPlayer:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executePerimeterxAkamaiDatadomeKasadaTap:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeThreatmetrixSardineForterSeonNeutralizer:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAppleAppAttestDevicecheckBridge:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeSyncFraudPersona:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeObjcSwizzleAndDladdrIntegrityCloak:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeThreadMachPortAndStackCloaker:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWipeFraudCanaries:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeApplyFraudPersona:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAuditFraudSurface:(id)reqId args:(NSDictionary *)args;
 - (NSString *)jsonTextForObject:(id)object;
 - (NSString *)jsonTextForDictionary:(NSDictionary *)dict;
 - (NSDictionary *)sanitizeFrontmostInfo:(NSDictionary *)info debug:(BOOL)debug;
@@ -3541,6 +3572,207 @@ static NSString *MCPLogId(id reqId) {
                 },
                 @"required": @[@"bundle_id", @"url"]
             }
+        },
+        // ═══════════════════════════════════════════════════════════════════
+        // Phase 4: Anti-Fraud, Anti-Bot, Syscall Shield & Persona Orchestrator
+        // ═══════════════════════════════════════════════════════════════════
+        @{
+            @"name": @"stealth_syscall_shield",
+            @"description": @"In-process data-only GOT/LA_SYMBOL_PTR rebinding shield (_dyld_image_count, _dyld_get_image_name, _dyld_get_image_header, dladdr, stat, lstat, fstatat, access, faccessat, open, fopen, opendir, getenv, ptrace, sysctl, sysctlbyname, getppid, isatty, fork, csops, task_get_exception_ports) + inline SVC #0x80 (0xD4001001) direct syscall scanner & hardware breakpoint trap.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"scan_svc": @{@"type": @"boolean", @"description": @"Scan app __TEXT,__text for inline SVC #0x80 (0xD4001001) instructions (default true)."},
+                    @"trap_svc": @{@"type": @"boolean", @"description": @"Install hardware debug register traps on discovered SVC #0x80 sites."},
+                    @"auto_inject": @{@"type": @"boolean", @"description": @"Automatically inject libmcpengine + libmcp_stealth if not yet active (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"spoof_device_fingerprint",
+            @"description": @"Deep device fingerprint spoofer & virtual Keychain sandbox isolator. Spoofs UIDevice.identifierForVendor, ASIdentifierManager.advertisingIdentifier, MGCopyAnswer (UniqueDeviceID, SerialNumber, MLBSerialNumber, UniqueChipID, WifiAddress, BluetoothAddress, ProductType, HardwareModel), sysctlbyname (hw.machine, hw.model, kern.osversion, kern.bootsessionuuid), statfs/fstatfs free-block jitter, and isolates SecItem* Keychain queries per persona.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"rotate": @{@"type": @"boolean", @"description": @"Generate fresh randomized UUIDs, serials, MACs, and virtual keychain prefix."},
+                    @"country_code": @{@"type": @"string", @"description": @"Optional ISO country preset ('US', 'GB', 'DE', 'JP', 'CA', 'AU')."},
+                    @"idfv": @{@"type": @"string", @"description": @"Optional custom identifierForVendor UUID."},
+                    @"idfa": @{@"type": @"string", @"description": @"Optional custom advertisingIdentifier UUID."},
+                    @"udid": @{@"type": @"string", @"description": @"Optional custom UniqueDeviceID."},
+                    @"serial_number": @{@"type": @"string", @"description": @"Optional custom SerialNumber."},
+                    @"machine": @{@"type": @"string", @"description": @"Optional hw.machine (e.g. 'iPhone15,2')."},
+                    @"model": @{@"type": @"string", @"description": @"Optional hw.model (e.g. 'D73AP')."},
+                    @"persona": @{@"type": @"object", @"description": @"Optional dictionary of custom persona fields."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"kernel_proc_cloak",
+            @"description": @"Process-table, csops, and Mach task_info cloak. Strips CS_DEBUGGED (0x10000000) and CS_INVALID_ALLOWED in csops(CS_OPS_STATUS), masks P_TRACED in sysctl(KERN_PROC_PID), forces getppid()=1, and blocks fork() sandbox probes.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"auto_inject": @{@"type": @"boolean", @"description": @"Automatically inject engine if not active (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"proxy_vpn_network_cloak",
+            @"description": @"Proxy, VPN, TUN/TAP interface, MTU, and SCNetworkReachability cloak. Returns empty @{} for CFNetworkCopySystemProxySettings, strips utun*/ppp*/ipsec*/tun*/tap* interfaces from getifaddrs(), normalizes en0/pdp_ip0 MTU to 1500/1428, and clears kSCNetworkReachabilityFlagsTransientConnection.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"auto_inject": @{@"type": @"boolean", @"description": @"Automatically inject engine if not active (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"hardware_canvas_gpu_audio_randomizer",
+            @"description": @"Hardware Canvas/CoreGraphics, Metal GPU, and Audio fingerprint randomizer. Injects deterministic persona-seeded LSB pixel noise into CGBitmapContextCreateImage and spoofs MTLDevice.name so canvas/GPU hashes are unique per persona and consistent within the same persona.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"canvas_seed": @{@"type": @"number", @"description": @"Optional 64-bit deterministic seed for CoreGraphics LSB pixel noise."},
+                    @"gpu_name": @{@"type": @"string", @"description": @"Optional Metal GPU name override (default 'Apple A16 GPU')."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"behavioral_biometrics_ghost_player",
+            @"description": @"Human-physics touch, IMU accelerometer/gyroscope micro-recoil synthesizer, UIPasteboard cloak, and UITextInput character-by-character ghost typer. Defeats Sardine, Forter, BioCatch, and ThreatMetrix behavioral biometrics.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"action": @{@"type": @"string", @"description": @"Optional action: 'configure' (default) or 'ghost_type' to type text with human cadence into the focused UITextField/UITextView."},
+                    @"text": @{@"type": @"string", @"description": @"Text to type when action='ghost_type'."},
+                    @"wpm": @{@"type": @"number", @"description": @"Typing speed in words per minute when action='ghost_type' (default 65)."},
+                    @"cloak_pasteboard": @{@"type": @"boolean", @"description": @"Cloak UIPasteboard.generalPasteboard changeCount/string probes (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"perimeterx_akamai_datadome_kasada_tap",
+            @"description": @"Bot-defense SDK detector, pre-encryption sensor payload sanitizer, and challenge token harvester for PerimeterX/HUMAN (PXManager), Akamai BMP (CYFMonitor), DataDome, Kasada (KPSDK), and Shape/F5.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear previously harvested bot-defense sensor payloads."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"threatmetrix_sardine_forter_seon_neutralizer",
+            @"description": @"Device-risk SDK neutralizer for ThreatMetrix (LexisNexis), Sardine.ai, Forter, SEON, Iovation, and Sift. Sinkholes localhost port scans (22, 27042, 27043, 23946, 8090, 1234, 4444, 8080, 8888, 9090) with ECONNREFUSED, blocks jailbreak URL scheme probes in UIApplication.canOpenURL:, and scrubs jailbreak/debugger risk flags in outgoing JSON telemetry.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"apple_app_attest_devicecheck_bridge",
+            @"description": @"Apple App Attest (DCAppAttestService) and DeviceCheck (DCDevice) bridge & key rotator. Hooks DCAppAttestService and DCDevice to log keyIdentifiers, clientDataHash challenges, attestation CBOR blobs, and rotate App Attest state across personas.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"rotate_keys": @{@"type": @"boolean", @"description": @"Clear recorded App Attest key state so the app provisions a fresh attestation key."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"sync_fraud_persona",
+            @"description": @"System environment & locale/timezone/carrier/battery consistency engine. Atomically aligns NSTimeZone, NSLocale, AppleLanguages, CTCarrier (carrierName, MCC, MNC, isoCountryCode), and UIDevice unplugged battery discharge curve so zero cross-signal mismatches occur.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"country_code": @{@"type": @"string", @"description": @"ISO country code preset ('US', 'GB', 'DE', 'JP', 'CA', 'AU')."},
+                    @"timezone": @{@"type": @"string", @"description": @"Explicit IANA timezone (e.g. 'America/New_York')."},
+                    @"locale": @{@"type": @"string", @"description": @"Explicit locale identifier (e.g. 'en_US')."},
+                    @"carrier_name": @{@"type": @"string", @"description": @"Explicit cellular carrier name (e.g. 'T-Mobile')."},
+                    @"mcc": @{@"type": @"string", @"description": @"Mobile Country Code (e.g. '310')."},
+                    @"mnc": @{@"type": @"string", @"description": @"Mobile Network Code (e.g. '260')."},
+                    @"battery_level": @{@"type": @"number", @"description": @"Initial unplugged battery level 0.15..0.95 (default ~0.68 with realistic discharge slope)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"objc_swizzle_and_dladdr_integrity_cloak",
+            @"description": @"Objective-C IMP swizzle & dladdr address-origin integrity cloak. Hooks method_getImplementation, class_getMethodImplementation, and dladdr so anti-tamper checks querying swizzled selectors or IMP addresses receive the original unswizzled system IMP and genuine /System/Library/Frameworks/... Dl_info.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"thread_mach_port_and_stack_cloaker",
+            @"description": @"Mach thread list (task_threads) and call-stack walker (backtrace / +[NSThread callStackSymbols] / +[NSThread callStackReturnAddresses]) cloaker. Hides libmcpengine/stealth server threads from task_threads enumeration and strips engine/companion frames from stack backtraces.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"wipe_fraud_canaries",
+            @"description": @"7-vector tracking canary & cross-reinstall beacon wiper: cleans virtual & app Keychain items, named/general UIPasteboards, sandbox Caches/Cookies/WebKit stores, NSUbiquitousKeyValueStore, NSURLCache/HTTPCookieStorage, and rotates st_birthtimespec nanosecond jitter on /var/mobile.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"apply_fraud_persona",
+            @"description": @"One-click atomic anti-fraud persona orchestrator: generates a coherent country/carrier/hardware persona, wipes all 7 tracking canary vectors, injects libmcp_stealth + libmcpengine, activates all 13 anti-fraud shields (syscall shield, fingerprint spoof, proc cloak, VPN/proxy cloak, canvas/GPU noise, biometrics ghost player, bot-SDK tap, risk-SDK neutralizer, App Attest bridge, locale/carrier sync, IMP/dladdr cloak, thread/stack cloak), and runs the 50-point audit_fraud_surface battery.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"country_code": @{@"type": @"string", @"description": @"Country preset ('US', 'GB', 'DE', 'JP', 'CA', 'AU'; default 'US')."},
+                    @"rotate": @{@"type": @"boolean", @"description": @"Generate a brand-new identity (fresh IDFV, IDFA, UDID, serials, canvas seed, keychain prefix; default true)."},
+                    @"wipe_canaries": @{@"type": @"boolean", @"description": @"Wipe all 7 tracking canary vectors before applying persona (default true)."},
+                    @"persona": @{@"type": @"object", @"description": @"Optional explicit overrides for any persona field."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"audit_fraud_surface",
+            @"description": @"Live in-process 50-point anti-fraud, RASP, jailbreak, debugger, dylib, proxy/VPN, swizzle, thread, and environment consistency self-test battery. Executes 50 detection vectors inside the target app and returns passed/total score (50/50 PASSED).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
         }
     ];
 
@@ -3800,6 +4032,36 @@ static NSString *MCPLogId(id reqId) {
         return [self executeDecodeProtobuf:reqId args:args];
     } else if ([toolName isEqualToString:@"replay_request_native"]) {
         return [self executeReplayRequestNative:reqId args:args];
+    } else if ([toolName isEqualToString:@"stealth_syscall_shield"]) {
+        return [self executeStealthSyscallShield:reqId args:args];
+    } else if ([toolName isEqualToString:@"spoof_device_fingerprint"]) {
+        return [self executeSpoofDeviceFingerprint:reqId args:args];
+    } else if ([toolName isEqualToString:@"kernel_proc_cloak"]) {
+        return [self executeKernelProcCloak:reqId args:args];
+    } else if ([toolName isEqualToString:@"proxy_vpn_network_cloak"]) {
+        return [self executeProxyVpnNetworkCloak:reqId args:args];
+    } else if ([toolName isEqualToString:@"hardware_canvas_gpu_audio_randomizer"]) {
+        return [self executeHardwareCanvasGpuAudioRandomizer:reqId args:args];
+    } else if ([toolName isEqualToString:@"behavioral_biometrics_ghost_player"]) {
+        return [self executeBehavioralBiometricsGhostPlayer:reqId args:args];
+    } else if ([toolName isEqualToString:@"perimeterx_akamai_datadome_kasada_tap"]) {
+        return [self executePerimeterxAkamaiDatadomeKasadaTap:reqId args:args];
+    } else if ([toolName isEqualToString:@"threatmetrix_sardine_forter_seon_neutralizer"]) {
+        return [self executeThreatmetrixSardineForterSeonNeutralizer:reqId args:args];
+    } else if ([toolName isEqualToString:@"apple_app_attest_devicecheck_bridge"]) {
+        return [self executeAppleAppAttestDevicecheckBridge:reqId args:args];
+    } else if ([toolName isEqualToString:@"sync_fraud_persona"]) {
+        return [self executeSyncFraudPersona:reqId args:args];
+    } else if ([toolName isEqualToString:@"objc_swizzle_and_dladdr_integrity_cloak"]) {
+        return [self executeObjcSwizzleAndDladdrIntegrityCloak:reqId args:args];
+    } else if ([toolName isEqualToString:@"thread_mach_port_and_stack_cloaker"]) {
+        return [self executeThreadMachPortAndStackCloaker:reqId args:args];
+    } else if ([toolName isEqualToString:@"wipe_fraud_canaries"]) {
+        return [self executeWipeFraudCanaries:reqId args:args];
+    } else if ([toolName isEqualToString:@"apply_fraud_persona"]) {
+        return [self executeApplyFraudPersona:reqId args:args];
+    } else if ([toolName isEqualToString:@"audit_fraud_surface"]) {
+        return [self executeAuditFraudSurface:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -6385,6 +6647,173 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *err = nil;
     NSDictionary *result = [[NetworkCaptureManager sharedInstance] replayRequestNativeForBundleId:bundleId args:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"replay_request_native failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+#pragma mark - Phase 4: Anti-Fraud, Anti-Bot, Syscall Shield & Persona Execution
+
+- (NSDictionary *)executeStealthSyscallShield:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] stealthSyscallShieldForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"stealth_syscall_shield failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSpoofDeviceFingerprint:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] spoofDeviceFingerprintForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"spoof_device_fingerprint failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeKernelProcCloak:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] kernelProcCloakForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"kernel_proc_cloak failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeProxyVpnNetworkCloak:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] proxyVpnNetworkCloakForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"proxy_vpn_network_cloak failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeHardwareCanvasGpuAudioRandomizer:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] hardwareCanvasGpuAudioRandomizerForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"hardware_canvas_gpu_audio_randomizer failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeBehavioralBiometricsGhostPlayer:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] behavioralBiometricsGhostPlayerForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"behavioral_biometrics_ghost_player failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executePerimeterxAkamaiDatadomeKasadaTap:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] perimeterxAkamaiDatadomeKasadaTapForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"perimeterx_akamai_datadome_kasada_tap failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeThreatmetrixSardineForterSeonNeutralizer:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] threatmetrixSardineForterSeonNeutralizerForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"threatmetrix_sardine_forter_seon_neutralizer failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAppleAppAttestDevicecheckBridge:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] appleAppAttestDevicecheckBridgeForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"apple_app_attest_devicecheck_bridge failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSyncFraudPersona:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] syncFraudPersonaForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"sync_fraud_persona failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeObjcSwizzleAndDladdrIntegrityCloak:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] objcSwizzleAndDladdrIntegrityCloakForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"objc_swizzle_and_dladdr_integrity_cloak failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeThreadMachPortAndStackCloaker:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] threadMachPortAndStackCloakerForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"thread_mach_port_and_stack_cloaker failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeWipeFraudCanaries:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] wipeFraudCanariesForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"wipe_fraud_canaries failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeApplyFraudPersona:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] applyFraudPersonaForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"apply_fraud_persona failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAuditFraudSurface:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[PersonaManager sharedInstance] auditFraudSurfaceForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"audit_fraud_surface failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 

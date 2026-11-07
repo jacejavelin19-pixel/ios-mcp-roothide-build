@@ -1,11 +1,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <dirent.h>
 #import <errno.h>
 #import <fcntl.h>
+#import <ifaddrs.h>
+#import <net/if.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -35,6 +38,16 @@
 
 #ifndef PT_DENY_ATTACH
 #define PT_DENY_ATTACH 31
+#endif
+
+#ifndef CS_OPS_STATUS
+#define CS_OPS_STATUS 0
+#endif
+#ifndef CS_DEBUGGED
+#define CS_DEBUGGED 0x10000000
+#endif
+#ifndef CS_INVALID_ALLOWED
+#define CS_INVALID_ALLOWED 0x00000020
 #endif
 
 extern kern_return_t mach_vm_region(vm_map_t target_task,
@@ -110,8 +123,13 @@ static int (*orig_dladdr)(const void *addr, Dl_info *info) = NULL;
 
 static int (*orig_ptrace)(int request, pid_t pid, void *addr, int data) = NULL;
 static int (*orig_sysctl)(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) = NULL;
+static int (*orig_csops)(pid_t pid, unsigned int ops, void *useraddr, size_t usersize) = NULL;
 static pid_t (*orig_getppid)(void) = NULL;
 static int (*orig_isatty)(int fd) = NULL;
+static int (*orig_getifaddrs)(struct ifaddrs **ifap) = NULL;
+static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void) = NULL;
+static int64_t g_birthtime_jitter_nsec = 0;
+static int64_t g_birthtime_jitter_sec = 0;
 
 static kern_return_t (*orig_task_get_exception_ports)(task_t task,
                                                       exception_mask_t exception_mask,
@@ -672,6 +690,59 @@ static int hook_isatty(int fd) {
     return orig_isatty ? orig_isatty(fd) : 0;
 }
 
+static int hook_csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize) {
+    const void *ret = __builtin_return_address(0);
+    int rc = orig_csops ? orig_csops(pid, ops, useraddr, usersize) : -1;
+    if (rc == 0 && g_enable_anti_debug && !mcp_is_internal_caller(ret) &&
+        ops == CS_OPS_STATUS && useraddr && usersize >= sizeof(uint32_t)) {
+        uint32_t *flags = (uint32_t *)useraddr;
+        *flags &= ~(uint32_t)(CS_DEBUGGED | CS_INVALID_ALLOWED);
+        atomic_fetch_add(&g_cnt_anti_debug, 1);
+    }
+    return rc;
+}
+
+static int hook_getifaddrs(struct ifaddrs **ifap) {
+    const void *ret = __builtin_return_address(0);
+    int rc = orig_getifaddrs ? orig_getifaddrs(ifap) : -1;
+    if (rc == 0 && !mcp_is_internal_caller(ret) && ifap && *ifap) {
+        struct ifaddrs *cur = *ifap;
+        struct ifaddrs *prev = NULL;
+        while (cur) {
+            int hide = 0;
+            if (cur->ifa_name) {
+                if (strncmp(cur->ifa_name, "utun", 4) == 0 ||
+                    strncmp(cur->ifa_name, "ppp", 3) == 0 ||
+                    strncmp(cur->ifa_name, "ipsec", 5) == 0 ||
+                    strncmp(cur->ifa_name, "tun", 3) == 0 ||
+                    strncmp(cur->ifa_name, "tap", 3) == 0) {
+                    hide = 1;
+                } else if (cur->ifa_data && cur->ifa_addr && cur->ifa_addr->sa_family == AF_LINK) {
+                    struct if_data *ifd = (struct if_data *)cur->ifa_data;
+                    if (strcmp(cur->ifa_name, "en0") == 0) ifd->ifi_mtu = 1500;
+                    else if (strncmp(cur->ifa_name, "pdp_ip", 6) == 0) ifd->ifi_mtu = 1428;
+                }
+            }
+            if (hide) {
+                if (prev) prev->ifa_next = cur->ifa_next;
+                else *ifap = cur->ifa_next;
+            } else {
+                prev = cur;
+            }
+            cur = cur->ifa_next;
+        }
+    }
+    return rc;
+}
+
+static CFDictionaryRef hook_CFNetworkCopySystemProxySettings(void) {
+    const void *ret = __builtin_return_address(0);
+    if (!mcp_is_internal_caller(ret)) {
+        return (__bridge_retained CFDictionaryRef)@{};
+    }
+    return orig_CFNetworkCopySystemProxySettings ? orig_CFNetworkCopySystemProxySettings() : (__bridge_retained CFDictionaryRef)@{};
+}
+
 #pragma mark - Bypass 2: Mach Exception Port Cloak (Gum Exception Handler Hiding)
 
 static kern_return_t hook_task_get_exception_ports(task_t task,
@@ -777,6 +848,15 @@ static int mcp_is_cloaked_path(const char *path) {
     return matched;
 }
 
+static void mcp_apply_birthtime_jitter(const char *path, struct stat *buf) {
+    if (!path || !buf || (g_birthtime_jitter_nsec == 0 && g_birthtime_jitter_sec == 0)) return;
+    if (strcmp(path, "/var/mobile") == 0 || strcmp(path, "/private/var/mobile") == 0 || strcmp(path, "/var/mobile/Library") == 0) {
+        buf->st_birthtimespec.tv_sec += (time_t)g_birthtime_jitter_sec;
+        buf->st_birthtimespec.tv_nsec = (long)((buf->st_birthtimespec.tv_nsec + g_birthtime_jitter_nsec) % 1000000000L);
+        if (buf->st_birthtimespec.tv_nsec < 0) buf->st_birthtimespec.tv_nsec += 1000000000L;
+    }
+}
+
 static int hook_stat(const char *path, struct stat *buf) {
     const void *ret = __builtin_return_address(0);
     if (g_enable_fs_cloak && !mcp_is_internal_caller(ret) && mcp_is_cloaked_path(path)) {
@@ -784,7 +864,9 @@ static int hook_stat(const char *path, struct stat *buf) {
         errno = ENOENT;
         return -1;
     }
-    return orig_stat ? orig_stat(path, buf) : -1;
+    int rc = orig_stat ? orig_stat(path, buf) : -1;
+    if (rc == 0 && !mcp_is_internal_caller(ret)) mcp_apply_birthtime_jitter(path, buf);
+    return rc;
 }
 
 static int hook_lstat(const char *path, struct stat *buf) {
@@ -794,7 +876,9 @@ static int hook_lstat(const char *path, struct stat *buf) {
         errno = ENOENT;
         return -1;
     }
-    return orig_lstat ? orig_lstat(path, buf) : -1;
+    int rc = orig_lstat ? orig_lstat(path, buf) : -1;
+    if (rc == 0 && !mcp_is_internal_caller(ret)) mcp_apply_birthtime_jitter(path, buf);
+    return rc;
 }
 
 static int hook_access(const char *path, int amode) {
@@ -880,7 +964,9 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
                 is_local = 1;
             }
         }
-        if (is_local && (port == 27042 || port == 27043 || port == 23946)) {
+        if (is_local && (port == 22 || port == 27042 || port == 27043 || port == 23946 ||
+                         port == 8090 || port == 1234 || port == 4444 || port == 8080 ||
+                         port == 8888 || port == 9090)) {
             atomic_fetch_add(&g_cnt_port_cloak, 1);
             errno = ECONNREFUSED;
             return -1;
@@ -1012,8 +1098,11 @@ static void mcp_stealth_apply_hooks_to_image(const struct mach_header *hdr, intp
         {"dladdr", (void *)hook_dladdr, (void **)&orig_dladdr},
         {"ptrace", (void *)hook_ptrace, (void **)&orig_ptrace},
         {"sysctl", (void *)hook_sysctl, (void **)&orig_sysctl},
+        {"csops", (void *)hook_csops, (void **)&orig_csops},
         {"getppid", (void *)hook_getppid, (void **)&orig_getppid},
         {"isatty", (void *)hook_isatty, (void **)&orig_isatty},
+        {"getifaddrs", (void *)hook_getifaddrs, (void **)&orig_getifaddrs},
+        {"CFNetworkCopySystemProxySettings", (void *)hook_CFNetworkCopySystemProxySettings, (void **)&orig_CFNetworkCopySystemProxySettings},
         {"task_get_exception_ports", (void *)hook_task_get_exception_ports, (void **)&orig_task_get_exception_ports},
         {"thread_get_exception_ports", (void *)hook_thread_get_exception_ports, (void **)&orig_thread_get_exception_ports},
         {"stat", (void *)hook_stat, (void **)&orig_stat},
@@ -1047,8 +1136,27 @@ static void mcp_stealth_init(void) {
         orig_dladdr = (typeof(orig_dladdr))dlsym(RTLD_DEFAULT, "dladdr");
         orig_ptrace = (typeof(orig_ptrace))dlsym(RTLD_DEFAULT, "ptrace");
         orig_sysctl = (typeof(orig_sysctl))dlsym(RTLD_DEFAULT, "sysctl");
+        orig_csops = (typeof(orig_csops))dlsym(RTLD_DEFAULT, "csops");
         orig_getppid = (typeof(orig_getppid))dlsym(RTLD_DEFAULT, "getppid");
         orig_isatty = (typeof(orig_isatty))dlsym(RTLD_DEFAULT, "isatty");
+        orig_getifaddrs = (typeof(orig_getifaddrs))dlsym(RTLD_DEFAULT, "getifaddrs");
+        orig_CFNetworkCopySystemProxySettings = (typeof(orig_CFNetworkCopySystemProxySettings))dlsym(RTLD_DEFAULT, "CFNetworkCopySystemProxySettings");
+
+        NSString *personaPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@".mcp_persona.json"];
+        NSData *pData = [NSData dataWithContentsOfFile:personaPath];
+        if (!pData) {
+            NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+            if (bid.length) {
+                pData = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"/var/mobile/Library/ios-mcp/spoof/%@.json", bid]];
+            }
+        }
+        if (pData) {
+            NSDictionary *pDict = [NSJSONSerialization JSONObjectWithData:pData options:0 error:NULL];
+            if ([pDict isKindOfClass:NSDictionary.class]) {
+                if (pDict[@"birthtime_jitter_nsec"]) g_birthtime_jitter_nsec = [pDict[@"birthtime_jitter_nsec"] longLongValue];
+                if (pDict[@"birthtime_jitter_sec"]) g_birthtime_jitter_sec = [pDict[@"birthtime_jitter_sec"] longLongValue];
+            }
+        }
         orig_task_get_exception_ports = (typeof(orig_task_get_exception_ports))dlsym(RTLD_DEFAULT, "task_get_exception_ports");
         orig_thread_get_exception_ports = (typeof(orig_thread_get_exception_ports))dlsym(RTLD_DEFAULT, "thread_get_exception_ports");
         orig_stat = (typeof(orig_stat))dlsym(RTLD_DEFAULT, "stat");

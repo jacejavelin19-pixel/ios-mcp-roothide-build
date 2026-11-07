@@ -158,4 +158,12 @@
                                       args:(NSDictionary *)args
                                      error:(NSString **)error;
 
+/// Phase 4: Anti-Fraud / Anti-Bot / Persona / Syscall Shield RPC wrapper
+/// Transparently applies any returned top-level or nested pending_slots via
+/// out-of-process mach_vm_protect + mach_vm_write.
+- (NSDictionary *)sendAntiFraudOp:(NSString *)op
+                      forBundleId:(NSString *)bundleId
+                             args:(NSDictionary *)args
+                            error:(NSString **)error;
+
 @end

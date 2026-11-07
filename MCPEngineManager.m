@@ -550,4 +550,29 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     return [self sendOp:@"engine.replay_request" forBundleId:bundleId args:(args ?: @{}) timeoutMs:30000 error:error];
 }
 
+- (NSDictionary *)sendAntiFraudOp:(NSString *)op forBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    NSDictionary *res = [self sendOp:op forBundleId:bundleId args:(args ?: @{}) timeoutMs:20000 error:error];
+    if (!res) return nil;
+    NSMutableArray *allPending = [NSMutableArray array];
+    if ([res[@"pending_slots"] isKindOfClass:[NSArray class]]) {
+        [allPending addObjectsFromArray:res[@"pending_slots"]];
+    }
+    for (NSString *k in res) {
+        id sub = res[k];
+        if ([sub isKindOfClass:[NSDictionary class]] && [sub[@"pending_slots"] isKindOfClass:[NSArray class]]) {
+            [allPending addObjectsFromArray:sub[@"pending_slots"]];
+        }
+    }
+    if (allPending.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:allPending error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"patched_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_result"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
+}
+
 @end
