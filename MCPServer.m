@@ -6099,7 +6099,7 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         }
         if (targetPid == getpid()) {
             NSString *inErr = nil;
-            NSDictionary *inRes = [[MemoryManager sharedInstance] searchPID:targetPid start:address end:end pattern:data error:&inErr];
+            NSDictionary *inRes = [[MemoryManager sharedInstance] searchPID:targetPid data:data start:address end:end error:&inErr];
             if (inRes) return [self mcpSuccess:reqId structuredContent:inRes];
         }
         [helperArgs addObjectsFromArray:@[@"search", pidText, addressText, endText, encoded]];
