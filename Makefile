@@ -15,7 +15,7 @@ BUNDLE_NAME = iosmcpprefs
 
 ios-mcp_FILES = Tweak.x MCPServer.m MCPLogger.m HIDManager.m ScreenManager.m ClipboardManager.m AppManager.m AccessibilityManager.m TextInputManager.m FileSystemManager.m LogManager.m OCRManager.m MCPProcessUtil.m MCPAXQueryContext.m MCPAXRemoteContextResolver.m MCPUIElementSerializer.m MCPUIElementsFacade.m MCPAXAttributeBridge.m MCPAXNodeSource.m
 ios-mcp_FILES += VisionOCREngine.m PaddleOCRManager.m MCPOCRRequestContext.m PlistPatchManager.m MemoryManager.m
-ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m MCPEngineManager.m AppStoreManager.m
+ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m MCPEngineManager.m AppStoreManager.m BinaryInspector.m
 ios-mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations -Wno-trigraphs
 ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Vision
 ios-mcp_LIBRARIES = sqlite3

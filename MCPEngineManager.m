@@ -480,5 +480,14 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
 - (NSDictionary *)searchMemoryForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
     return [self sendOp:@"engine.search_mem" forBundleId:bundleId args:args timeoutMs:30000 error:error];
 }
+- (NSDictionary *)hardwareBreakpointForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.hw_breakpoint" forBundleId:bundleId args:(args ?: @{}) timeoutMs:15000 error:error];
+}
+- (NSDictionary *)decompileForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.decompile" forBundleId:bundleId args:(args ?: @{}) timeoutMs:15000 error:error];
+}
+- (NSDictionary *)evalJSForBundleId:(NSString *)bundleId script:(NSString *)script error:(NSString **)error {
+    return [self sendOp:@"engine.eval_js" forBundleId:bundleId args:@{@"script": script ?: @""} timeoutMs:15000 error:error];
+}
 
 @end

@@ -10,5 +10,8 @@
 - (NSDictionary *)searchPID:(pid_t)pid data:(NSData *)data start:(uint64_t)start end:(uint64_t)end error:(NSString **)error;
 - (NSDictionary *)listRegionsPID:(pid_t)pid limit:(NSUInteger)limit error:(NSString **)error;
 - (NSDictionary *)dumpClassesPID:(pid_t)pid filter:(NSString *)filter limit:(NSUInteger)limit includeSystem:(BOOL)includeSystem error:(NSString **)error;
+- (NSDictionary *)decryptAppIPAForPID:(pid_t)pid bundlePath:(NSString *)bundlePath outputPath:(NSString *)outputPath error:(NSString **)error;
+- (NSDictionary *)hardwareBreakpointPID:(pid_t)pid action:(NSString *)action slot:(int)slot address:(uint64_t)address redirectAddress:(uint64_t)redirectAddress durationMs:(int)durationMs error:(NSString **)error;
+- (NSDictionary *)extractDyldSharedCacheImagePID:(pid_t)pid imageName:(NSString *)imageName outputPath:(NSString *)outputPath error:(NSString **)error;
 
 @end

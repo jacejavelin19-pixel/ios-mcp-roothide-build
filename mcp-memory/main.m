@@ -20,8 +20,37 @@ int main(int argc, const char *argv[]) {
         NSDictionary *result = nil;
         uint64_t pid = 0, address = 0, amount = 0;
 
-        if (argc < 3 || !parseUnsigned(argv[2], &pid) || pid == 0 || pid > INT32_MAX) {
+        BOOL isExtractDSC = (argc >= 2 && strcmp(argv[1], "extract-dsc") == 0);
+        if (argc < 3 || !parseUnsigned(argv[2], &pid) || (!isExtractDSC && pid == 0) || pid > INT32_MAX) {
             failure = @"invalid pid or missing operation";
+        } else if (strcmp(argv[1], "decrypt-ipa") == 0 && argc >= 4) {
+            NSString *bundlePath = [NSString stringWithUTF8String:argv[3]];
+            NSString *outputPath = (argc >= 5 && argv[4][0] != '\0') ? [NSString stringWithUTF8String:argv[4]] : nil;
+            result = [[MemoryManager sharedInstance] decryptAppIPAForPID:(pid_t)pid
+                                                              bundlePath:bundlePath
+                                                              outputPath:outputPath
+                                                                   error:&failure];
+        } else if (strcmp(argv[1], "hw-breakpoint") == 0 && argc >= 4) {
+            NSString *action = [NSString stringWithUTF8String:argv[3]];
+            int slot = (argc >= 5) ? atoi(argv[4]) : -1;
+            uint64_t bpAddr = 0, redirectAddr = 0, durationMs = 0;
+            if (argc >= 6 && argv[5][0] != '\0') parseUnsigned(argv[5], &bpAddr);
+            if (argc >= 7 && argv[6][0] != '\0') parseUnsigned(argv[6], &redirectAddr);
+            if (argc >= 8 && argv[7][0] != '\0') parseUnsigned(argv[7], &durationMs);
+            result = [[MemoryManager sharedInstance] hardwareBreakpointPID:(pid_t)pid
+                                                                    action:action
+                                                                      slot:slot
+                                                                   address:bpAddr
+                                                           redirectAddress:redirectAddr
+                                                                durationMs:(int)durationMs
+                                                                     error:&failure];
+        } else if (isExtractDSC && argc >= 4) {
+            NSString *imageName = [NSString stringWithUTF8String:argv[3]];
+            NSString *outputPath = (argc >= 5 && argv[4][0] != '\0') ? [NSString stringWithUTF8String:argv[4]] : nil;
+            result = [[MemoryManager sharedInstance] extractDyldSharedCacheImagePID:(pid_t)pid
+                                                                          imageName:imageName
+                                                                         outputPath:outputPath
+                                                                              error:&failure];
         } else if (strcmp(argv[1], "regions") == 0) {
             uint64_t limit = 256;
             if (argc >= 4 && !parseUnsigned(argv[3], &limit)) {

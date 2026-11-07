@@ -21,6 +21,7 @@
 #import "FridaManager.h"
 #import "MCPEngineManager.h"
 #import "AppStoreManager.h"
+#import "BinaryInspector.h"
 #import "SQLiteQueryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
@@ -588,7 +589,16 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"appstore_search_and_versions",
             @"appstore_install",
             @"appstore_downgrade",
-            @"appstore_auto_rollback_diff"
+            @"appstore_auto_rollback_diff",
+            @"decrypt_app_ipa",
+            @"decompile_function",
+            @"decompile_objc_method",
+            @"find_xrefs_to",
+            @"hardware_breakpoint_hook",
+            @"dump_swift_metadata",
+            @"extract_dyld_shared_cache",
+            @"inspect_hermes_flutter",
+            @"engine_eval_js"
         ];
     });
     return tools;
@@ -3320,6 +3330,139 @@ static NSString *MCPLogId(id reqId) {
                     @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds for version download/downgrade (default 150)."}
                 }
             }
+        },
+        // ═══════════════════════════════════════════════════════════════════
+        // Phase 2: Binary Decryption, Decompilation, Swift/DSC & Hybrid RE
+        // ═══════════════════════════════════════════════════════════════════
+        @{
+            @"name": @"decrypt_app_ipa",
+            @"description": @"Zero-injection out-of-process FairPlay decryptor & clean .ipa packager. Attaches via task_for_pid (zero dylib injection), reads decrypted __TEXT pages from live memory via mach_vm_read_overwrite for the main binary and loaded Frameworks, patches cryptid=0 in LC_ENCRYPTION_INFO_64, re-signs ad-hoc with mcp-ldid preserving entitlements, and packages a clean .ipa.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target application bundle identifier (e.g. 'com.example.app')."},
+                    @"pid": @{@"type": @"number", @"description": @"Optional running PID if bundle_id is omitted."},
+                    @"bundle_path": @{@"type": @"string", @"description": @"Optional path to the .app bundle if bundle_id is omitted."},
+                    @"output_path": @{@"type": @"string", @"description": @"Optional output path for the decrypted .ipa archive (defaults to /tmp/<bundle_id>-decrypted.ipa)."},
+                    @"auto_launch": @{@"type": @"boolean", @"description": @"Automatically launch the app if not running so the kernel maps decrypted FairPlay pages (default true)."}
+                }
+            }
+        },
+        @{
+            @"name": @"decompile_function",
+            @"description": @"On-device ARM64/ARM64e disassembler, PAC stripper, CFG builder, and Pseudo-C decompiler. Decodes instructions from a Mach-O binary or live process memory, strips PAC (pacibsp/autibsp/retaa/blraa), resolves ADRP+ADD/LDR PC-relative ObjC selectors, classes, CFStrings, and iOS 16+ objc_msgSend$selector stubs, and lifts basic blocks into structured Pseudo-C.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Path to Mach-O binary on disk (optional if bundle_id provided)."},
+                    @"address": @{@"type": @"string", @"description": @"Hex virtual address or file offset of the function to decompile (e.g. '0x100004a20')."},
+                    @"symbol": @{@"type": @"string", @"description": @"Symbol name to resolve and decompile if address is omitted."},
+                    @"max_instructions": @{@"type": @"number", @"description": @"Maximum instructions to decode (default 128, max 1024)."},
+                    @"use_engine": @{@"type": @"boolean", @"description": @"Use in-process libmcpengine decompiler if an engine session is active."}
+                }
+            }
+        },
+        @{
+            @"name": @"decompile_objc_method",
+            @"description": @"Resolve an Objective-C method IMP (from Mach-O __objc_classlist relative/direct method lists or live remote task_for_pid class dump) and decompile its ARM64e instructions into annotated disassembly and structured Pseudo-C.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Optional path to Mach-O binary on disk."},
+                    @"class_name": @{@"type": @"string", @"description": @"Objective-C class name (e.g. 'AuthManager')."},
+                    @"selector": @{@"type": @"string", @"description": @"Objective-C selector name (e.g. 'verifySignature:error:')."},
+                    @"max_instructions": @{@"type": @"number", @"description": @"Maximum instructions to decode (default 128, max 1024)."},
+                    @"use_engine": @{@"type": @"boolean", @"description": @"Use in-process libmcpengine decompiler if an engine session is active."}
+                },
+                @"required": @[@"class_name", @"selector"]
+            }
+        },
+        @{
+            @"name": @"find_xrefs_to",
+            @"description": @"Scan __TEXT,__text of a Mach-O binary for all cross-references (BL, B, ADR, ADRP+ADD, ADRP+LDR) targeting a virtual address, Objective-C selector, C/CFString literal, or symbol, resolving the containing function/method for every hit.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Path to Mach-O binary on disk."},
+                    @"address": @{@"type": @"string", @"description": @"Target virtual address in hex (e.g. '0x100008000')."},
+                    @"selector": @{@"type": @"string", @"description": @"Objective-C selector name to find xrefs to (matches __objc_selrefs and __objc_stubs)."},
+                    @"string": @{@"type": @"string", @"description": @"Substring in __cstring or __cfstring to find code references to."},
+                    @"symbol": @{@"type": @"string", @"description": @"Symbol name to find callers/references to."},
+                    @"limit": @{@"type": @"number", @"description": @"Maximum xrefs to return (default 200, max 2000)."}
+                }
+            }
+        },
+        @{
+            @"name": @"hardware_breakpoint_hook",
+            @"description": @"Zero-memory-patch ARM64 hardware debug register (DBGBVR0..15 / DBGBCR0..15) hook. Programs ARM_DEBUG_STATE64 across target threads and catches EXC_BREAKPOINT via Mach exception ports to log registers, single-step via MDSCR_EL1.SS, override x0 return value, or redirect PC without modifying a single byte in __TEXT or __DATA_CONST.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target running app bundle ID."},
+                    @"pid": @{@"type": @"number", @"description": @"Target running process PID (optional if bundle_id provided)."},
+                    @"action": @{@"type": @"string", @"description": @"Operation: 'set' ('install'), 'clear' ('remove'), 'list' ('status'), or 'events' (default 'set')."},
+                    @"slot": @{@"type": @"number", @"description": @"Hardware breakpoint slot 0..15 (default -1 to auto-select free slot)."},
+                    @"address": @{@"type": @"string", @"description": @"Target instruction virtual address in hex (e.g. '0x104008120')."},
+                    @"symbol": @{@"type": @"string", @"description": @"Optional symbol name when using in-process engine hardware breakpoints."},
+                    @"redirect_address": @{@"type": @"string", @"description": @"Optional replacement PC address in hex when breakpoint triggers."},
+                    @"override_return": @{@"type": @"string", @"description": @"Optional x0 return value override (in-process engine mode returns immediately to LR with x0 set)."},
+                    @"duration_ms": @{@"type": @"number", @"description": @"Optional synchronous out-of-process Mach exception capture window in ms (0..15000)."},
+                    @"use_engine": @{@"type": @"boolean", @"description": @"Prefer in-process libmcpengine Mach exception server when injected (default true)."}
+                }
+            }
+        },
+        @{
+            @"name": @"dump_swift_metadata",
+            @"description": @"Full Swift 5 reflection, type reconstruction, and protocol conformance mapper. Parses __swift5_types, __swift5_fieldmd, __swift5_reflstr, __swift5_typeref, __swift5_protos, and __swift5_proto relative pointers to reconstruct Swift classes, structs, enums, field names/types, and witness tables.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Path to Mach-O binary on disk."},
+                    @"filter": @{@"type": @"string", @"description": @"Optional case-insensitive substring filter for Swift type names."},
+                    @"limit": @{@"type": @"number", @"description": @"Maximum types to return (default 500, max 5000)."}
+                }
+            }
+        },
+        @{
+            @"name": @"extract_dyld_shared_cache",
+            @"description": @"Live in-memory system framework & private API extractor. Locates any system framework or dylib mapped from dyld_shared_cache, dumps its segments from memory, rebases section offsets, reconstructs a localized LC_SYMTAB symbol table, and writes a standalone Mach-O binary on disk ready for inspect_macho and decompile_function.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"image_name": @{@"type": @"string", @"description": @"System framework or dylib name (e.g. 'UIKitCore', 'Security', 'SpringBoardServices', 'libobjc.A.dylib')."},
+                    @"pid": @{@"type": @"number", @"description": @"Optional PID to extract from (defaults to live dyld_shared_cache mapping)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional running bundle_id to extract from."},
+                    @"output_path": @{@"type": @"string", @"description": @"Optional output file path (defaults to /tmp/<image_name>.extracted.macho)."}
+                },
+                @"required": @[@"image_name"]
+            }
+        },
+        @{
+            @"name": @"inspect_hermes_flutter",
+            @"description": @"React Native Hermes bytecode (HBC magic 0x1F1903C103BC1FC6, version, SHA1, function headers, string table, API URLs) and Flutter (App.framework _kDartVmSnapshotData / _kDartIsolateSnapshotInstructions, Dart SDK features, Object Pool strings & package URIs) inspector.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Optional path to app bundle or binary."}
+                }
+            }
+        },
+        @{
+            @"name": @"engine_eval_js",
+            @"description": @"Evaluate JavaScript inside a running target app via libmcpengine across React Native (RCTBridge / RCTCxxBridge / JSContext), frontmost WKWebView, or JavaScriptCore.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID with an active libmcpengine session."},
+                    @"script": @{@"type": @"string", @"description": @"JavaScript code/expression to evaluate in-process."}
+                },
+                @"required": @[@"bundle_id", @"script"]
+            }
         }
     ];
 
@@ -3553,6 +3696,22 @@ static NSString *MCPLogId(id reqId) {
         return [self executeAppStoreDowngrade:reqId args:args];
     } else if ([toolName isEqualToString:@"appstore_auto_rollback_diff"]) {
         return [self executeAppStoreAutoRollbackDiff:reqId args:args];
+    } else if ([toolName isEqualToString:@"decrypt_app_ipa"]) {
+        return [self executeDecryptAppIPA:reqId args:args];
+    } else if ([toolName isEqualToString:@"decompile_function"]) {
+        return [self executeDecompileFunction:reqId args:args];
+    } else if ([toolName isEqualToString:@"decompile_objc_method"]) {
+        return [self executeDecompileObjCMethod:reqId args:args];
+    } else if ([toolName isEqualToString:@"find_xrefs_to"]) {
+        return [self executeFindXrefsTo:reqId args:args];
+    } else if ([toolName isEqualToString:@"hardware_breakpoint_hook"]) {
+        return [self executeHardwareBreakpointHook:reqId args:args];
+    } else if ([toolName isEqualToString:@"dump_swift_metadata"]) {
+        return [self executeDumpSwiftMetadata:reqId args:args];
+    } else if ([toolName isEqualToString:@"extract_dyld_shared_cache"]) {
+        return [self executeExtractDyldSharedCache:reqId args:args];
+    } else if ([toolName isEqualToString:@"inspect_hermes_flutter"]) {
+        return [self executeInspectHermesFlutter:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -5799,7 +5958,10 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
                        @"engine_call": @"engine.call",
                        @"engine_read_memory": @"engine.read_mem",
                        @"engine_write_memory": @"engine.write_mem",
-                       @"engine_search_memory": @"engine.search_mem" };
+                       @"engine_search_memory": @"engine.search_mem",
+                       @"engine_eval_js": @"engine.eval_js",
+                       @"engine_hw_breakpoint": @"engine.hw_breakpoint",
+                       @"engine_decompile": @"engine.decompile" };
         });
         NSString *op = opMap[toolName];
         if (!op) return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown engine tool: %@", toolName]];
@@ -6005,6 +6167,64 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     if (!result) {
         return [self mcpSuccess:reqId text:(err ?: @"appstore_auto_rollback_diff failed") isError:YES];
     }
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+#pragma mark - Phase 2: Binary Decryption, Decompilation, Swift/DSC & Hybrid RE Execution
+
+- (NSDictionary *)executeDecryptAppIPA:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] decryptAppIPAForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"decrypt_app_ipa failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDecompileFunction:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] decompileFunctionForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"decompile_function failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDecompileObjCMethod:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] decompileObjCMethodForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"decompile_objc_method failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFindXrefsTo:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] findXrefsForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"find_xrefs_to failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeHardwareBreakpointHook:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] hardwareBreakpointForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"hardware_breakpoint_hook failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDumpSwiftMetadata:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] dumpSwiftMetadataForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"dump_swift_metadata failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeExtractDyldSharedCache:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] extractDyldSharedCacheForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"extract_dyld_shared_cache failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeInspectHermesFlutter:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] inspectHermesFlutterForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"inspect_hermes_flutter failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 

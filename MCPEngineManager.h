@@ -127,4 +127,15 @@
 - (NSDictionary *)pingForBundleId:(NSString *)bundleId
                             error:(NSString **)error;
 
+/// Phase 2: engine.hw_breakpoint / engine.decompile / engine.eval_js
+- (NSDictionary *)hardwareBreakpointForBundleId:(NSString *)bundleId
+                                           args:(NSDictionary *)args
+                                          error:(NSString **)error;
+- (NSDictionary *)decompileForBundleId:(NSString *)bundleId
+                                  args:(NSDictionary *)args
+                                 error:(NSString **)error;
+- (NSDictionary *)evalJSForBundleId:(NSString *)bundleId
+                             script:(NSString *)script
+                              error:(NSString **)error;
+
 @end

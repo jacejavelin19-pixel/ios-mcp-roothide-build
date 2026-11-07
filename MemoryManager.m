@@ -4,11 +4,19 @@
 #import <glob.h>
 #import <libkern/OSByteOrder.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach-o/fat.h>
 #import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <spawn.h>
 #import <stdbool.h>
 #import <stdlib.h>
 #import <string.h>
+#import <sys/stat.h>
+#import <sys/wait.h>
 #import <unistd.h>
+
+extern char **environ;
 
 // The iOS SDK intentionally omits the mach_vm MIG declarations.
 extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_address_t, mach_vm_size_t *);
@@ -848,6 +856,1187 @@ static NSArray<NSDictionary *> *MCPRemoteReadIvarList(mach_port_t task, uint64_t
         @"class_count": @(classes.count),
         @"truncated": @(truncated),
         @"classes": classes
+    };
+}
+
+#pragma mark - Phase 2 Helpers (ZIP, ldid, Chunked Remote Read)
+
+static uint32_t MCPCRC32Compute(const uint8_t *buf, size_t len) {
+    static uint32_t table[256];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) {
+                c = (c & 1) ? (0xEDB88320U ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+    });
+    uint32_t c = 0xFFFFFFFFU;
+    for (size_t i = 0; i < len; i++) {
+        c = table[(c ^ buf[i]) & 0xFFU] ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFFU;
+}
+
+static void MCPAppendU16LE(NSMutableData *d, uint16_t v) {
+    uint16_t le = OSSwapHostToLittleInt16(v);
+    [d appendBytes:&le length:sizeof(le)];
+}
+
+static void MCPAppendU32LE(NSMutableData *d, uint32_t v) {
+    uint32_t le = OSSwapHostToLittleInt32(v);
+    [d appendBytes:&le length:sizeof(le)];
+}
+
+static BOOL MCPPackageDirectoryAsIPA(NSString *rootDir, NSString *outputIPAPath, NSString **error) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:outputIPAPath error:nil];
+    NSString *parentDir = [outputIPAPath stringByDeletingLastPathComponent];
+    if (parentDir.length) {
+        [fm createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    if (![fm createFileAtPath:outputIPAPath contents:nil attributes:nil]) {
+        if (error) *error = [NSString stringWithFormat:@"Could not create output IPA at %@", outputIPAPath];
+        return NO;
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:outputIPAPath];
+    if (!fh) {
+        if (error) *error = [NSString stringWithFormat:@"Could not open output IPA for writing at %@", outputIPAPath];
+        return NO;
+    }
+
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:rootDir];
+    NSMutableData *centralDir = [NSMutableData data];
+    uint16_t entryCount = 0;
+    uint64_t currentOffset = 0;
+
+    for (NSString *relPath in enumerator) {
+        @autoreleasepool {
+            NSString *fullPath = [rootDir stringByAppendingPathComponent:relPath];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:fullPath error:nil];
+            NSString *fileType = attrs[NSFileType];
+            BOOL isDir = [fileType isEqualToString:NSFileTypeDirectory];
+            BOOL isSymlink = [fileType isEqualToString:NSFileTypeSymbolicLink];
+            if (isSymlink) continue;
+
+            NSString *zipName = isDir ? [relPath stringByAppendingString:@"/"] : relPath;
+            NSData *nameData = [zipName dataUsingEncoding:NSUTF8StringEncoding];
+            if (!nameData.length || nameData.length > 0xFFFF) continue;
+
+            NSData *fileData = isDir ? [NSData data] : [NSData dataWithContentsOfFile:fullPath options:NSDataReadingMappedIfSafe error:nil];
+            if (!isDir && !fileData) continue;
+            if (fileData.length > 0xFFFFFFFFULL) continue;
+
+            uint32_t crc = isDir ? 0 : MCPCRC32Compute((const uint8_t *)fileData.bytes, fileData.length);
+            uint32_t uncompSize = (uint32_t)fileData.length;
+            uint32_t localHeaderOffset = (uint32_t)MIN(currentOffset, (uint64_t)0xFFFFFFFFULL);
+            uint32_t posixMode = (uint32_t)[attrs[NSFilePosixPermissions] unsignedShortValue];
+            if (posixMode == 0) posixMode = isDir ? 0755 : 0644;
+            uint32_t extAttr = ((isDir ? 0040000U : 0100000U) | (posixMode & 07777U)) << 16;
+
+            NSMutableData *localHdr = [NSMutableData dataWithCapacity:30 + nameData.length];
+            MCPAppendU32LE(localHdr, 0x04034b50U);
+            MCPAppendU16LE(localHdr, 20);
+            MCPAppendU16LE(localHdr, 0x0800); // UTF-8
+            MCPAppendU16LE(localHdr, 0);      // STORED
+            MCPAppendU16LE(localHdr, 0);
+            MCPAppendU16LE(localHdr, 0x5421);
+            MCPAppendU32LE(localHdr, crc);
+            MCPAppendU32LE(localHdr, uncompSize);
+            MCPAppendU32LE(localHdr, uncompSize);
+            MCPAppendU16LE(localHdr, (uint16_t)nameData.length);
+            MCPAppendU16LE(localHdr, 0);
+            [localHdr appendData:nameData];
+
+            [fh writeData:localHdr];
+            if (uncompSize > 0) {
+                [fh writeData:fileData];
+            }
+            currentOffset += localHdr.length + uncompSize;
+
+            MCPAppendU32LE(centralDir, 0x02014b50U);
+            MCPAppendU16LE(centralDir, 0x031E); // Unix
+            MCPAppendU16LE(centralDir, 20);
+            MCPAppendU16LE(centralDir, 0x0800);
+            MCPAppendU16LE(centralDir, 0);
+            MCPAppendU16LE(centralDir, 0);
+            MCPAppendU16LE(centralDir, 0x5421);
+            MCPAppendU32LE(centralDir, crc);
+            MCPAppendU32LE(centralDir, uncompSize);
+            MCPAppendU32LE(centralDir, uncompSize);
+            MCPAppendU16LE(centralDir, (uint16_t)nameData.length);
+            MCPAppendU16LE(centralDir, 0);
+            MCPAppendU16LE(centralDir, 0);
+            MCPAppendU16LE(centralDir, 0);
+            MCPAppendU16LE(centralDir, 0);
+            MCPAppendU32LE(centralDir, extAttr);
+            MCPAppendU32LE(centralDir, localHeaderOffset);
+            [centralDir appendData:nameData];
+            if (entryCount < 0xFFFF) entryCount++;
+        }
+    }
+
+    uint32_t cdOffset = (uint32_t)MIN(currentOffset, (uint64_t)0xFFFFFFFFULL);
+    uint32_t cdSize = (uint32_t)centralDir.length;
+    [fh writeData:centralDir];
+
+    NSMutableData *eocd = [NSMutableData dataWithCapacity:22];
+    MCPAppendU32LE(eocd, 0x06054b50U);
+    MCPAppendU16LE(eocd, 0);
+    MCPAppendU16LE(eocd, 0);
+    MCPAppendU16LE(eocd, entryCount);
+    MCPAppendU16LE(eocd, entryCount);
+    MCPAppendU32LE(eocd, cdSize);
+    MCPAppendU32LE(eocd, cdOffset);
+    MCPAppendU16LE(eocd, 0);
+    [fh writeData:eocd];
+    [fh closeFile];
+    return YES;
+}
+
+static NSString *MCPFindLdidBinary(void) {
+    NSArray<NSString *> *candidates = @[
+        @"/usr/libexec/ios-mcp/mcp-ldid",
+        @"/var/jb/usr/libexec/ios-mcp/mcp-ldid",
+        @"/usr/bin/ldid",
+        @"/var/jb/usr/bin/ldid"
+    ];
+    for (NSString *cand in candidates) {
+        if (access(cand.UTF8String, X_OK) == 0) return cand;
+    }
+    glob_t g = {0};
+    NSString *found = nil;
+    if (glob("/var/containers/Bundle/Application/.jbroot-*/usr/libexec/ios-mcp/mcp-ldid", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+        if (access(g.gl_pathv[0], X_OK) == 0) {
+            found = [NSString stringWithUTF8String:g.gl_pathv[0]];
+        }
+    }
+    globfree(&g);
+    return found;
+}
+
+static NSData *MCPRunToolStdout(NSString *binPath, NSArray<NSString *> *args, int *outStatus) {
+    if (!binPath.length || access(binPath.UTF8String, X_OK) != 0) return nil;
+    int pipefd[2] = {-1, -1};
+    if (pipe(pipefd) != 0) return nil;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+    size_t argc = args.count + 1;
+    char **argv = (char **)calloc(argc + 1, sizeof(char *));
+    argv[0] = strdup(binPath.UTF8String);
+    for (size_t i = 0; i < args.count; i++) {
+        argv[i + 1] = strdup([args[i] UTF8String]);
+    }
+
+    pid_t child = -1;
+    int rc = posix_spawn(&child, binPath.UTF8String, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipefd[1]);
+    for (size_t i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
+
+    if (rc != 0 || child <= 0) {
+        close(pipefd[0]);
+        return nil;
+    }
+
+    NSMutableData *outData = [NSMutableData data];
+    uint8_t buf[4096];
+    ssize_t n = 0;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        [outData appendBytes:buf length:(NSUInteger)n];
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (outStatus) *outStatus = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return outData;
+}
+
+static BOOL MCPResignMachOWithLdid(NSString *origBinaryPath, NSString *stagedBinaryPath) {
+    NSString *ldid = MCPFindLdidBinary();
+    if (!ldid) return NO;
+
+    int st = -1;
+    NSData *entData = MCPRunToolStdout(ldid, @[@"-e", origBinaryPath], &st);
+    NSString *entTemp = nil;
+    if (st == 0 && entData.length > 16) {
+        entTemp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"mcp_ent_%d_%u.plist", getpid(), arc4random()]];
+        [entData writeToFile:entTemp atomically:YES];
+    }
+
+    NSString *signArg = entTemp ? [NSString stringWithFormat:@"-S%@", entTemp] : @"-S";
+    int signStatus = -1;
+    MCPRunToolStdout(ldid, @[signArg, stagedBinaryPath], &signStatus);
+    if (entTemp) [[NSFileManager defaultManager] removeItemAtPath:entTemp error:nil];
+    return (signStatus == 0);
+}
+
+static BOOL MCPRemoteReadChunked(mach_port_t task, uint64_t addr, void *outBuf, size_t totalLen, uint64_t vaMask, BOOL allowPartialZeroFill) {
+    uint8_t *dst = (uint8_t *)outBuf;
+    size_t offset = 0;
+    while (offset < totalLen) {
+        size_t chunk = MIN((size_t)0x4000, totalLen - offset);
+        uint64_t curAddr = MCPStripRemotePointer(addr + offset, vaMask);
+        mach_vm_size_t outSize = 0;
+        kern_return_t kr = mach_vm_read_overwrite(task,
+                                                  (mach_vm_address_t)curAddr,
+                                                  (mach_vm_size_t)chunk,
+                                                  (mach_vm_address_t)(uintptr_t)(dst + offset),
+                                                  &outSize);
+        if (kr != KERN_SUCCESS || outSize != chunk) {
+            if (!allowPartialZeroFill) return NO;
+            // Try page-by-page (4KB) fallback and zero-fill unmapped holes
+            size_t subOff = 0;
+            while (subOff < chunk) {
+                size_t subChunk = MIN((size_t)0x1000, chunk - subOff);
+                mach_vm_size_t subOut = 0;
+                kern_return_t subKr = mach_vm_read_overwrite(task,
+                                                             (mach_vm_address_t)(curAddr + subOff),
+                                                             (mach_vm_size_t)subChunk,
+                                                             (mach_vm_address_t)(uintptr_t)(dst + offset + subOff),
+                                                             &subOut);
+                if (subKr != KERN_SUCCESS || subOut != subChunk) {
+                    memset(dst + offset + subOff, 0, subChunk);
+                }
+                subOff += subChunk;
+            }
+        }
+        offset += chunk;
+    }
+    return YES;
+}
+
+#pragma mark - Upgrade 01: Zero-Injection Out-of-Process FairPlay Decryptor & Clean IPA Packager
+
+static BOOL MCPParseSliceEncryptionInfo(const uint8_t *sliceBase,
+                                        size_t sliceLen,
+                                        uint32_t *outCpuType,
+                                        uint32_t *outCpuSubType,
+                                        uint32_t *outCryptOff,
+                                        uint32_t *outCryptSize,
+                                        uint32_t *outCryptId,
+                                        size_t *outCryptIdFieldOffset,
+                                        NSString **outUUID) {
+    if (sliceLen < sizeof(struct mach_header_64)) return NO;
+    const struct mach_header_64 *hdr = (const struct mach_header_64 *)sliceBase;
+    if (hdr->magic != MH_MAGIC_64) return NO;
+    if (outCpuType) *outCpuType = hdr->cputype;
+    if (outCpuSubType) *outCpuSubType = hdr->cpusubtype;
+    if (outCryptOff) *outCryptOff = 0;
+    if (outCryptSize) *outCryptSize = 0;
+    if (outCryptId) *outCryptId = 0;
+    if (outCryptIdFieldOffset) *outCryptIdFieldOffset = 0;
+
+    size_t cmdOffset = sizeof(struct mach_header_64);
+    size_t maxCmdOffset = MIN(sliceLen, cmdOffset + hdr->sizeofcmds);
+    for (uint32_t i = 0; i < hdr->ncmds && cmdOffset + sizeof(struct load_command) <= maxCmdOffset; i++) {
+        const struct load_command *lc = (const struct load_command *)(sliceBase + cmdOffset);
+        if (lc->cmdsize < sizeof(struct load_command) || cmdOffset + lc->cmdsize > maxCmdOffset) break;
+        if (lc->cmd == LC_ENCRYPTION_INFO_64 && lc->cmdsize >= sizeof(struct encryption_info_command_64)) {
+            const struct encryption_info_command_64 *enc = (const struct encryption_info_command_64 *)lc;
+            if (outCryptOff) *outCryptOff = enc->cryptoff;
+            if (outCryptSize) *outCryptSize = enc->cryptsize;
+            if (outCryptId) *outCryptId = enc->cryptid;
+            if (outCryptIdFieldOffset) *outCryptIdFieldOffset = cmdOffset + offsetof(struct encryption_info_command_64, cryptid);
+        } else if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command) && outUUID) {
+            const struct uuid_command *uc = (const struct uuid_command *)lc;
+            NSMutableString *u = [NSMutableString stringWithCapacity:36];
+            for (int b = 0; b < 16; b++) [u appendFormat:@"%02x", uc->uuid[b]];
+            *outUUID = u;
+        }
+        cmdOffset += lc->cmdsize;
+    }
+    return YES;
+}
+
+- (NSDictionary *)decryptAppIPAForPID:(pid_t)pid
+                           bundlePath:(NSString *)bundlePath
+                           outputPath:(NSString *)outputPath
+                                error:(NSString **)error {
+    if (error) *error = nil;
+    if (pid <= 0) {
+        if (error) *error = @"Invalid PID for FairPlay decryption";
+        return nil;
+    }
+    if (!bundlePath.length) {
+        if (error) *error = @"Missing bundlePath for FairPlay decryption";
+        return nil;
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:bundlePath isDirectory:&isDir] || !isDir) {
+        if (error) *error = [NSString stringWithFormat:@"Bundle path does not exist: %@", bundlePath];
+        return nil;
+    }
+
+    MCPTryEnsureProcessDebugged(pid);
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
+        if (error) *error = [NSString stringWithFormat:@"task_for_pid(%d) failed: %s (0x%x)", pid, mach_error_string(kr), kr];
+        return nil;
+    }
+
+    uint64_t vaMask = 0x00007fffffffffffULL;
+    NSArray<NSDictionary *> *loadedImages = MCPRemoteEnumerateDyldImages(task, &vaMask);
+    NSMutableDictionary<NSString *, NSNumber *> *loadAddrByPath = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSNumber *> *loadAddrByBasename = [NSMutableDictionary dictionary];
+    for (NSDictionary *img in loadedImages) {
+        NSString *p = img[@"path"];
+        NSNumber *addr = img[@"address"];
+        if (p.length && addr) {
+            loadAddrByPath[p] = addr;
+            loadAddrByPath[p.stringByResolvingSymlinksInPath] = addr;
+            if (p.lastPathComponent.length) {
+                loadAddrByBasename[p.lastPathComponent] = addr;
+            }
+        }
+    }
+
+    NSString *stageRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                           [NSString stringWithFormat:@"ios-mcp-decrypt-%d-%u", pid, arc4random()]];
+    NSString *payloadDir = [stageRoot stringByAppendingPathComponent:@"Payload"];
+    NSString *stagedAppPath = [payloadDir stringByAppendingPathComponent:bundlePath.lastPathComponent];
+    [fm removeItemAtPath:stageRoot error:nil];
+
+    NSError *copyErr = nil;
+    if (![fm createDirectoryAtPath:payloadDir withIntermediateDirectories:YES attributes:nil error:&copyErr] ||
+        ![fm copyItemAtPath:bundlePath toPath:stagedAppPath error:&copyErr]) {
+        mach_port_deallocate(mach_task_self(), task);
+        [fm removeItemAtPath:stageRoot error:nil];
+        if (error) *error = [NSString stringWithFormat:@"Failed to stage app bundle: %@", copyErr.localizedDescription ?: @"copy failed"];
+        return nil;
+    }
+
+    // Remove PlugIns/Watch if non-loaded extensions might fail sideloading or decrypt any that ARE loaded
+    NSMutableArray<NSDictionary *> *decryptedBinaries = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *skippedBinaries = [NSMutableArray array];
+
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:stagedAppPath];
+    for (NSString *relPath in enumerator) {
+        @autoreleasepool {
+            NSString *stagedFile = [stagedAppPath stringByAppendingPathComponent:relPath];
+            NSString *origFile = [bundlePath stringByAppendingPathComponent:relPath];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:stagedFile error:nil];
+            if (![attrs[NSFileType] isEqualToString:NSFileTypeRegular]) continue;
+            if ([attrs[NSFileSize] unsignedLongLongValue] < sizeof(struct mach_header_64)) continue;
+
+            NSFileHandle *checkFh = [NSFileHandle fileHandleForReadingAtPath:stagedFile];
+            NSData *magicData = [checkFh readDataOfLength:4];
+            [checkFh closeFile];
+            if (magicData.length < 4) continue;
+            uint32_t magic = *(const uint32_t *)magicData.bytes;
+            if (magic != MH_MAGIC_64 && magic != FAT_MAGIC && magic != FAT_CIGAM) continue;
+
+            NSMutableData *fileData = [NSMutableData dataWithContentsOfFile:stagedFile];
+            if (!fileData) continue;
+
+            uint8_t *bytes = (uint8_t *)fileData.mutableBytes;
+            size_t totalLen = fileData.length;
+
+            NSMutableArray<NSDictionary *> *slices = [NSMutableArray array];
+            if (magic == MH_MAGIC_64) {
+                [slices addObject:@{@"offset": @0, @"size": @(totalLen)}];
+            } else {
+                const struct fat_header *fhdr = (const struct fat_header *)bytes;
+                uint32_t nfat = OSSwapBigToHostInt32(fhdr->nfat_arch);
+                size_t archOff = sizeof(struct fat_header);
+                for (uint32_t a = 0; a < nfat && archOff + sizeof(struct fat_arch) <= totalLen; a++) {
+                    const struct fat_arch *fa = (const struct fat_arch *)(bytes + archOff);
+                    uint32_t sOff = OSSwapBigToHostInt32(fa->offset);
+                    uint32_t sSize = OSSwapBigToHostInt32(fa->size);
+                    if ((uint64_t)sOff + (uint64_t)sSize <= totalLen) {
+                        [slices addObject:@{@"offset": @(sOff), @"size": @(sSize)}];
+                    }
+                    archOff += sizeof(struct fat_arch);
+                }
+            }
+
+            uint64_t liveLoadAddr = [loadAddrByPath[origFile] unsignedLongLongValue];
+            if (!liveLoadAddr) liveLoadAddr = [loadAddrByPath[origFile.stringByResolvingSymlinksInPath] unsignedLongLongValue];
+            if (!liveLoadAddr) liveLoadAddr = [loadAddrByBasename[origFile.lastPathComponent] unsignedLongLongValue];
+
+            uint32_t liveCpuSubType = 0;
+            if (liveLoadAddr) {
+                struct mach_header_64 liveHdr = {0};
+                if (MCPRemoteReadExact(task, liveLoadAddr, &liveHdr, sizeof(liveHdr), vaMask) && liveHdr.magic == MH_MAGIC_64) {
+                    liveCpuSubType = (uint32_t)liveHdr.cpusubtype;
+                }
+            }
+
+            BOOL binaryModified = NO;
+            BOOL hadEncryptedSlice = NO;
+
+            for (NSDictionary *sliceInfo in slices) {
+                size_t sOff = [sliceInfo[@"offset"] unsignedLongValue];
+                size_t sSize = [sliceInfo[@"size"] unsignedLongValue];
+                uint32_t cpuType = 0, cpuSubType = 0, cryptOff = 0, cryptSize = 0, cryptId = 0;
+                size_t cryptIdFieldOff = 0;
+                NSString *uuid = nil;
+                if (!MCPParseSliceEncryptionInfo(bytes + sOff, sSize, &cpuType, &cpuSubType, &cryptOff, &cryptSize, &cryptId, &cryptIdFieldOff, &uuid)) {
+                    continue;
+                }
+                if (cryptId == 0 || cryptSize == 0) continue;
+                hadEncryptedSlice = YES;
+
+                if (!liveLoadAddr) {
+                    // Dynamically dlopen encrypted framework inside target only if not requested; here zero-injection means we only read loaded images
+                    [skippedBinaries addObject:@{
+                        @"relative_path": relPath,
+                        @"reason": @"encrypted_image_not_loaded_in_process",
+                        @"cryptid": @(cryptId),
+                        @"cryptoff": @(cryptOff),
+                        @"cryptsize": @(cryptSize)
+                    }];
+                    continue;
+                }
+
+                // Check if slice matches live CPU subtype (or single slice)
+                if (slices.count > 1 && liveCpuSubType != 0 && ((cpuSubType & ~CPU_SUBTYPE_MASK) != (liveCpuSubType & ~CPU_SUBTYPE_MASK))) {
+                    continue;
+                }
+                if ((uint64_t)cryptOff + (uint64_t)cryptSize > sSize) continue;
+
+                void *decryptedBuf = malloc(cryptSize);
+                if (!decryptedBuf) continue;
+
+                BOOL readOk = MCPRemoteReadChunked(task, liveLoadAddr + cryptOff, decryptedBuf, cryptSize, vaMask, NO);
+                if (readOk) {
+                    memcpy(bytes + sOff + cryptOff, decryptedBuf, cryptSize);
+                    uint32_t zeroCryptId = 0;
+                    memcpy(bytes + sOff + cryptIdFieldOff, &zeroCryptId, sizeof(zeroCryptId));
+                    binaryModified = YES;
+                    [decryptedBinaries addObject:@{
+                        @"relative_path": relPath,
+                        @"load_address": [NSString stringWithFormat:@"0x%llx", (unsigned long long)liveLoadAddr],
+                        @"cryptoff": @(cryptOff),
+                        @"cryptsize": @(cryptSize),
+                        @"original_cryptid": @(cryptId),
+                        @"patched_cryptid": @0,
+                        @"uuid": uuid ?: @""
+                    }];
+                } else {
+                    [skippedBinaries addObject:@{
+                        @"relative_path": relPath,
+                        @"reason": @"mach_vm_read_overwrite_failed",
+                        @"load_address": [NSString stringWithFormat:@"0x%llx", (unsigned long long)liveLoadAddr]
+                    }];
+                }
+                free(decryptedBuf);
+            }
+
+            if (binaryModified) {
+                [fileData writeToFile:stagedFile atomically:YES];
+                chmod(stagedFile.UTF8String, 0755);
+                MCPResignMachOWithLdid(origFile, stagedFile);
+            } else if (hadEncryptedSlice && [relPath hasPrefix:@"PlugIns/"]) {
+                // Remove unloaded encrypted app extensions so the decrypted main app installs cleanly
+                [fm removeItemAtPath:[stagedAppPath stringByAppendingPathComponent:[relPath stringByDeletingLastPathComponent]] error:nil];
+            }
+        }
+    }
+
+    mach_port_deallocate(mach_task_self(), task);
+
+    // Strip _CodeSignature from unloaded extensions if modified, and re-sign main executable
+    NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:[stagedAppPath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *execName = infoPlist[@"CFBundleExecutable"];
+    if (execName.length) {
+        NSString *origMain = [bundlePath stringByAppendingPathComponent:execName];
+        NSString *stagedMain = [stagedAppPath stringByAppendingPathComponent:execName];
+        MCPResignMachOWithLdid(origMain, stagedMain);
+    }
+
+    if (!outputPath.length) {
+        NSString *bundleId = infoPlist[@"CFBundleIdentifier"] ?: @"decrypted-app";
+        NSString *shortVer = infoPlist[@"CFBundleShortVersionString"] ?: @"1.0";
+        outputPath = [NSString stringWithFormat:@"/tmp/%@-%@-decrypted.ipa", bundleId, shortVer];
+    }
+
+    NSString *zipErr = nil;
+    if (!MCPPackageDirectoryAsIPA(stageRoot, outputPath, &zipErr)) {
+        [fm removeItemAtPath:stageRoot error:nil];
+        if (error) *error = zipErr ?: @"Failed to package decrypted IPA";
+        return nil;
+    }
+
+    NSDictionary *ipaAttrs = [fm attributesOfItemAtPath:outputPath error:nil];
+    uint64_t ipaSize = [ipaAttrs[NSFileSize] unsignedLongLongValue];
+    [fm removeItemAtPath:stageRoot error:nil];
+
+    return @{
+        @"pid": @(pid),
+        @"bundle_path": bundlePath,
+        @"output_ipa_path": outputPath,
+        @"ipa_size_bytes": @(ipaSize),
+        @"decryption_method": @"zero_injection_task_for_pid_mach_vm_read_overwrite",
+        @"decrypted_count": @(decryptedBinaries.count),
+        @"decrypted_binaries": decryptedBinaries,
+        @"skipped_binaries": skippedBinaries
+    };
+}
+
+#pragma mark - Upgrade 03: Zero-Memory-Patch ARM64 Hardware Debug Register (DBGBVR/DBGBCR) Hooking
+
+typedef struct {
+    uint64_t bvr[16];
+    uint64_t bcr[16];
+    uint64_t wvr[16];
+    uint64_t wcr[16];
+    uint64_t mdscr_el1;
+} MCPRawArmDebugState64;
+
+typedef struct {
+    uint64_t x[29];
+    uint64_t fp;
+    uint64_t lr;
+    uint64_t sp;
+    uint64_t pc;
+    uint32_t cpsr;
+    uint32_t pad;
+} MCPRawArmThreadState64;
+
+#ifndef ARM_DEBUG_STATE64
+#define ARM_DEBUG_STATE64 15
+#endif
+#ifndef ARM_DEBUG_STATE64_COUNT
+#define ARM_DEBUG_STATE64_COUNT ((mach_msg_type_number_t)(sizeof(MCPRawArmDebugState64) / sizeof(uint32_t)))
+#endif
+#ifndef ARM_THREAD_STATE64
+#define ARM_THREAD_STATE64 6
+#endif
+#ifndef ARM_THREAD_STATE64_COUNT
+#define ARM_THREAD_STATE64_COUNT ((mach_msg_type_number_t)(sizeof(MCPRawArmThreadState64) / sizeof(uint32_t)))
+#endif
+
+- (NSDictionary *)hardwareBreakpointPID:(pid_t)pid
+                                 action:(NSString *)action
+                                   slot:(int)slot
+                                address:(uint64_t)address
+                        redirectAddress:(uint64_t)redirectAddress
+                             durationMs:(int)durationMs
+                                  error:(NSString **)error {
+    if (error) *error = nil;
+    if (pid <= 0) {
+        if (error) *error = @"Invalid PID";
+        return nil;
+    }
+
+    MCPTryEnsureProcessDebugged(pid);
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
+        if (error) *error = [NSString stringWithFormat:@"task_for_pid(%d) failed: %s (0x%x)", pid, mach_error_string(kr), kr];
+        return nil;
+    }
+
+    uint64_t vaMask = 0x00007fffffffffffULL;
+    MCPRemoteEnumerateDyldImages(task, &vaMask);
+
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t threadCount = 0;
+    kr = task_threads(task, &threads, &threadCount);
+    if (kr != KERN_SUCCESS || threadCount == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        if (error) *error = [NSString stringWithFormat:@"task_threads(%d) failed: %s", pid, mach_error_string(kr)];
+        return nil;
+    }
+
+    NSString *normAction = [action.lowercaseString ?: @"list" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    int chosenSlot = slot;
+    uint64_t cleanAddress = (MCPStripRemotePointer(address, vaMask)) & ~3ULL;
+    uint64_t cleanRedirect = redirectAddress ? (MCPStripRemotePointer(redirectAddress, vaMask) & ~3ULL) : 0;
+
+    // Determine free slot if needed
+    if (([normAction isEqualToString:@"set"] || [normAction isEqualToString:@"install"]) && (chosenSlot < 0 || chosenSlot >= 16)) {
+        MCPRawArmDebugState64 firstDbg;
+        memset(&firstDbg, 0, sizeof(firstDbg));
+        mach_msg_type_number_t cnt = ARM_DEBUG_STATE64_COUNT;
+        if (thread_get_state(threads[0], ARM_DEBUG_STATE64, (thread_state_t)&firstDbg, &cnt) == KERN_SUCCESS) {
+            chosenSlot = 0;
+            for (int s = 0; s < 16; s++) {
+                if ((firstDbg.bcr[s] & 1ULL) == 0 || firstDbg.bvr[s] == cleanAddress) {
+                    chosenSlot = s;
+                    break;
+                }
+            }
+        } else {
+            chosenSlot = 0;
+        }
+    }
+
+    NSUInteger updatedThreads = 0;
+    kern_return_t lastKr = KERN_SUCCESS;
+    NSMutableArray<NSDictionary *> *activeSlots = [NSMutableArray array];
+
+    for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+        MCPRawArmDebugState64 dbg;
+        memset(&dbg, 0, sizeof(dbg));
+        mach_msg_type_number_t cnt = ARM_DEBUG_STATE64_COUNT;
+        kern_return_t gkr = thread_get_state(threads[i], ARM_DEBUG_STATE64, (thread_state_t)&dbg, &cnt);
+        if (gkr != KERN_SUCCESS) {
+            lastKr = gkr;
+            continue;
+        }
+
+        if ([normAction isEqualToString:@"set"] || [normAction isEqualToString:@"install"]) {
+            if (cleanAddress == 0) {
+                for (mach_msg_type_number_t j = 0; j < threadCount; j++) mach_port_deallocate(mach_task_self(), threads[j]);
+                vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_t));
+                mach_port_deallocate(mach_task_self(), task);
+                if (error) *error = @"Hardware breakpoint requires non-zero address";
+                return nil;
+            }
+            dbg.bvr[chosenSlot] = cleanAddress;
+            // DBGBCRn_EL1: E=1 (bit 0), PMC=10b EL0 (bits 2:1 = 0x4), BAS=1111b (bits 8:5 = 0x1E0) => 0x1E5
+            dbg.bcr[chosenSlot] = 0x1E5ULL;
+            kern_return_t skr = thread_set_state(threads[i], ARM_DEBUG_STATE64, (thread_state_t)&dbg, ARM_DEBUG_STATE64_COUNT);
+            if (skr == KERN_SUCCESS) updatedThreads++;
+            else lastKr = skr;
+        } else if ([normAction isEqualToString:@"clear"] || [normAction isEqualToString:@"remove"]) {
+            if (chosenSlot < 0) {
+                for (int s = 0; s < 16; s++) {
+                    dbg.bvr[s] = 0;
+                    dbg.bcr[s] = 0;
+                }
+            } else if (chosenSlot < 16) {
+                dbg.bvr[chosenSlot] = 0;
+                dbg.bcr[chosenSlot] = 0;
+            }
+            dbg.mdscr_el1 &= ~1ULL;
+            kern_return_t skr = thread_set_state(threads[i], ARM_DEBUG_STATE64, (thread_state_t)&dbg, ARM_DEBUG_STATE64_COUNT);
+            if (skr == KERN_SUCCESS) updatedThreads++;
+            else lastKr = skr;
+        } else {
+            updatedThreads++;
+        }
+
+        if (i == 0) {
+            for (int s = 0; s < 16; s++) {
+                if ((dbg.bcr[s] & 1ULL) != 0 || dbg.bvr[s] != 0) {
+                    [activeSlots addObject:@{
+                        @"slot": @(s),
+                        @"type": @"breakpoint",
+                        @"bvr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)dbg.bvr[s]],
+                        @"bcr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)dbg.bcr[s]],
+                        @"enabled": @((dbg.bcr[s] & 1ULL) != 0)
+                    }];
+                }
+                if ((dbg.wcr[s] & 1ULL) != 0 || dbg.wvr[s] != 0) {
+                    [activeSlots addObject:@{
+                        @"slot": @(s),
+                        @"type": @"watchpoint",
+                        @"wvr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)dbg.wvr[s]],
+                        @"wcr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)dbg.wcr[s]],
+                        @"enabled": @((dbg.wcr[s] & 1ULL) != 0)
+                    }];
+                }
+            }
+        }
+    }
+
+    // Optional synchronous Mach exception port monitor if durationMs > 0
+    NSMutableArray<NSDictionary *> *capturedHits = [NSMutableArray array];
+    if (durationMs > 0 && ([normAction isEqualToString:@"set"] || [normAction isEqualToString:@"install"])) {
+        if (durationMs > 15000) durationMs = 15000;
+        mach_port_t excPort = MACH_PORT_NULL;
+        if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort) == KERN_SUCCESS &&
+            mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND) == KERN_SUCCESS) {
+
+            exception_mask_t savedMasks[EXC_TYPES_COUNT];
+            mach_port_t savedPorts[EXC_TYPES_COUNT];
+            exception_behavior_t savedBehaviors[EXC_TYPES_COUNT];
+            thread_state_flavor_t savedFlavors[EXC_TYPES_COUNT];
+            mach_msg_type_number_t savedCount = EXC_TYPES_COUNT;
+
+            task_get_exception_ports(task, EXC_MASK_BREAKPOINT, savedMasks, &savedCount, savedPorts, savedBehaviors, savedFlavors);
+            task_set_exception_ports(task, EXC_MASK_BREAKPOINT, excPort, EXCEPTION_DEFAULT, ARM_THREAD_STATE64);
+
+            CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + ((double)durationMs / 1000.0);
+            while (CFAbsoluteTimeGetCurrent() < deadline) {
+                typedef struct {
+                    mach_msg_header_t Head;
+                    mach_msg_body_t msgh_body;
+                    mach_msg_port_descriptor_t thread;
+                    mach_msg_port_descriptor_t task;
+                    NDR_record_t NDR;
+                    exception_type_t exception;
+                    mach_msg_type_number_t codeCnt;
+                    integer_t code[2];
+                    uint8_t tail[256];
+                } MCPExcRequestMsg;
+
+                typedef struct {
+                    mach_msg_header_t Head;
+                    NDR_record_t NDR;
+                    kern_return_t RetCode;
+                } MCPExcReplyMsg;
+
+                MCPExcRequestMsg req;
+                memset(&req, 0, sizeof(req));
+                double remMs = (deadline - CFAbsoluteTimeGetCurrent()) * 1000.0;
+                if (remMs < 1.0) break;
+                mach_msg_return_t mr = mach_msg(&req.Head,
+                                                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                                0,
+                                                sizeof(req),
+                                                excPort,
+                                                (mach_msg_timeout_t)remMs,
+                                                MACH_PORT_NULL);
+                if (mr != MACH_MSG_SUCCESS) break;
+
+                mach_port_t hitThread = req.thread.name;
+                MCPRawArmThreadState64 ts;
+                memset(&ts, 0, sizeof(ts));
+                mach_msg_type_number_t tsCnt = ARM_THREAD_STATE64_COUNT;
+                if (thread_get_state(hitThread, ARM_THREAD_STATE64, (thread_state_t)&ts, &tsCnt) == KERN_SUCCESS) {
+                    NSMutableDictionary *regs = [NSMutableDictionary dictionaryWithCapacity:34];
+                    for (int r = 0; r < 29; r++) {
+                        regs[[NSString stringWithFormat:@"x%d", r]] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)ts.x[r]];
+                    }
+                    regs[@"fp"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)ts.fp];
+                    regs[@"lr"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)ts.lr];
+                    regs[@"sp"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)ts.sp];
+                    regs[@"pc"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long)ts.pc];
+                    regs[@"cpsr"] = [NSString stringWithFormat:@"0x%x", ts.cpsr];
+
+                    [capturedHits addObject:@{
+                        @"thread_port": @(hitThread),
+                        @"pc": regs[@"pc"],
+                        @"lr": regs[@"lr"],
+                        @"registers": regs,
+                        @"redirected_to": cleanRedirect ? [NSString stringWithFormat:@"0x%llx", (unsigned long long)cleanRedirect] : [NSNull null]
+                    }];
+
+                    if (cleanRedirect) {
+                        ts.pc = cleanRedirect;
+                        thread_set_state(hitThread, ARM_THREAD_STATE64, (thread_state_t)&ts, ARM_THREAD_STATE64_COUNT);
+                    } else {
+                        // Disable breakpoint on this thread or advance past breakpoint so execution continues cleanly
+                        MCPRawArmDebugState64 tdbg;
+                        memset(&tdbg, 0, sizeof(tdbg));
+                        mach_msg_type_number_t dcnt = ARM_DEBUG_STATE64_COUNT;
+                        if (thread_get_state(hitThread, ARM_DEBUG_STATE64, (thread_state_t)&tdbg, &dcnt) == KERN_SUCCESS) {
+                            tdbg.bcr[chosenSlot] = 0;
+                            thread_set_state(hitThread, ARM_DEBUG_STATE64, (thread_state_t)&tdbg, ARM_DEBUG_STATE64_COUNT);
+                        }
+                    }
+                }
+
+                MCPExcReplyMsg reply;
+                memset(&reply, 0, sizeof(reply));
+                reply.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(req.Head.msgh_bits), 0);
+                reply.Head.msgh_size = sizeof(reply);
+                reply.Head.msgh_remote_port = req.Head.msgh_remote_port;
+                reply.Head.msgh_local_port = MACH_PORT_NULL;
+                reply.Head.msgh_id = req.Head.msgh_id + 100;
+                reply.NDR = req.NDR;
+                reply.RetCode = KERN_SUCCESS;
+                mach_msg(&reply.Head, MACH_SEND_MSG, sizeof(reply), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+
+                if (hitThread != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), hitThread);
+                if (req.task.name != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), req.task.name);
+            }
+
+            // Restore original exception ports
+            for (mach_msg_type_number_t m = 0; m < savedCount; m++) {
+                if (savedMasks[m] != 0) {
+                    task_set_exception_ports(task, savedMasks[m], savedPorts[m], savedBehaviors[m], savedFlavors[m]);
+                }
+                if (savedPorts[m] != MACH_PORT_NULL) {
+                    mach_port_deallocate(mach_task_self(), savedPorts[m]);
+                }
+            }
+            mach_port_destroy(mach_task_self(), excPort);
+        }
+    }
+
+    for (mach_msg_type_number_t i = 0; i < threadCount; i++) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof(thread_t));
+    mach_port_deallocate(mach_task_self(), task);
+
+    if (updatedThreads == 0 && threadCount > 0) {
+        if (error) *error = [NSString stringWithFormat:@"thread_get/set_state(ARM_DEBUG_STATE64) failed across all %u threads: %s (0x%x)", threadCount, mach_error_string(lastKr), lastKr];
+        return nil;
+    }
+
+    return @{
+        @"pid": @(pid),
+        @"action": normAction,
+        @"slot": @(chosenSlot),
+        @"address": [NSString stringWithFormat:@"0x%llx", (unsigned long long)cleanAddress],
+        @"redirect_address": cleanRedirect ? [NSString stringWithFormat:@"0x%llx", (unsigned long long)cleanRedirect] : [NSNull null],
+        @"total_threads": @(threadCount),
+        @"updated_threads": @(updatedThreads),
+        @"zero_memory_patch": @YES,
+        @"active_debug_slots": activeSlots,
+        @"captured_hits": capturedHits
+    };
+}
+
+#pragma mark - Upgrade 08: Live In-Memory dyld_shared_cache Framework Extractor
+
+- (NSDictionary *)extractDyldSharedCacheImagePID:(pid_t)pid
+                                       imageName:(NSString *)imageName
+                                      outputPath:(NSString *)outputPath
+                                           error:(NSString **)error {
+    if (error) *error = nil;
+    if (!imageName.length) {
+        if (error) *error = @"Missing imageName to extract from dyld_shared_cache";
+        return nil;
+    }
+
+    pid_t targetPid = (pid > 0) ? pid : getpid();
+    if (targetPid != getpid()) {
+        MCPTryEnsureProcessDebugged(targetPid);
+    }
+
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = (targetPid == getpid()) ? KERN_SUCCESS : task_for_pid(mach_task_self(), targetPid, &task);
+    if (targetPid == getpid() || kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
+        targetPid = getpid();
+        task = mach_task_self();
+    }
+
+    uint64_t vaMask = 0x00007fffffffffffULL;
+    NSArray<NSDictionary *> *images = MCPRemoteEnumerateDyldImages(task, &vaMask);
+
+    uint64_t matchedAddr = 0;
+    NSString *matchedPath = nil;
+    NSString *needle = imageName.lowercaseString;
+
+    for (NSDictionary *img in images) {
+        NSString *p = img[@"path"];
+        if (!p.length) continue;
+        NSString *lower = p.lowercaseString;
+        NSString *base = p.lastPathComponent.lowercaseString;
+        if ([lower isEqualToString:needle] ||
+            [base isEqualToString:needle] ||
+            [base isEqualToString:[needle stringByAppendingString:@".dylib"]] ||
+            [lower hasSuffix:[NSString stringWithFormat:@"/%@.framework/%@", needle, needle]] ||
+            [lower rangeOfString:needle].location != NSNotFound) {
+            matchedAddr = [img[@"address"] unsignedLongLongValue];
+            matchedPath = p;
+            if ([base isEqualToString:needle] || [lower isEqualToString:needle]) break;
+        }
+    }
+
+    // If not yet loaded in target process, load it in our own process via dlopen so dyld maps it from dyld_shared_cache
+    if (!matchedAddr) {
+        if (task != mach_task_self()) {
+            mach_port_deallocate(mach_task_self(), task);
+            task = mach_task_self();
+            targetPid = getpid();
+        }
+        NSArray<NSString *> *dlCandidates = @[
+            imageName,
+            [NSString stringWithFormat:@"/System/Library/Frameworks/%@.framework/%@", imageName, imageName],
+            [NSString stringWithFormat:@"/System/Library/PrivateFrameworks/%@.framework/%@", imageName, imageName],
+            [NSString stringWithFormat:@"/usr/lib/%@", [imageName hasSuffix:@".dylib"] ? imageName : [imageName stringByAppendingString:@".dylib"]],
+            [NSString stringWithFormat:@"/usr/lib/system/%@", [imageName hasSuffix:@".dylib"] ? imageName : [imageName stringByAppendingString:@".dylib"]]
+        ];
+        for (NSString *cand in dlCandidates) {
+            void *h = dlopen(cand.UTF8String, RTLD_LAZY);
+            if (h) break;
+        }
+        uint32_t imgCount = _dyld_image_count();
+        for (uint32_t i = 0; i < imgCount; i++) {
+            const char *cname = _dyld_get_image_name(i);
+            if (!cname) continue;
+            NSString *p = [NSString stringWithUTF8String:cname];
+            NSString *lower = p.lowercaseString;
+            NSString *base = p.lastPathComponent.lowercaseString;
+            if ([lower isEqualToString:needle] ||
+                [base isEqualToString:needle] ||
+                [base isEqualToString:[needle stringByAppendingString:@".dylib"]] ||
+                [lower rangeOfString:needle].location != NSNotFound) {
+                matchedAddr = (uint64_t)(uintptr_t)_dyld_get_image_header(i);
+                matchedPath = p;
+                if ([base isEqualToString:needle] || [lower isEqualToString:needle]) break;
+            }
+        }
+    }
+
+    if (!matchedAddr) {
+        if (task != mach_task_self()) mach_port_deallocate(mach_task_self(), task);
+        if (error) *error = [NSString stringWithFormat:@"Could not find or map '%@' in dyld_shared_cache", imageName];
+        return nil;
+    }
+
+    struct mach_header_64 hdr = {0};
+    if (!MCPRemoteReadExact(task, matchedAddr, &hdr, sizeof(hdr), vaMask) || hdr.magic != MH_MAGIC_64) {
+        if (task != mach_task_self()) mach_port_deallocate(mach_task_self(), task);
+        if (error) *error = [NSString stringWithFormat:@"Invalid Mach-O header at 0x%llx for %@", (unsigned long long)matchedAddr, matchedPath];
+        return nil;
+    }
+
+    size_t headerAndCmdsSize = sizeof(struct mach_header_64) + hdr.sizeofcmds;
+    if (headerAndCmdsSize > 256 * 1024) {
+        if (task != mach_task_self()) mach_port_deallocate(mach_task_self(), task);
+        if (error) *error = @"Mach-O load commands exceed 256 KB safety limit";
+        return nil;
+    }
+
+    NSMutableData *cmdBuf = [NSMutableData dataWithLength:headerAndCmdsSize];
+    if (!MCPRemoteReadExact(task, matchedAddr, cmdBuf.mutableBytes, headerAndCmdsSize, vaMask)) {
+        if (task != mach_task_self()) mach_port_deallocate(mach_task_self(), task);
+        if (error) *error = @"Failed to read Mach-O load commands from memory";
+        return nil;
+    }
+
+    uint8_t *cmdBytes = (uint8_t *)cmdBuf.mutableBytes;
+    struct mach_header_64 *outHdr = (struct mach_header_64 *)cmdBytes;
+    outHdr->flags &= ~0x80000000U; // Clear MH_DYLIB_IN_CACHE
+
+    uint64_t textVMAddr = 0;
+    uint64_t linkeditVMAddr = 0;
+    uint64_t linkeditFileOff = 0;
+    size_t off = sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < hdr.ncmds && off + sizeof(struct load_command) <= headerAndCmdsSize; i++) {
+        struct load_command *lc = (struct load_command *)(cmdBytes + off);
+        if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > headerAndCmdsSize) break;
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, "__TEXT", 16) == 0) {
+                textVMAddr = seg->vmaddr;
+            } else if (strncmp(seg->segname, "__LINKEDIT", 16) == 0) {
+                linkeditVMAddr = seg->vmaddr;
+                linkeditFileOff = seg->fileoff;
+            }
+        }
+        off += lc->cmdsize;
+    }
+
+    int64_t slide = (int64_t)matchedAddr - (int64_t)textVMAddr;
+    NSMutableData *outFileData = [NSMutableData data];
+    NSMutableArray<NSDictionary *> *extractedSegments = [NSMutableArray array];
+    NSUInteger totalSections = 0;
+
+    off = sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < hdr.ncmds && off + sizeof(struct load_command) <= headerAndCmdsSize; i++) {
+        struct load_command *lc = (struct load_command *)(cmdBytes + off);
+        if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > headerAndCmdsSize) break;
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+            char segNameBuf[17] = {0};
+            memcpy(segNameBuf, seg->segname, 16);
+            NSString *segName = [NSString stringWithUTF8String:segNameBuf];
+
+            if ([segName isEqualToString:@"__PAGEZERO"] || seg->vmsize == 0) {
+                off += lc->cmdsize;
+                continue;
+            }
+            if ([segName isEqualToString:@"__LINKEDIT"]) {
+                // Handled after all data/text segments so localized symtab sits cleanly at EOF
+                off += lc->cmdsize;
+                continue;
+            }
+
+            // Align file offset to 16KB page boundary (0 on __TEXT)
+            uint64_t newFileOff = [segName isEqualToString:@"__TEXT"] ? 0 : ((outFileData.length + 0x3FFFULL) & ~0x3FFFULL);
+            if (newFileOff > outFileData.length) {
+                [outFileData increaseLengthBy:(NSUInteger)(newFileOff - outFileData.length)];
+            }
+
+            uint64_t dumpSize = MIN(seg->vmsize, (uint64_t)(128ULL * 1024ULL * 1024ULL));
+            uint64_t alignedSize = (dumpSize + 0x3FFFULL) & ~0x3FFFULL;
+            NSMutableData *segData = [NSMutableData dataWithLength:(NSUInteger)alignedSize];
+            uint64_t runtimeSegAddr = (uint64_t)((int64_t)seg->vmaddr + slide);
+            MCPRemoteReadChunked(task, runtimeSegAddr, segData.mutableBytes, (size_t)dumpSize, vaMask, YES);
+
+            // Update section offsets inside this segment
+            struct section_64 *secs = (struct section_64 *)((uint8_t *)seg + sizeof(struct segment_command_64));
+            uint32_t nsects = seg->nsects;
+            for (uint32_t s = 0; s < nsects; s++) {
+                if ((uint8_t *)&secs[s + 1] > (uint8_t *)seg + seg->cmdsize) break;
+                if (secs[s].addr >= seg->vmaddr && secs[s].addr < seg->vmaddr + dumpSize) {
+                    secs[s].offset = (uint32_t)(newFileOff + (secs[s].addr - seg->vmaddr));
+                }
+                totalSections++;
+            }
+
+            seg->fileoff = newFileOff;
+            seg->filesize = alignedSize;
+            [outFileData appendData:segData];
+
+            [extractedSegments addObject:@{
+                @"name": segName,
+                @"vmaddr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)seg->vmaddr],
+                @"runtime_addr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)runtimeSegAddr],
+                @"fileoff": @(newFileOff),
+                @"filesize": @(alignedSize),
+                @"nsects": @(nsects)
+            }];
+        }
+        off += lc->cmdsize;
+    }
+
+    // Reconstruct compact localized __LINKEDIT with LC_FUNCTION_STARTS and LC_SYMTAB
+    uint64_t newLinkeditFileOff = (outFileData.length + 0x3FFFULL) & ~0x3FFFULL;
+    if (newLinkeditFileOff > outFileData.length) {
+        [outFileData increaseLengthBy:(NSUInteger)(newLinkeditFileOff - outFileData.length)];
+    }
+    NSMutableData *localLinkedit = [NSMutableData data];
+    NSUInteger exportedSymCount = 0;
+
+    off = sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < hdr.ncmds && off + sizeof(struct load_command) <= headerAndCmdsSize; i++) {
+        struct load_command *lc = (struct load_command *)(cmdBytes + off);
+        if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > headerAndCmdsSize) break;
+
+        if (lc->cmd == LC_FUNCTION_STARTS && lc->cmdsize >= sizeof(struct linkedit_data_command) && linkeditVMAddr != 0) {
+            struct linkedit_data_command *ldc = (struct linkedit_data_command *)lc;
+            if (ldc->datasize > 0 && ldc->datasize <= 2 * 1024 * 1024 && ldc->dataoff >= linkeditFileOff) {
+                uint64_t fsRuntimeAddr = (uint64_t)((int64_t)linkeditVMAddr + slide) + (ldc->dataoff - linkeditFileOff);
+                NSMutableData *fsData = [NSMutableData dataWithLength:ldc->datasize];
+                if (MCPRemoteReadChunked(task, fsRuntimeAddr, fsData.mutableBytes, ldc->datasize, vaMask, NO)) {
+                    uint32_t relOff = (uint32_t)localLinkedit.length;
+                    [localLinkedit appendData:fsData];
+                    ldc->dataoff = (uint32_t)(newLinkeditFileOff + relOff);
+                } else {
+                    ldc->dataoff = 0;
+                    ldc->datasize = 0;
+                }
+            } else {
+                ldc->dataoff = 0;
+                ldc->datasize = 0;
+            }
+        } else if (lc->cmd == LC_SYMTAB && lc->cmdsize >= sizeof(struct symtab_command) && linkeditVMAddr != 0) {
+            struct symtab_command *sc = (struct symtab_command *)lc;
+            uint32_t maxSyms = MIN(sc->nsyms, 65536U);
+            if (maxSyms > 0 && sc->symoff >= linkeditFileOff && sc->stroff >= linkeditFileOff) {
+                uint64_t symRuntimeAddr = (uint64_t)((int64_t)linkeditVMAddr + slide) + (sc->symoff - linkeditFileOff);
+                uint64_t strRuntimeAddr = (uint64_t)((int64_t)linkeditVMAddr + slide) + (sc->stroff - linkeditFileOff);
+                size_t symBytesLen = (size_t)maxSyms * sizeof(struct nlist_64);
+                NSMutableData *symData = [NSMutableData dataWithLength:symBytesLen];
+                if (MCPRemoteReadChunked(task, symRuntimeAddr, symData.mutableBytes, symBytesLen, vaMask, YES)) {
+                    struct nlist_64 *nlists = (struct nlist_64 *)symData.mutableBytes;
+                    NSMutableData *newStrTab = [NSMutableData dataWithBytes:"\0" length:1];
+                    for (uint32_t s = 0; s < maxSyms; s++) {
+                        uint32_t origStrx = nlists[s].n_un.n_strx;
+                        if (origStrx > 0 && origStrx < sc->strsize) {
+                            NSString *symName = MCPRemoteReadCString(task, strRuntimeAddr + origStrx, 512, vaMask);
+                            if (symName.length > 0) {
+                                uint32_t newStrx = (uint32_t)newStrTab.length;
+                                const char *utf8 = symName.UTF8String;
+                                [newStrTab appendBytes:utf8 length:strlen(utf8) + 1];
+                                nlists[s].n_un.n_strx = newStrx;
+                                exportedSymCount++;
+                            } else {
+                                nlists[s].n_un.n_strx = 0;
+                            }
+                        } else {
+                            nlists[s].n_un.n_strx = 0;
+                        }
+                    }
+                    // Align localLinkedit to 8 bytes
+                    while (localLinkedit.length & 7) [localLinkedit appendBytes:"\0" length:1];
+                    uint32_t newSymOff = (uint32_t)(newLinkeditFileOff + localLinkedit.length);
+                    [localLinkedit appendData:symData];
+                    uint32_t newStrOff = (uint32_t)(newLinkeditFileOff + localLinkedit.length);
+                    [localLinkedit appendData:newStrTab];
+
+                    sc->symoff = newSymOff;
+                    sc->nsyms = maxSyms;
+                    sc->stroff = newStrOff;
+                    sc->strsize = (uint32_t)newStrTab.length;
+                } else {
+                    sc->symoff = 0;
+                    sc->nsyms = 0;
+                    sc->stroff = 0;
+                    sc->strsize = 0;
+                }
+            }
+        } else if (lc->cmd == LC_DYSYMTAB && lc->cmdsize >= sizeof(struct dysymtab_command)) {
+            struct dysymtab_command *dsc = (struct dysymtab_command *)lc;
+            dsc->tocoff = 0; dsc->ntoc = 0;
+            dsc->modtaboff = 0; dsc->nmodtab = 0;
+            dsc->extrefsymoff = 0; dsc->nextrefsyms = 0;
+            dsc->indirectsymoff = 0; dsc->nindirectsyms = 0;
+            dsc->extreloff = 0; dsc->nextrel = 0;
+            dsc->locreloff = 0; dsc->nlocrel = 0;
+        } else if ((lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY) && lc->cmdsize >= sizeof(struct dyld_info_command)) {
+            struct dyld_info_command *dic = (struct dyld_info_command *)lc;
+            dic->rebase_off = 0; dic->rebase_size = 0;
+            dic->bind_off = 0; dic->bind_size = 0;
+            dic->weak_bind_off = 0; dic->weak_bind_size = 0;
+            dic->lazy_bind_off = 0; dic->lazy_bind_size = 0;
+            dic->export_off = 0; dic->export_size = 0;
+        }
+        off += lc->cmdsize;
+    }
+
+    // Update __LINKEDIT segment command
+    off = sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < hdr.ncmds && off + sizeof(struct load_command) <= headerAndCmdsSize; i++) {
+        struct load_command *lc = (struct load_command *)(cmdBytes + off);
+        if (lc->cmdsize < sizeof(struct load_command) || off + lc->cmdsize > headerAndCmdsSize) break;
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, "__LINKEDIT", 16) == 0) {
+                seg->fileoff = newLinkeditFileOff;
+                seg->filesize = localLinkedit.length;
+                seg->vmsize = (localLinkedit.length + 0x3FFFULL) & ~0x3FFFULL;
+                [extractedSegments addObject:@{
+                    @"name": @"__LINKEDIT",
+                    @"vmaddr": [NSString stringWithFormat:@"0x%llx", (unsigned long long)seg->vmaddr],
+                    @"fileoff": @(newLinkeditFileOff),
+                    @"filesize": @(localLinkedit.length)
+                }];
+                break;
+            }
+        }
+        off += lc->cmdsize;
+    }
+
+    [outFileData appendData:localLinkedit];
+    // Write updated Mach-O header and load commands at offset 0 of __TEXT
+    if (outFileData.length >= headerAndCmdsSize) {
+        [outFileData replaceBytesInRange:NSMakeRange(0, headerAndCmdsSize) withBytes:cmdBuf.bytes];
+    }
+
+    if (task != mach_task_self()) {
+        mach_port_deallocate(mach_task_self(), task);
+    }
+
+    if (!outputPath.length) {
+        NSString *safeBase = matchedPath.lastPathComponent ?: @"extracted_dylib";
+        outputPath = [NSString stringWithFormat:@"/tmp/%@.extracted.macho", safeBase];
+    }
+    NSString *parentDir = [outputPath stringByDeletingLastPathComponent];
+    if (parentDir.length) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    if (![outFileData writeToFile:outputPath atomically:YES]) {
+        if (error) *error = [NSString stringWithFormat:@"Failed to write extracted Mach-O to %@", outputPath];
+        return nil;
+    }
+
+    return @{
+        @"pid": @(targetPid),
+        @"requested_image": imageName,
+        @"resolved_image_path": matchedPath ?: @"",
+        @"load_address": [NSString stringWithFormat:@"0x%llx", (unsigned long long)matchedAddr],
+        @"aslr_slide": [NSString stringWithFormat:@"0x%llx", (unsigned long long)slide],
+        @"output_path": outputPath,
+        @"output_size_bytes": @(outFileData.length),
+        @"segment_count": @(extractedSegments.count),
+        @"section_count": @(totalSections),
+        @"reconstructed_symbols": @(exportedSymCount),
+        @"segments": extractedSegments
     };
 }
 
