@@ -6,6 +6,7 @@
 #import <CFNetwork/CFNetwork.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <CoreMotion/CoreMotion.h>
+#include <objc/message.h>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <errno.h>
@@ -1766,9 +1767,13 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
         SEL sharedSvcSel = NSSelectorFromString(@"sharedService");
         SEL isSuppSel = NSSelectorFromString(@"isSupported");
         if (dcAppAttest && [dcAppAttest respondsToSelector:sharedSvcSel]) {
-            id svc = ((id (*)(id, SEL))objc_msgSend)(dcAppAttest, sharedSvcSel);
-            if ([svc respondsToSelector:isSuppSel]) {
-                supported = ((BOOL (*)(id, SEL))objc_msgSend)(svc, isSuppSel);
+            @try {
+                id svc = [dcAppAttest valueForKey:@"sharedService"];
+                if (svc && [svc respondsToSelector:isSuppSel]) {
+                    supported = [[svc valueForKey:@"isSupported"] boolValue];
+                }
+            } @catch (NSException *ex) {
+                (void)ex;
             }
         }
         NSArray *events = nil;
