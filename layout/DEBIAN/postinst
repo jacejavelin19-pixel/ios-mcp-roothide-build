@@ -33,7 +33,7 @@ fix_perms() {
             chmod 0755 "${base}/usr/bin/${bin}" 2>/dev/null || true
         fi
     done
-    for helper in mcp-memory mcp-keychain mcp-appmod mcp-helperd mcp-ocr-worker; do
+    for helper in mcp-memory mcp-keychain mcp-appmod mcp-appstore mcp-helperd mcp-ocr-worker; do
         if [ -f "${base}/usr/libexec/ios-mcp/${helper}" ]; then
             chown 0:0 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true
             chmod 0755 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true

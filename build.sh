@@ -84,6 +84,7 @@ build_subprojects() {
   (cd mcp-memory && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-keychain && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-appmod && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
+  (cd mcp-appstore && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-helperd && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-root && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")
   (cd mcp-logreader && make "${scheme_env[@]}" clean && make "${scheme_env[@]}")

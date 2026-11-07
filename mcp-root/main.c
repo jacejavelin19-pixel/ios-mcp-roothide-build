@@ -33,6 +33,7 @@ typedef enum {
     MCP_ALLOWED_COMMAND_MEMORY,
     MCP_ALLOWED_COMMAND_KEYCHAIN,
     MCP_ALLOWED_COMMAND_APPMOD,
+    MCP_ALLOWED_COMMAND_APPSTORE,
     MCP_ALLOWED_COMMAND_JBCTL,
 } MCPAllowedCommand;
 
@@ -50,6 +51,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-memory [args...]\n");
     fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-keychain [args...]\n");
     fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-appmod [args...]\n");
+    fprintf(stderr, "  /usr/libexec/ios-mcp/mcp-appstore [args...]\n");
 }
 
 static int is_executable_file(const char *path) {
@@ -513,6 +515,7 @@ static MCPAllowedCommand classify_allowed_command(const char *command_path) {
         {"/usr/libexec/ios-mcp/mcp-memory", MCP_ALLOWED_COMMAND_MEMORY},
         {"/usr/libexec/ios-mcp/mcp-keychain", MCP_ALLOWED_COMMAND_KEYCHAIN},
         {"/usr/libexec/ios-mcp/mcp-appmod", MCP_ALLOWED_COMMAND_APPMOD},
+        {"/usr/libexec/ios-mcp/mcp-appstore", MCP_ALLOWED_COMMAND_APPSTORE},
         {"/usr/bin/jbctl", MCP_ALLOWED_COMMAND_JBCTL},
         {"/basebin/jbctl", MCP_ALLOWED_COMMAND_JBCTL},
     };

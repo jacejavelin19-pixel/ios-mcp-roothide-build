@@ -20,6 +20,7 @@
 #import "IL2CPPManager.h"
 #import "FridaManager.h"
 #import "MCPEngineManager.h"
+#import "AppStoreManager.h"
 #import "SQLiteQueryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
@@ -529,6 +530,7 @@ static NSDictionary *MCPJailbreakInfo(BOOL debug) {
             @"mcpMemory": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-memory"),
             @"mcpKeychain": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-keychain"),
             @"mcpAppMod": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-appmod"),
+            @"mcpAppStore": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-appstore"),
             @"mcpHelperd": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-helperd"),
             @"mcpOcrWorker": MCPHelperExecutableStatus(@"/usr/libexec/ios-mcp/mcp-ocr-worker")
         };
@@ -582,7 +584,11 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_frida_stealth_status",
             @"get_syslog",
             @"get_crash_logs",
-            @"read_crash_log"
+            @"read_crash_log",
+            @"appstore_search_and_versions",
+            @"appstore_install",
+            @"appstore_downgrade",
+            @"appstore_auto_rollback_diff"
         ];
     });
     return tools;
@@ -854,6 +860,10 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeGetSyslog:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeGetCrashLogs:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeReadCrashLog:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAppStoreSearchAndVersions:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAppStoreInstall:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAppStoreDowngrade:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAppStoreAutoRollbackDiff:(id)reqId args:(NSDictionary *)args;
 - (NSString *)jsonTextForObject:(id)object;
 - (NSString *)jsonTextForDictionary:(NSDictionary *)dict;
 - (NSDictionary *)sanitizeFrontmostInfo:(NSDictionary *)info debug:(BOOL)debug;
@@ -3249,6 +3259,67 @@ static NSString *MCPLogId(id reqId) {
                 },
                 @"required": @[@"path"]
             }
+        },
+        // ---- Autonomous App Store Acquisition & MuffinStore Historical Version Downgrading (Upgrades 37-40) ----
+        @{
+            @"name": @"appstore_search_and_versions",
+            @"description": @"Search the iOS App Store by keyword, bundle_id, or adam_id (trackId), resolve bundle_id <-> adamId, and list all historical softwareVersionExternalIdentifiers (appExtVrsId) hosted on Apple's CDN mapped to semantic version numbers (1.0 .. latest) via Apple StoreServices + mineek/MuffinStore version catalog.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"query": @{@"type": @"string", @"description": @"Keyword search query on the App Store (optional if bundle_id or adam_id is provided)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"App bundle identifier (e.g. 'com.charleys.app') to resolve adamId and list all historical versions."},
+                    @"adam_id": @{@"type": @"integer", @"description": @"Numeric App Store trackId / salableAdamId."},
+                    @"country": @{@"type": @"string", @"description": @"Two-letter ISO storefront country code (default 'US')."},
+                    @"limit": @{@"type": @"integer", @"description": @"Maximum search results to return when querying by keyword (default 10, max 50)."},
+                    @"include_versions": @{@"type": @"boolean", @"description": @"Fetch complete appExtVrsId version history catalog (default true)."}
+                }
+            }
+        },
+        @{
+            @"name": @"appstore_install",
+            @"description": @"Zero-UI headless App Store acquisition & installation using StoreServices / AppStoreDaemon and the device's active signed-in Apple ID session. Acquires and installs any free or previously purchased App Store app in the background with zero user prompts.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target App Store bundle identifier (optional if adam_id is provided)."},
+                    @"adam_id": @{@"type": @"integer", @"description": @"Numeric App Store trackId / salableAdamId (optional if bundle_id is provided)."},
+                    @"country": @{@"type": @"string", @"description": @"Storefront country code (default 'US')."},
+                    @"wait_for_install": @{@"type": @"boolean", @"description": @"Block until download and installd registration complete (default true)."},
+                    @"timeout": @{@"type": @"number", @"description": @"Maximum wait timeout in seconds when wait_for_install=true (default 120, max 300)."}
+                }
+            }
+        },
+        @{
+            @"name": @"appstore_downgrade",
+            @"description": @"Direct historical version installer powered by mineek/MuffinStore's buyParameters appExtVrsId injection engine. Forces itunesstored / appstored to download and install any older historical release of an App Store app directly from Apple's CDN with a genuine FairPlay signature while preserving the app's sandbox DataContainer (Documents/Library/tmp).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle identifier (optional if adam_id is provided)."},
+                    @"adam_id": @{@"type": @"integer", @"description": @"Numeric App Store trackId / salableAdamId."},
+                    @"version": @{@"type": @"string", @"description": @"Target semantic version string (e.g. '2.4.1'), 'previous' / 'N-1' for the build immediately prior to the current version, or 'oldest' for the earliest build."},
+                    @"app_ext_vrs_id": @{@"type": @"string", @"description": @"Explicit numeric softwareVersionExternalIdentifier (appExtVrsId) from appstore_search_and_versions."},
+                    @"preserve_data": @{@"type": @"boolean", @"description": @"Snapshot and preserve sandbox DataContainer across downgrade (default true)."},
+                    @"wait_for_install": @{@"type": @"boolean", @"description": @"Wait until the downgraded build finishes installing (default true)."},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds (default 150, max 300)."}
+                }
+            }
+        },
+        @{
+            @"name": @"appstore_auto_rollback_diff",
+            @"description": @"Autonomous version vulnerability hunter & security-hardening diff pipeline: profiles the currently installed (or latest) version of an App Store app, downgrades to a historical version (default 'previous' / N-1) via MuffinStore appExtVrsId injection, and diffs both binaries for newly added anti-fraud/RASP SDKs (Promon, iXGuard, PerimeterX, Akamai BMP, DataDome, ThreatMetrix, Sardine, Forter), inline SVC #0x80 syscalls, linked frameworks, and SSL pinning.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target App Store bundle identifier."},
+                    @"adam_id": @{@"type": @"integer", @"description": @"Optional numeric App Store trackId."},
+                    @"target_version": @{@"type": @"string", @"description": @"Historical version to compare against (default 'previous' / N-1)."},
+                    @"target_ext_vrs_id": @{@"type": @"string", @"description": @"Optional explicit historical appExtVrsId to compare against."},
+                    @"country": @{@"type": @"string", @"description": @"Storefront country code (default 'US')."},
+                    @"timeout": @{@"type": @"number", @"description": @"Timeout in seconds for version download/downgrade (default 150)."}
+                }
+            }
         }
     ];
 
@@ -3474,6 +3545,14 @@ static NSString *MCPLogId(id reqId) {
         return [self executeGetCrashLogs:reqId args:args];
     } else if ([toolName isEqualToString:@"read_crash_log"]) {
         return [self executeReadCrashLog:reqId args:args];
+    } else if ([toolName isEqualToString:@"appstore_search_and_versions"]) {
+        return [self executeAppStoreSearchAndVersions:reqId args:args];
+    } else if ([toolName isEqualToString:@"appstore_install"]) {
+        return [self executeAppStoreInstall:reqId args:args];
+    } else if ([toolName isEqualToString:@"appstore_downgrade"]) {
+        return [self executeAppStoreDowngrade:reqId args:args];
+    } else if ([toolName isEqualToString:@"appstore_auto_rollback_diff"]) {
+        return [self executeAppStoreAutoRollbackDiff:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -5889,6 +5968,42 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSDictionary *result = [[LogManager sharedInstance] crashLogContentAtPath:path error:&err];
     if (!result) {
         return [self mcpSuccess:reqId text:(err ?: @"Failed to read crash log") isError:YES];
+    }
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAppStoreSearchAndVersions:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[AppStoreManager sharedInstance] searchAndVersionsWithArgs:args error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"appstore_search_and_versions failed") isError:YES];
+    }
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAppStoreInstall:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[AppStoreManager sharedInstance] installAppWithArgs:args error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"appstore_install failed") isError:YES];
+    }
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAppStoreDowngrade:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[AppStoreManager sharedInstance] downgradeAppWithArgs:args error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"appstore_downgrade failed") isError:YES];
+    }
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAppStoreAutoRollbackDiff:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[AppStoreManager sharedInstance] autoRollbackAndDiffWithArgs:args error:&err];
+    if (!result) {
+        return [self mcpSuccess:reqId text:(err ?: @"appstore_auto_rollback_diff failed") isError:YES];
     }
     return [self mcpSuccess:reqId structuredContent:result];
 }

@@ -15,7 +15,7 @@ BUNDLE_NAME = iosmcpprefs
 
 ios-mcp_FILES = Tweak.x MCPServer.m MCPLogger.m HIDManager.m ScreenManager.m ClipboardManager.m AppManager.m AccessibilityManager.m TextInputManager.m FileSystemManager.m LogManager.m OCRManager.m MCPProcessUtil.m MCPAXQueryContext.m MCPAXRemoteContextResolver.m MCPUIElementSerializer.m MCPUIElementsFacade.m MCPAXAttributeBridge.m MCPAXNodeSource.m
 ios-mcp_FILES += VisionOCREngine.m PaddleOCRManager.m MCPOCRRequestContext.m PlistPatchManager.m MemoryManager.m
-ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m MCPEngineManager.m
+ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m MCPEngineManager.m AppStoreManager.m
 ios-mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations -Wno-trigraphs
 ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Vision
 ios-mcp_LIBRARIES = sqlite3
@@ -77,6 +77,7 @@ after-stage::
 	$(ECHO_NOTHING)cp mcp-memory/.theos/obj/mcp-memory "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-memory"$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-keychain/.theos/obj/mcp-keychain "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-keychain"$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-appmod/.theos/obj/mcp-appmod "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-appmod"$(ECHO_END)
+	$(ECHO_NOTHING)cp mcp-appstore/.theos/obj/mcp-appstore "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-appstore"$(ECHO_END)
 	$(ECHO_NOTHING)cp mcp-helperd/.theos/obj/mcp-helperd "$(THEOS_STAGING_DIR)/usr/libexec/ios-mcp/mcp-helperd"$(ECHO_END)
 	@# Standalone pure-Apple-SDK companion payload dylibs injected per-app (SSL Kill Switch, Network Capture, Frida Stealth).
 	$(ECHO_NOTHING)cp payloads/sslkillswitch/.theos/obj/libmcp_sslks.dylib "$(THEOS_STAGING_DIR)/usr/lib/ios-mcp/libmcp_sslks.dylib"$(ECHO_END)
