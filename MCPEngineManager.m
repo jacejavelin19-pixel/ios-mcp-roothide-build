@@ -2,6 +2,7 @@
 #import "AppManager.h"
 #import "MCPProcessUtil.h"
 #import <sys/socket.h>
+#import <sys/stat.h>
 #import <sys/un.h>
 #import <poll.h>
 #import <errno.h>

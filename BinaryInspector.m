@@ -13,6 +13,7 @@
 #import <mach-o/nlist.h>
 #import <stdlib.h>
 #import <string.h>
+#import <sys/stat.h>
 
 typedef char *(*mcp_swift_demangle_fn)(const char *mangledName,
                                        size_t mangledNameLength,
