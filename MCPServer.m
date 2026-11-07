@@ -598,7 +598,12 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"dump_swift_metadata",
             @"extract_dyld_shared_cache",
             @"inspect_hermes_flutter",
-            @"engine_eval_js"
+            @"engine_eval_js",
+            @"trace_crypto_primitives",
+            @"get_crypto_events",
+            @"hook_quic_http3",
+            @"decode_protobuf",
+            @"replay_request_native"
         ];
     });
     return tools;
@@ -3463,6 +3468,79 @@ static NSString *MCPLogId(id reqId) {
                 },
                 @"required": @[@"bundle_id", @"script"]
             }
+        },
+        @{
+            @"name": @"trace_crypto_primitives",
+            @"description": @"Automatic CommonCrypto, SecKey (Security.framework), and BoringSSL (EVP_CipherInit_ex / EVP_EncryptUpdate / EVP_DecryptUpdate) key, IV, HMAC secret, PBKDF2 password/salt, and plaintext/ciphertext harvester with symbolicated caller backtraces.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear prior captured crypto events before starting (default true)."},
+                    @"stop": @{@"type": @"boolean", @"description": @"Stop crypto tracing and restore hooked GOT slots."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch the target app to capture startup key derivation and initialization."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"get_crypto_events",
+            @"description": @"Retrieve captured cryptographic operations (AES/3DES/ChaCha20-Poly1305 keys, IVs, HMAC secrets, PBKDF2 salts, SecKey payloads, plaintexts, ciphertexts, and symbolicated caller backtraces) recorded by trace_crypto_primitives.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"limit": @{@"type": @"number", @"description": @"Maximum events to return (default 100, max 2000)."},
+                    @"primitive_filter": @{@"type": @"string", @"description": @"Optional substring filter on primitive name (e.g. 'CCCrypt', 'CCHmac', 'PBKDF', 'SecKey', 'EVP')."},
+                    @"algorithm_filter": @{@"type": @"string", @"description": @"Optional substring filter on algorithm (e.g. 'AES', 'SHA256', 'RSA')."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear captured crypto events after reading."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"hook_quic_http3",
+            @"description": @"Hook Network.framework (nw_connection_send / nw_connection_receive / nw_connection_receive_message) QUIC / HTTP/3 streams and NSURLSessionWebSocketTask (sendMessage / receiveMessage) frames in-process, with automatic schema-less Protobuf & gRPC wire decoding.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear existing capture log before hooking."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch the target app after injecting hooks."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"decode_protobuf",
+            @"description": @"Schema-less Protobuf and gRPC length-prefixed wire format decoder. Recursively decodes varints (with sint64 ZigZag), fixed64/double, fixed32/float, UTF-8 strings, raw byte slices, and nested embedded messages without requiring .proto files.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"data_base64": @{@"type": @"string", @"description": @"Base64-encoded Protobuf or gRPC frame payload."},
+                    @"data_hex": @{@"type": @"string", @"description": @"Hex-encoded Protobuf or gRPC frame payload."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional running app bundle ID to decode in-process."}
+                }
+            }
+        },
+        @{
+            @"name": @"replay_request_native",
+            @"description": @"Replay or send a custom HTTP/HTTPS request directly inside the target app's own process and NSURLSession (CFNetwork + libboringssl.dylib), preserving the app's exact iOS JA3/JA4 TLS ClientHello fingerprint, HTTP/2 SETTINGS frame parameters, TLS session tickets, and cookie jar.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID whose TLS/HTTP2 stack and session will execute the request."},
+                    @"url": @{@"type": @"string", @"description": @"Request URL (http:// or https://)."},
+                    @"method": @{@"type": @"string", @"description": @"HTTP method (GET, POST, PUT, DELETE, PATCH, etc.; default GET)."},
+                    @"headers": @{@"type": @"object", @"description": @"Dictionary of HTTP request headers."},
+                    @"body": @{@"type": @"string", @"description": @"UTF-8 request body string."},
+                    @"body_base64": @{@"type": @"string", @"description": @"Base64-encoded binary request body."},
+                    @"body_json": @{@"type": @"object", @"description": @"JSON object to serialize as the request body."},
+                    @"use_shared_session": @{@"type": @"boolean", @"description": @"Use [NSURLSession sharedSession] to inherit app cookies and credentials (default true)."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Request timeout in milliseconds (default 15000)."}
+                },
+                @"required": @[@"bundle_id", @"url"]
+            }
         }
     ];
 
@@ -3712,6 +3790,16 @@ static NSString *MCPLogId(id reqId) {
         return [self executeExtractDyldSharedCache:reqId args:args];
     } else if ([toolName isEqualToString:@"inspect_hermes_flutter"]) {
         return [self executeInspectHermesFlutter:reqId args:args];
+    } else if ([toolName isEqualToString:@"trace_crypto_primitives"]) {
+        return [self executeTraceCryptoPrimitives:reqId args:args];
+    } else if ([toolName isEqualToString:@"get_crypto_events"]) {
+        return [self executeGetCryptoEvents:reqId args:args];
+    } else if ([toolName isEqualToString:@"hook_quic_http3"]) {
+        return [self executeHookQuicHttp3:reqId args:args];
+    } else if ([toolName isEqualToString:@"decode_protobuf"]) {
+        return [self executeDecodeProtobuf:reqId args:args];
+    } else if ([toolName isEqualToString:@"replay_request_native"]) {
+        return [self executeReplayRequestNative:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -5934,6 +6022,18 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         result = [[MCPEngineManager sharedInstance] getCapturedRequestsForBundleId:bundleId args:args error:&err];
     } else if ([toolName isEqualToString:@"engine_stop_capture"]) {
         result = [[MCPEngineManager sharedInstance] stopCaptureForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_trace_crypto"]) {
+        result = [[MCPEngineManager sharedInstance] traceCryptoForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_get_crypto_events"]) {
+        result = [[MCPEngineManager sharedInstance] getCryptoEventsForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_stop_crypto"]) {
+        result = [[MCPEngineManager sharedInstance] stopCryptoForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_hook_quic_http3"]) {
+        result = [[MCPEngineManager sharedInstance] hookQuicHttp3ForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_decode_protobuf"]) {
+        result = [[MCPEngineManager sharedInstance] decodeProtobufForBundleId:bundleId args:args error:&err];
+    } else if ([toolName isEqualToString:@"engine_replay_request"]) {
+        result = [[MCPEngineManager sharedInstance] replayRequestForBundleId:bundleId args:args error:&err];
     } else {
         // Map the tool name to its engine.* op and forward the args verbatim
         // (the engine validates its own required arguments and ignores bundle_id).
@@ -5961,7 +6061,13 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
                        @"engine_search_memory": @"engine.search_mem",
                        @"engine_eval_js": @"engine.eval_js",
                        @"engine_hw_breakpoint": @"engine.hw_breakpoint",
-                       @"engine_decompile": @"engine.decompile" };
+                       @"engine_decompile": @"engine.decompile",
+                       @"engine_trace_crypto": @"engine.trace_crypto",
+                       @"engine_get_crypto_events": @"engine.get_crypto_events",
+                       @"engine_stop_crypto": @"engine.stop_crypto",
+                       @"engine_hook_quic_http3": @"engine.hook_quic_http3",
+                       @"engine_decode_protobuf": @"engine.decode_protobuf",
+                       @"engine_replay_request": @"engine.replay_request" };
         });
         NSString *op = opMap[toolName];
         if (!op) return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown engine tool: %@", toolName]];
@@ -6225,6 +6331,60 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *err = nil;
     NSDictionary *result = [[BinaryInspector sharedInstance] inspectHermesFlutterForArgs:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"inspect_hermes_flutter failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+#pragma mark - Phase 3: Crypto Tracing, QUIC/HTTP3 Hooks, Protobuf Wire Decoder & Native Replay
+
+- (NSDictionary *)executeTraceCryptoPrimitives:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] traceCryptoPrimitivesForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"trace_crypto_primitives failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeGetCryptoEvents:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] getCryptoEventsForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"get_crypto_events failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeHookQuicHttp3:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] hookQuicHttp3ForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"hook_quic_http3 failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDecodeProtobuf:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] decodeProtobufWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"decode_protobuf failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeReplayRequestNative:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *url = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
+        !MCPStringFromArgs(args, @"url", YES, &url, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] replayRequestNativeForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"replay_request_native failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 

@@ -490,4 +490,64 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     return [self sendOp:@"engine.eval_js" forBundleId:bundleId args:@{@"script": script ?: @""} timeoutMs:15000 error:error];
 }
 
+- (NSDictionary *)traceCryptoForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    NSDictionary *res = [self sendOp:@"engine.trace_crypto" forBundleId:bundleId args:(args ?: @{}) timeoutMs:15000 error:error];
+    if (!res) return nil;
+    NSArray *pending = [res[@"pending_slots"] isKindOfClass:[NSArray class]] ? res[@"pending_slots"] : nil;
+    if (pending.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:pending error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"patched_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_result"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
+}
+
+- (NSDictionary *)getCryptoEventsForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.get_crypto_events" forBundleId:bundleId args:(args ?: @{}) timeoutMs:10000 error:error];
+}
+
+- (NSDictionary *)stopCryptoForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    NSDictionary *res = [self sendOp:@"engine.stop_crypto" forBundleId:bundleId args:(args ?: @{}) timeoutMs:10000 error:error];
+    if (!res) return nil;
+    NSArray *restoreSlots = [res[@"restore_slots"] isKindOfClass:[NSArray class]] ? res[@"restore_slots"] : nil;
+    if (restoreSlots.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:restoreSlots error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"restored_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_restore"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
+}
+
+- (NSDictionary *)hookQuicHttp3ForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    NSDictionary *res = [self sendOp:@"engine.hook_quic_http3" forBundleId:bundleId args:(args ?: @{}) timeoutMs:15000 error:error];
+    if (!res) return nil;
+    NSArray *pending = [res[@"pending_slots"] isKindOfClass:[NSArray class]] ? res[@"pending_slots"] : nil;
+    if (pending.count > 0) {
+        NSString *oopErr = nil;
+        NSDictionary *oopRes = [self applySlotPatchesOutOfProcessForBundleId:bundleId patches:pending error:&oopErr];
+        NSMutableDictionary *merged = [res mutableCopy];
+        merged[@"patched_out_of_proc"] = oopRes[@"patched_count"] ?: @0;
+        if (oopRes) merged[@"out_of_proc_result"] = oopRes;
+        if (oopErr.length) merged[@"out_of_proc_warning"] = oopErr;
+        return merged;
+    }
+    return res;
+}
+
+- (NSDictionary *)decodeProtobufForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.decode_protobuf" forBundleId:bundleId args:(args ?: @{}) timeoutMs:10000 error:error];
+}
+
+- (NSDictionary *)replayRequestForBundleId:(NSString *)bundleId args:(NSDictionary *)args error:(NSString **)error {
+    return [self sendOp:@"engine.replay_request" forBundleId:bundleId args:(args ?: @{}) timeoutMs:30000 error:error];
+}
+
 @end

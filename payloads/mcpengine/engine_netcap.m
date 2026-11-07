@@ -53,6 +53,130 @@ static NSDictionary *MCPCapSanitizeHeaders(NSDictionary *headers) {
     return clean;
 }
 
+static NSArray<NSDictionary *> *MCPCapDecodeProtobufFields(const uint8_t *bytes, size_t len, unsigned depth) {
+    if (!bytes || len == 0 || depth > 5) return nil;
+    size_t pos = 0;
+    // Detect 5-byte gRPC length-prefixed header (0x00 uncompressed flag + 4-byte BE length)
+    if (depth == 0 && len >= 5 && bytes[0] == 0x00) {
+        uint32_t grpcLen = OSSwapBigToHostInt32(*(const uint32_t *)(bytes + 1));
+        if ((size_t)grpcLen + 5 == len && grpcLen > 0) {
+            pos = 5;
+        }
+    }
+
+    NSMutableArray<NSDictionary *> *fields = [NSMutableArray array];
+    while (pos < len && fields.count < 128) {
+        uint64_t tag = 0;
+        unsigned shift = 0;
+        while (pos < len) {
+            uint8_t b = bytes[pos++];
+            tag |= (uint64_t)(b & 0x7FU) << shift;
+            if ((b & 0x80U) == 0) break;
+            shift += 7;
+            if (shift > 63) return nil;
+        }
+        uint32_t fieldNum = (uint32_t)(tag >> 3);
+        uint32_t wireType = (uint32_t)(tag & 0x7U);
+        if (fieldNum == 0 || fieldNum > 536870911U) return nil;
+
+        if (wireType == 0) { // Varint
+            uint64_t val = 0;
+            shift = 0;
+            BOOL ok = NO;
+            while (pos < len) {
+                uint8_t b = bytes[pos++];
+                val |= (uint64_t)(b & 0x7FU) << shift;
+                if ((b & 0x80U) == 0) { ok = YES; break; }
+                shift += 7;
+                if (shift > 63) return nil;
+            }
+            if (!ok) return nil;
+            int64_t sint = (int64_t)((val >> 1) ^ (~(val & 1ULL) + 1ULL));
+            [fields addObject:@{
+                @"field": @(fieldNum),
+                @"wire_type": @"varint",
+                @"uint64": @(val),
+                @"sint64": @(sint)
+            }];
+        } else if (wireType == 1) { // 64-bit
+            if (pos + 8 > len) return nil;
+            uint64_t raw64 = OSSwapLittleToHostInt64(*(const uint64_t *)(bytes + pos));
+            double dbl = 0;
+            memcpy(&dbl, &raw64, sizeof(dbl));
+            pos += 8;
+            [fields addObject:@{
+                @"field": @(fieldNum),
+                @"wire_type": @"fixed64",
+                @"uint64": @(raw64),
+                @"double": isfinite(dbl) ? @(dbl) : [NSNull null]
+            }];
+        } else if (wireType == 2) { // Length-delimited
+            uint64_t subLen = 0;
+            shift = 0;
+            BOOL ok = NO;
+            while (pos < len) {
+                uint8_t b = bytes[pos++];
+                subLen |= (uint64_t)(b & 0x7FU) << shift;
+                if ((b & 0x80U) == 0) { ok = YES; break; }
+                shift += 7;
+                if (shift > 32) return nil;
+            }
+            if (!ok || pos + subLen > len) return nil;
+            const uint8_t *subBytes = bytes + pos;
+            pos += (size_t)subLen;
+
+            BOOL isPrintable = (subLen > 0);
+            for (size_t k = 0; k < subLen; k++) {
+                uint8_t c = subBytes[k];
+                if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') { isPrintable = NO; break; }
+                if (c > 0x7E) { isPrintable = NO; break; }
+            }
+            if (isPrintable) {
+                NSString *s = [[NSString alloc] initWithBytes:subBytes length:(NSUInteger)subLen encoding:NSUTF8StringEncoding];
+                [fields addObject:@{
+                    @"field": @(fieldNum),
+                    @"wire_type": @"string",
+                    @"length": @(subLen),
+                    @"value": s ?: @""
+                }];
+            } else {
+                NSArray<NSDictionary *> *nested = (subLen >= 2) ? MCPCapDecodeProtobufFields(subBytes, (size_t)subLen, depth + 1) : nil;
+                if (nested.count > 0) {
+                    [fields addObject:@{
+                        @"field": @(fieldNum),
+                        @"wire_type": @"nested_message",
+                        @"length": @(subLen),
+                        @"fields": nested
+                    }];
+                } else {
+                    NSData *rawSub = [NSData dataWithBytes:subBytes length:(NSUInteger)MIN(subLen, (uint64_t)512)];
+                    [fields addObject:@{
+                        @"field": @(fieldNum),
+                        @"wire_type": @"bytes",
+                        @"length": @(subLen),
+                        @"base64": [rawSub base64EncodedStringWithOptions:0] ?: @""
+                    }];
+                }
+            }
+        } else if (wireType == 5) { // 32-bit
+            if (pos + 4 > len) return nil;
+            uint32_t raw32 = OSSwapLittleToHostInt32(*(const uint32_t *)(bytes + pos));
+            float flt = 0;
+            memcpy(&flt, &raw32, sizeof(flt));
+            pos += 4;
+            [fields addObject:@{
+                @"field": @(fieldNum),
+                @"wire_type": @"fixed32",
+                @"uint32": @(raw32),
+                @"float": isfinite(flt) ? @(flt) : [NSNull null]
+            }];
+        } else {
+            return nil;
+        }
+    }
+    return (pos == len && fields.count > 0) ? fields : nil;
+}
+
 static NSDictionary *MCPCapEncodeBodyPreview(NSData *data) {
     if (!data || data.length == 0) {
         return @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO};
@@ -68,12 +192,17 @@ static NSDictionary *MCPCapEncodeBodyPreview(NSData *data) {
             @"truncated": @(truncated)
         };
     }
-    return @{
+    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithDictionary:@{
         @"size": @(data.length),
         @"encoding": @"base64",
         @"preview": [slice base64EncodedStringWithOptions:0] ?: @"",
         @"truncated": @(truncated)
-    };
+    }];
+    NSArray<NSDictionary *> *pbFields = MCPCapDecodeProtobufFields((const uint8_t *)slice.bytes, slice.length, 0);
+    if (pbFields.count > 0) {
+        res[@"protobuf_fields"] = pbFields;
+    }
+    return res;
 }
 
 static NSData *MCPCapReadRequestBody(NSURLRequest *request, BOOL allowConsumeStream, NSMutableURLRequest *forwardReq) {
@@ -379,6 +508,112 @@ static void swizzled_cap_taskResume(id self, SEL _cmd) {
     }
 }
 
+static void (*orig_cap_wsSend)(id, SEL, id, void (^)(NSError *)) = NULL;
+static void (*orig_cap_wsReceive)(id, SEL, void (^)(id, NSError *)) = NULL;
+
+static void swizzled_cap_wsSend(id self, SEL _cmd, id message, void (^completionHandler)(NSError *error)) {
+    if (atomic_load(&g_mcpcap_active) && message) {
+        @try {
+            NSURLSessionTask *task = [self isKindOfClass:[NSURLSessionTask class]] ? (NSURLSessionTask *)self : nil;
+            NSURL *u = task.currentRequest.URL ?: task.originalRequest.URL;
+            NSData *payload = nil;
+            if ([message respondsToSelector:@selector(data)]) {
+                payload = [message valueForKey:@"data"];
+            }
+            if (!payload && [message respondsToSelector:@selector(string)]) {
+                NSString *str = [message valueForKey:@"string"];
+                if ([str isKindOfClass:[NSString class]]) {
+                    payload = [str dataUsingEncoding:NSUTF8StringEncoding];
+                }
+            }
+            uint64_t seqId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
+            NSDictionary *record = @{
+                @"id": @(seqId),
+                @"pid": @(getpid()),
+                @"source": @"websocket",
+                @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+                @"duration_ms": @0,
+                @"method": @"WS_SEND",
+                @"url": u.absoluteString ?: @"ws://websocket",
+                @"scheme": u.scheme ?: @"wss",
+                @"host": u.host ?: @"",
+                @"path": u.path ?: @"/",
+                @"request_headers": MCPCapSanitizeHeaders(task.currentRequest.allHTTPHeaderFields),
+                @"request_body": MCPCapEncodeBodyPreview(payload),
+                @"status_code": @101,
+                @"mime_type": @"application/websocket",
+                @"response_headers": @{},
+                @"response_bytes": @0,
+                @"response_body": @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO},
+                @"error": [NSNull null]
+            };
+            MCPCapAppendRecord(record);
+        } @catch (NSException *ex) {
+            (void)ex;
+        }
+    }
+    if (orig_cap_wsSend) {
+        orig_cap_wsSend(self, _cmd, message, completionHandler);
+    }
+}
+
+static void swizzled_cap_wsReceive(id self, SEL _cmd, void (^completionHandler)(id message, NSError *error)) {
+    if (!atomic_load(&g_mcpcap_active) || !completionHandler) {
+        if (orig_cap_wsReceive) orig_cap_wsReceive(self, _cmd, completionHandler);
+        return;
+    }
+    __weak id weakSelf = self;
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    void (^wrapped)(id, NSError *) = ^(id message, NSError *error) {
+        if (atomic_load(&g_mcpcap_active) && (message || error)) {
+            @try {
+                id strongSelf = weakSelf;
+                NSURLSessionTask *task = [strongSelf isKindOfClass:[NSURLSessionTask class]] ? (NSURLSessionTask *)strongSelf : nil;
+                NSURL *u = task.currentRequest.URL ?: task.originalRequest.URL;
+                NSData *payload = nil;
+                if (message && [message respondsToSelector:@selector(data)]) {
+                    payload = [message valueForKey:@"data"];
+                }
+                if (!payload && message && [message respondsToSelector:@selector(string)]) {
+                    NSString *str = [message valueForKey:@"string"];
+                    if ([str isKindOfClass:[NSString class]]) {
+                        payload = [str dataUsingEncoding:NSUTF8StringEncoding];
+                    }
+                }
+                uint64_t seqId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
+                double durationMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0;
+                NSDictionary *record = @{
+                    @"id": @(seqId),
+                    @"pid": @(getpid()),
+                    @"source": @"websocket",
+                    @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+                    @"duration_ms": @(round(durationMs * 100.0) / 100.0),
+                    @"method": @"WS_RECV",
+                    @"url": u.absoluteString ?: @"ws://websocket",
+                    @"scheme": u.scheme ?: @"wss",
+                    @"host": u.host ?: @"",
+                    @"path": u.path ?: @"/",
+                    @"request_headers": @{},
+                    @"request_body": @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO},
+                    @"status_code": @101,
+                    @"mime_type": @"application/websocket",
+                    @"response_headers": @{},
+                    @"response_bytes": @(payload.length),
+                    @"response_body": MCPCapEncodeBodyPreview(payload),
+                    @"error": error ? (error.localizedDescription ?: @"ws error") : [NSNull null]
+                };
+                MCPCapAppendRecord(record);
+            } @catch (NSException *ex) {
+                (void)ex;
+            }
+        }
+        completionHandler(message, error);
+    };
+    if (orig_cap_wsReceive) {
+        orig_cap_wsReceive(self, _cmd, wrapped);
+    }
+}
+
 static void MCPCapInstallObjCHooksOnce(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -413,6 +648,27 @@ static void MCPCapInstallObjCHooksOnce(void) {
                     orig_cap_taskResume = (typeof(orig_cap_taskResume))method_getImplementation(mLocalRes);
                 }
                 method_setImplementation(mLocalRes, (IMP)swizzled_cap_taskResume);
+            }
+        }
+
+        // Hook NSURLSessionWebSocketTask send/receive
+        NSArray<NSString *> *wsClassNames = @[@"NSURLSessionWebSocketTask", @"__NSURLSessionWebSocketTask"];
+        for (NSString *clsName in wsClassNames) {
+            Class wsCls = NSClassFromString(clsName);
+            if (!wsCls) continue;
+            Method mSend = class_getInstanceMethod(wsCls, @selector(sendMessage:completionHandler:));
+            if (mSend && method_getImplementation(mSend) != (IMP)swizzled_cap_wsSend) {
+                if (!orig_cap_wsSend) {
+                    orig_cap_wsSend = (typeof(orig_cap_wsSend))method_getImplementation(mSend);
+                }
+                method_setImplementation(mSend, (IMP)swizzled_cap_wsSend);
+            }
+            Method mRecv = class_getInstanceMethod(wsCls, @selector(receiveMessageWithCompletionHandler:));
+            if (mRecv && method_getImplementation(mRecv) != (IMP)swizzled_cap_wsReceive) {
+                if (!orig_cap_wsReceive) {
+                    orig_cap_wsReceive = (typeof(orig_cap_wsReceive))method_getImplementation(mRecv);
+                }
+                method_setImplementation(mRecv, (IMP)swizzled_cap_wsReceive);
             }
         }
     });
@@ -714,6 +970,273 @@ static void MCPCapInstallTLSHooks(NSMutableArray<NSDictionary *> *allSlots,
     if (outPatchedInProc) *outPatchedInProc = patched;
 }
 
+#pragma mark - Layer 3: Network.framework QUIC / HTTP/3 / nw_connection C hooks
+
+typedef void (*nw_send_completion_block_t)(void *error);
+typedef void (*nw_receive_completion_block_t)(dispatch_data_t content, void *context, bool is_complete, void *error);
+
+static void (*orig_cap_nw_connection_send)(void *connection, dispatch_data_t content, void *context, bool is_complete, nw_send_completion_block_t completion) = NULL;
+static void (*orig_cap_nw_connection_receive)(void *connection, uint32_t minimum_incomplete_length, uint32_t maximum_length, nw_receive_completion_block_t completion) = NULL;
+static void (*orig_cap_nw_connection_receive_message)(void *connection, nw_receive_completion_block_t completion) = NULL;
+static void *(*fn_cap_nw_connection_copy_endpoint)(void *connection) = NULL;
+static const char *(*fn_cap_nw_endpoint_get_hostname)(void *endpoint) = NULL;
+static uint16_t (*fn_cap_nw_endpoint_get_port)(void *endpoint) = NULL;
+
+static NSData *MCPCapDataFromDispatchData(dispatch_data_t ddata) {
+    if (!ddata) return nil;
+    NSMutableData *acc = [NSMutableData data];
+    dispatch_data_apply(ddata, ^bool(dispatch_data_t region, size_t offset, const void *buffer, size_t size) {
+        (void)region;
+        (void)offset;
+        if (buffer && size > 0 && acc.length < kMCPCapBodyPreviewLimit) {
+            size_t toCopy = MIN(size, kMCPCapBodyPreviewLimit - acc.length);
+            [acc appendBytes:buffer length:toCopy];
+        }
+        return acc.length < kMCPCapBodyPreviewLimit;
+    });
+    return acc;
+}
+
+static NSString *MCPCapEndpointHostForNWConnection(void *connection, uint16_t *outPort) {
+    if (outPort) *outPort = 0;
+    if (!connection || !fn_cap_nw_connection_copy_endpoint) return @"";
+    void *ep = fn_cap_nw_connection_copy_endpoint(connection);
+    if (!ep) return @"";
+    NSString *hostStr = @"";
+    if (fn_cap_nw_endpoint_get_hostname) {
+        const char *h = fn_cap_nw_endpoint_get_hostname(ep);
+        if (h && *h) hostStr = @(h);
+    }
+    if (outPort && fn_cap_nw_endpoint_get_port) {
+        *outPort = fn_cap_nw_endpoint_get_port(ep);
+    }
+    return hostStr ?: @"";
+}
+
+static void hook_cap_nw_connection_send(void *connection, dispatch_data_t content, void *context, bool is_complete, nw_send_completion_block_t completion) {
+    if (atomic_load(&g_mcpcap_active) && content && MEDepth == 0) {
+        MEDepth++;
+        @try {
+            NSData *payload = MCPCapDataFromDispatchData(content);
+            if (payload.length > 0) {
+                uint16_t port = 0;
+                NSString *host = MCPCapEndpointHostForNWConnection(connection, &port);
+                NSString *urlStr = host.length
+                    ? (port > 0 ? [NSString stringWithFormat:@"quic://%@:%u/", host, port] : [NSString stringWithFormat:@"quic://%@/", host])
+                    : @"quic://nw_connection/";
+                uint64_t seqId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
+                NSDictionary *record = @{
+                    @"id": @(seqId),
+                    @"pid": @(getpid()),
+                    @"source": @"nw_connection_quic",
+                    @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+                    @"duration_ms": @0,
+                    @"method": @"QUIC_SEND",
+                    @"url": urlStr,
+                    @"scheme": @"quic",
+                    @"host": host ?: @"",
+                    @"path": @"/",
+                    @"request_headers": @{},
+                    @"request_body": MCPCapEncodeBodyPreview(payload),
+                    @"status_code": @200,
+                    @"mime_type": @"application/octet-stream",
+                    @"response_headers": @{},
+                    @"response_bytes": @0,
+                    @"response_body": @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO},
+                    @"error": [NSNull null]
+                };
+                MCPCapAppendRecord(record);
+            }
+        } @catch (NSException *ex) {
+            (void)ex;
+        } @finally {
+            MEDepth--;
+        }
+    }
+    if (orig_cap_nw_connection_send) {
+        orig_cap_nw_connection_send(connection, content, context, is_complete, completion);
+    }
+}
+
+static void hook_cap_nw_connection_receive(void *connection, uint32_t minimum_incomplete_length, uint32_t maximum_length, nw_receive_completion_block_t completion) {
+    if (!atomic_load(&g_mcpcap_active) || !completion) {
+        if (orig_cap_nw_connection_receive) {
+            orig_cap_nw_connection_receive(connection, minimum_incomplete_length, maximum_length, completion);
+        }
+        return;
+    }
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    nw_receive_completion_block_t wrapped = ^(dispatch_data_t content, void *context, bool is_complete, void *error) {
+        if (atomic_load(&g_mcpcap_active) && content && MEDepth == 0) {
+            MEDepth++;
+            @try {
+                NSData *payload = MCPCapDataFromDispatchData(content);
+                if (payload.length > 0) {
+                    uint16_t port = 0;
+                    NSString *host = MCPCapEndpointHostForNWConnection(connection, &port);
+                    NSString *urlStr = host.length
+                        ? (port > 0 ? [NSString stringWithFormat:@"quic://%@:%u/", host, port] : [NSString stringWithFormat:@"quic://%@/", host])
+                        : @"quic://nw_connection/";
+                    uint64_t seqId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
+                    double durationMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0;
+                    NSDictionary *record = @{
+                        @"id": @(seqId),
+                        @"pid": @(getpid()),
+                        @"source": @"nw_connection_quic",
+                        @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+                        @"duration_ms": @(round(durationMs * 100.0) / 100.0),
+                        @"method": @"QUIC_RECV",
+                        @"url": urlStr,
+                        @"scheme": @"quic",
+                        @"host": host ?: @"",
+                        @"path": @"/",
+                        @"request_headers": @{},
+                        @"request_body": @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO},
+                        @"status_code": @200,
+                        @"mime_type": @"application/octet-stream",
+                        @"response_headers": @{},
+                        @"response_bytes": @(payload.length),
+                        @"response_body": MCPCapEncodeBodyPreview(payload),
+                        @"error": [NSNull null]
+                    };
+                    MCPCapAppendRecord(record);
+                }
+            } @catch (NSException *ex) {
+                (void)ex;
+            } @finally {
+                MEDepth--;
+            }
+        }
+        completion(content, context, is_complete, error);
+    };
+    if (orig_cap_nw_connection_receive) {
+        orig_cap_nw_connection_receive(connection, minimum_incomplete_length, maximum_length, wrapped);
+    }
+}
+
+static void hook_cap_nw_connection_receive_message(void *connection, nw_receive_completion_block_t completion) {
+    if (!atomic_load(&g_mcpcap_active) || !completion) {
+        if (orig_cap_nw_connection_receive_message) {
+            orig_cap_nw_connection_receive_message(connection, completion);
+        }
+        return;
+    }
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    nw_receive_completion_block_t wrapped = ^(dispatch_data_t content, void *context, bool is_complete, void *error) {
+        if (atomic_load(&g_mcpcap_active) && content && MEDepth == 0) {
+            MEDepth++;
+            @try {
+                NSData *payload = MCPCapDataFromDispatchData(content);
+                if (payload.length > 0) {
+                    uint16_t port = 0;
+                    NSString *host = MCPCapEndpointHostForNWConnection(connection, &port);
+                    NSString *urlStr = host.length
+                        ? (port > 0 ? [NSString stringWithFormat:@"quic://%@:%u/", host, port] : [NSString stringWithFormat:@"quic://%@/", host])
+                        : @"quic://nw_connection/";
+                    uint64_t seqId = atomic_fetch_add(&g_mcpcap_seq, 1) + 1;
+                    double durationMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0;
+                    NSDictionary *record = @{
+                        @"id": @(seqId),
+                        @"pid": @(getpid()),
+                        @"source": @"nw_connection_quic",
+                        @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+                        @"duration_ms": @(round(durationMs * 100.0) / 100.0),
+                        @"method": @"QUIC_MSG_RECV",
+                        @"url": urlStr,
+                        @"scheme": @"quic",
+                        @"host": host ?: @"",
+                        @"path": @"/",
+                        @"request_headers": @{},
+                        @"request_body": @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO},
+                        @"status_code": @200,
+                        @"mime_type": @"application/octet-stream",
+                        @"response_headers": @{},
+                        @"response_bytes": @(payload.length),
+                        @"response_body": MCPCapEncodeBodyPreview(payload),
+                        @"error": [NSNull null]
+                    };
+                    MCPCapAppendRecord(record);
+                }
+            } @catch (NSException *ex) {
+                (void)ex;
+            } @finally {
+                MEDepth--;
+            }
+        }
+        completion(content, context, is_complete, error);
+    };
+    if (orig_cap_nw_connection_receive_message) {
+        orig_cap_nw_connection_receive_message(connection, wrapped);
+    }
+}
+
+static void MCPCapInstallQuicHooks(NSMutableArray<NSDictionary *> *allSlots,
+                                   NSMutableArray<NSDictionary *> *pendingSlots,
+                                   NSUInteger *outPatchedInProc) {
+    MCPCapInitLock();
+    void *netlib = dlopen("/usr/lib/libnetwork.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    if (!netlib) netlib = dlopen("/usr/lib/libnetwork.dylib", RTLD_LAZY);
+    if (netlib) {
+        if (!orig_cap_nw_connection_send) orig_cap_nw_connection_send = dlsym(netlib, "nw_connection_send");
+        if (!orig_cap_nw_connection_receive) orig_cap_nw_connection_receive = dlsym(netlib, "nw_connection_receive");
+        if (!orig_cap_nw_connection_receive_message) orig_cap_nw_connection_receive_message = dlsym(netlib, "nw_connection_receive_message");
+        if (!fn_cap_nw_connection_copy_endpoint) fn_cap_nw_connection_copy_endpoint = dlsym(netlib, "nw_connection_copy_endpoint");
+        if (!fn_cap_nw_endpoint_get_hostname) fn_cap_nw_endpoint_get_hostname = dlsym(netlib, "nw_endpoint_get_hostname");
+        if (!fn_cap_nw_endpoint_get_port) fn_cap_nw_endpoint_get_port = dlsym(netlib, "nw_endpoint_get_port");
+    }
+    if (!orig_cap_nw_connection_send) orig_cap_nw_connection_send = dlsym(RTLD_DEFAULT, "nw_connection_send");
+    if (!orig_cap_nw_connection_receive) orig_cap_nw_connection_receive = dlsym(RTLD_DEFAULT, "nw_connection_receive");
+    if (!orig_cap_nw_connection_receive_message) orig_cap_nw_connection_receive_message = dlsym(RTLD_DEFAULT, "nw_connection_receive_message");
+    if (!fn_cap_nw_connection_copy_endpoint) fn_cap_nw_connection_copy_endpoint = dlsym(RTLD_DEFAULT, "nw_connection_copy_endpoint");
+    if (!fn_cap_nw_endpoint_get_hostname) fn_cap_nw_endpoint_get_hostname = dlsym(RTLD_DEFAULT, "nw_endpoint_get_hostname");
+    if (!fn_cap_nw_endpoint_get_port) fn_cap_nw_endpoint_get_port = dlsym(RTLD_DEFAULT, "nw_endpoint_get_port");
+
+    struct mcp_rebinding rebindings[] = {
+        {"nw_connection_send", (void *)hook_cap_nw_connection_send, (void **)&orig_cap_nw_connection_send},
+        {"nw_connection_receive", (void *)hook_cap_nw_connection_receive, (void **)&orig_cap_nw_connection_receive},
+        {"nw_connection_receive_message", (void *)hook_cap_nw_connection_receive_message, (void **)&orig_cap_nw_connection_receive_message}
+    };
+
+    NSUInteger patched = 0;
+    uint32_t count = _dyld_image_count();
+    MEDepth++;
+    @try {
+        for (uint32_t i = 0; i < count; i++) {
+            const struct mach_header *hdr = _dyld_get_image_header(i);
+            const char *name = _dyld_get_image_name(i);
+            if (!MCPCapShouldHookImage(hdr, name)) continue;
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            mcp_slot_collector_t collector = {0};
+            mcp_rebind_symbols_image_collect(hdr, slide, MESelfHeader(), rebindings, 3, &collector);
+            NSString *imgName = name ? @(name) : @"";
+            for (size_t k = 0; k < collector.count; k++) {
+                NSDictionary *slotDict = MCPCapSlotPatchToDict(&collector.patches[k], imgName);
+                @synchronized(g_mcpcap_lock) {
+                    BOOL exists = NO;
+                    for (NSUInteger idx = 0; idx < g_mcpcap_bound_slots.count; idx++) {
+                        if ([g_mcpcap_bound_slots[idx][@"slot_address"] isEqualToString:slotDict[@"slot_address"]]) {
+                            g_mcpcap_bound_slots[idx] = slotDict;
+                            exists = YES;
+                            break;
+                        }
+                    }
+                    if (!exists) [g_mcpcap_bound_slots addObject:slotDict];
+                }
+                [allSlots addObject:slotDict];
+                if (collector.patches[k].written_in_proc) {
+                    patched++;
+                } else {
+                    [pendingSlots addObject:slotDict];
+                }
+            }
+            mcp_slot_collector_free(&collector);
+        }
+    } @finally {
+        MEDepth--;
+    }
+    if (outPatchedInProc) *outPatchedInProc = patched;
+}
+
 static NSArray<NSDictionary *> *MCPCapReadRecordsFromFile(NSString *path) {
     if (!path.length) return @[];
     NSData *data = [NSData dataWithContentsOfFile:path];
@@ -754,6 +1277,12 @@ NSDictionary *MENetCap(NSString *op, NSDictionary *a) {
         NSMutableArray<NSDictionary *> *pendingSlots = [NSMutableArray array];
         NSUInteger patchedInProc = 0;
         MCPCapInstallTLSHooks(allSlots, pendingSlots, &patchedInProc);
+        BOOL hookQuic = a[@"hook_quic"] ? [a[@"hook_quic"] boolValue] : YES;
+        if (hookQuic) {
+            NSUInteger quicPatched = 0;
+            MCPCapInstallQuicHooks(allSlots, pendingSlots, &quicPatched);
+            patchedInProc += quicPatched;
+        }
 
         return @{
             @"capturing": @YES,
@@ -763,6 +1292,162 @@ NSDictionary *MENetCap(NSString *op, NSDictionary *a) {
             @"patched_in_proc": @(patchedInProc),
             @"slots": allSlots,
             @"pending_slots": pendingSlots
+        };
+    }
+
+    if ([op isEqualToString:@"engine.hook_quic_http3"]) {
+        BOOL clear = [a[@"clear"] boolValue];
+        if (clear) {
+            unlink(MCPCapPrimaryLogPath().fileSystemRepresentation);
+            unlink(MCPCapLegacyLogPath().fileSystemRepresentation);
+        }
+        int fd1 = open(MCPCapPrimaryLogPath().fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd1 >= 0) close(fd1);
+        int fd2 = open(MCPCapLegacyLogPath().fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd2 >= 0) close(fd2);
+
+        atomic_store(&g_mcpcap_active, 1);
+        MCPCapInstallObjCHooksOnce();
+
+        NSMutableArray<NSDictionary *> *allSlots = [NSMutableArray array];
+        NSMutableArray<NSDictionary *> *pendingSlots = [NSMutableArray array];
+        NSUInteger tlsPatched = 0;
+        NSUInteger quicPatched = 0;
+        MCPCapInstallTLSHooks(allSlots, pendingSlots, &tlsPatched);
+        MCPCapInstallQuicHooks(allSlots, pendingSlots, &quicPatched);
+
+        return @{
+            @"capturing": @YES,
+            @"quic_http3_hooked": @YES,
+            @"websocket_hooked": @YES,
+            @"pid": @(getpid()),
+            @"log_path": MCPCapPrimaryLogPath(),
+            @"patched_in_proc": @(tlsPatched + quicPatched),
+            @"slots": allSlots,
+            @"pending_slots": pendingSlots
+        };
+    }
+
+    if ([op isEqualToString:@"engine.decode_protobuf"]) {
+        NSData *raw = nil;
+        if ([a[@"data_base64"] isKindOfClass:[NSString class]]) {
+            raw = [[NSData alloc] initWithBase64EncodedString:a[@"data_base64"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        } else if ([a[@"data_hex"] isKindOfClass:[NSString class]]) {
+            NSString *hex = [[a[@"data_hex"] stringByReplacingOccurrencesOfString:@" " withString:@""]
+                             stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+            NSMutableData *m = [NSMutableData dataWithCapacity:hex.length / 2];
+            for (NSUInteger i = 0; i + 1 < hex.length; i += 2) {
+                char byteChars[3] = { (char)[hex characterAtIndex:i], (char)[hex characterAtIndex:i + 1], 0 };
+                uint8_t b = (uint8_t)strtoul(byteChars, NULL, 16);
+                [m appendBytes:&b length:1];
+            }
+            raw = m;
+        }
+        if (!raw.length) {
+            return @{@"error": @"missing or invalid data_base64 / data_hex"};
+        }
+        NSArray<NSDictionary *> *fields = MCPCapDecodeProtobufFields((const uint8_t *)raw.bytes, raw.length, 0);
+        return @{
+            @"byte_length": @(raw.length),
+            @"valid_protobuf": @(fields.count > 0),
+            @"field_count": @(fields.count),
+            @"fields": fields ?: @[]
+        };
+    }
+
+    if ([op isEqualToString:@"engine.replay_request"]) {
+        NSString *urlStr = [a[@"url"] isKindOfClass:[NSString class]] ? a[@"url"] : @"";
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (!url || !url.scheme.length) {
+            return @{@"error": @"valid url is required"};
+        }
+        NSString *method = [a[@"method"] isKindOfClass:[NSString class]] ? [a[@"method"] uppercaseString] : @"GET";
+        NSTimeInterval timeoutSec = [a[@"timeout_ms"] respondsToSelector:@selector(doubleValue)]
+            ? MAX(1.0, MIN(60.0, [a[@"timeout_ms"] doubleValue] / 1000.0))
+            : 15.0;
+
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                       timeoutInterval:timeoutSec];
+        req.HTTPMethod = method;
+        [NSURLProtocol setProperty:@YES forKey:kMCPCapHandledKey inRequest:req];
+
+        if ([a[@"headers"] isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *hdrs = a[@"headers"];
+            for (id k in hdrs) {
+                id v = hdrs[k];
+                [req setValue:[v description] forHTTPHeaderField:[k description]];
+            }
+        }
+        if ([a[@"body_base64"] isKindOfClass:[NSString class]] && [a[@"body_base64"] length] > 0) {
+            req.HTTPBody = [[NSData alloc] initWithBase64EncodedString:a[@"body_base64"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        } else if ([a[@"body"] isKindOfClass:[NSString class]] && [a[@"body"] length] > 0) {
+            req.HTTPBody = [a[@"body"] dataUsingEncoding:NSUTF8StringEncoding];
+        } else if ([a[@"body_json"] isKindOfClass:[NSDictionary class]] || [a[@"body_json"] isKindOfClass:[NSArray class]]) {
+            req.HTTPBody = [NSJSONSerialization dataWithJSONObject:a[@"body_json"] options:0 error:NULL];
+            if (![req valueForHTTPHeaderField:@"Content-Type"]) {
+                [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+            }
+        }
+
+        BOOL useShared = a[@"use_shared_session"] ? [a[@"use_shared_session"] boolValue] : YES;
+        NSURLSession *session = useShared ? [NSURLSession sharedSession] : [MCPCapURLProtocol forwardingSession];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSData *respData = nil;
+        __block NSURLResponse *respObj = nil;
+        __block NSError *respErr = nil;
+        CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+
+        NSURLSessionDataTask *task = [session dataTaskWithRequest:req
+                                                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            respData = data;
+            respObj = response;
+            respErr = error;
+            dispatch_semaphore_signal(sem);
+        }];
+        [task resume];
+
+        long waitRes = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeoutSec + 1.0) * NSEC_PER_SEC)));
+        double durationMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0;
+        if (waitRes != 0) {
+            [task cancel];
+            return @{
+                @"error": @"replay_request timed out",
+                @"url": urlStr,
+                @"method": method,
+                @"duration_ms": @(round(durationMs * 100.0) / 100.0)
+            };
+        }
+
+        NSInteger statusCode = 0;
+        NSDictionary *respHeaders = @{};
+        if ([respObj isKindOfClass:[NSHTTPURLResponse class]]) {
+            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)respObj;
+            statusCode = httpResp.statusCode;
+            respHeaders = MCPCapSanitizeHeaders(httpResp.allHeaderFields);
+        }
+
+        id parsedJson = [NSNull null];
+        if (respData.length > 0) {
+            id obj = [NSJSONSerialization JSONObjectWithData:respData options:0 error:NULL];
+            if (obj) parsedJson = obj;
+        }
+
+        return @{
+            @"replayed_in_process": @YES,
+            @"pid": @(getpid()),
+            @"tls_stack": @"CFNetwork+libboringssl.dylib (native app JA3/JA4 & HTTP/2 SETTINGS)",
+            @"session": useShared ? @"NSURLSession.sharedSession" : @"ephemeral",
+            @"url": respObj.URL.absoluteString ?: urlStr,
+            @"method": method,
+            @"status_code": @(statusCode),
+            @"duration_ms": @(round(durationMs * 100.0) / 100.0),
+            @"response_headers": respHeaders,
+            @"response_bytes": @(respData.length),
+            @"response_body": MCPCapEncodeBodyPreview(respData),
+            @"response_json": parsedJson,
+            @"error": respErr ? (respErr.localizedDescription ?: @"request failed") : [NSNull null]
         };
     }
 

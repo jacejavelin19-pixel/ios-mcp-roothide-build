@@ -40,6 +40,7 @@ NSDictionary *MENative(NSString *op, NSDictionary *a);
 NSDictionary *MEHooks(NSString *op, NSDictionary *a);
 NSDictionary *MENetCap(NSString *op, NSDictionary *a);
 NSDictionary *MERE(NSString *op, NSDictionary *a);
+NSDictionary *MECrypto(NSString *op, NSDictionary *a);
 void *MEResolve(NSDictionary *a);
 uintptr_t MECall(void *fn, const uintptr_t *args, unsigned count);
 const struct mach_header *MESelfHeader(void);

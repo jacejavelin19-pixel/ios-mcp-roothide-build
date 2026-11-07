@@ -3,6 +3,94 @@
 #import "DylibInjectManager.h"
 #import "MCPEngineManager.h"
 #import "MCPProcessUtil.h"
+#include <libkern/OSByteOrder.h>
+#include <math.h>
+
+static BOOL MCPHostReadVarint(const uint8_t *bytes, size_t len, size_t *offset, uint64_t *outVal) {
+    if (!bytes || !offset || !outVal || *offset >= len) return NO;
+    uint64_t result = 0;
+    int shift = 0;
+    size_t pos = *offset;
+    while (pos < len && shift < 64) {
+        uint8_t b = bytes[pos++];
+        result |= ((uint64_t)(b & 0x7F)) << shift;
+        if ((b & 0x80) == 0) {
+            *offset = pos;
+            *outVal = result;
+            return YES;
+        }
+        shift += 7;
+    }
+    return NO;
+}
+
+static NSArray<NSDictionary *> *MCPHostDecodeProtobufFields(const uint8_t *bytes, size_t len, int depth) {
+    if (!bytes || len == 0 || depth > 5) return nil;
+    size_t pos = 0;
+    if (depth == 0 && len >= 5 && (bytes[0] == 0x00 || bytes[0] == 0x01)) {
+        uint32_t frameLen = OSSwapBigToHostInt32(*(const uint32_t *)(bytes + 1));
+        if ((size_t)frameLen + 5 <= len && frameLen > 0) {
+            pos = 5;
+            len = 5 + (size_t)frameLen;
+        }
+    }
+    NSMutableArray<NSDictionary *> *fields = [NSMutableArray array];
+    while (pos < len && fields.count < 128) {
+        uint64_t tag = 0;
+        if (!MCPHostReadVarint(bytes, len, &pos, &tag) || tag == 0) return nil;
+        uint64_t fieldNum = tag >> 3;
+        uint8_t wireType = (uint8_t)(tag & 0x07);
+        if (fieldNum == 0 || fieldNum > 536870911ULL) return nil;
+        if (wireType == 0) {
+            uint64_t val = 0;
+            if (!MCPHostReadVarint(bytes, len, &pos, &val)) return nil;
+            int64_t zigzag = (int64_t)((val >> 1) ^ (-(int64_t)(val & 1)));
+            [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"varint", @"uint64": @(val), @"sint64_zigzag": @(zigzag)}];
+        } else if (wireType == 1) {
+            if (pos + 8 > len) return nil;
+            uint64_t raw64 = OSSwapLittleToHostInt64(*(const uint64_t *)(bytes + pos));
+            double dbl = 0;
+            memcpy(&dbl, &raw64, sizeof(dbl));
+            pos += 8;
+            [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"fixed64", @"uint64": @(raw64), @"double": isfinite(dbl) ? @(dbl) : [NSNull null]}];
+        } else if (wireType == 2) {
+            uint64_t subLen = 0;
+            if (!MCPHostReadVarint(bytes, len, &pos, &subLen) || pos + subLen > len) return nil;
+            const uint8_t *subBytes = bytes + pos;
+            pos += (size_t)subLen;
+            BOOL printable = subLen > 0;
+            for (size_t i = 0; i < (size_t)subLen; i++) {
+                uint8_t c = subBytes[i];
+                if (c < 0x09 || (c > 0x0D && c < 0x20)) {
+                    printable = NO;
+                    break;
+                }
+            }
+            NSString *strVal = printable ? [[NSString alloc] initWithBytes:subBytes length:(NSUInteger)subLen encoding:NSUTF8StringEncoding] : nil;
+            if (strVal) {
+                [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"length_delimited", @"type": @"string", @"value": strVal}];
+            } else {
+                NSArray<NSDictionary *> *nested = (subLen >= 2) ? MCPHostDecodeProtobufFields(subBytes, (size_t)subLen, depth + 1) : nil;
+                if (nested.count > 0) {
+                    [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"length_delimited", @"type": @"embedded_message", @"fields": nested}];
+                } else {
+                    NSData *rawSub = [NSData dataWithBytes:subBytes length:(NSUInteger)MIN(subLen, (uint64_t)1024)];
+                    [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"bytes", @"length": @(subLen), @"base64": [rawSub base64EncodedStringWithOptions:0] ?: @""}];
+                }
+            }
+        } else if (wireType == 5) {
+            if (pos + 4 > len) return nil;
+            uint32_t raw32 = OSSwapLittleToHostInt32(*(const uint32_t *)(bytes + pos));
+            float flt = 0;
+            memcpy(&flt, &raw32, sizeof(flt));
+            pos += 4;
+            [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"fixed32", @"uint32": @(raw32), @"float": isfinite(flt) ? @(flt) : [NSNull null]}];
+        } else {
+            return nil;
+        }
+    }
+    return (pos == len && fields.count > 0) ? fields : nil;
+}
 
 static NSString *const kMCPNetCapLogicalPath = @"/usr/lib/ios-mcp/libmcp_netcap.dylib";
 static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
@@ -269,6 +357,174 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
         @"cleared": @(clear),
         @"requests": returned
     };
+}
+
+- (NSDictionary *)traceCryptoPrimitivesForBundleId:(NSString *)bundleId
+                                              args:(NSDictionary *)args
+                                             error:(NSString **)error {
+    if (error) *error = nil;
+    if ([args[@"stop"] boolValue]) {
+        return [[MCPEngineManager sharedInstance] stopCryptoForBundleId:bundleId args:args error:error];
+    }
+    BOOL relaunch = [args[@"relaunch"] boolValue];
+    NSDictionary *ping = !relaunch ? [[MCPEngineManager sharedInstance] pingForBundleId:bundleId error:nil] : nil;
+    NSDictionary *inj = nil;
+    if (!ping) {
+        inj = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId
+                                                           stealthConfig:nil
+                                                                  launch:(args[@"launch"] ? [args[@"launch"] boolValue] : YES)
+                                                                   error:error];
+        if (!inj) return nil;
+    }
+    NSDictionary *traceRes = [[MCPEngineManager sharedInstance] traceCryptoForBundleId:bundleId args:args error:error];
+    if (!traceRes) return nil;
+    NSMutableDictionary *merged = [traceRes mutableCopy];
+    merged[@"bundle_id"] = bundleId;
+    if (inj) merged[@"engine_injection"] = inj;
+    return merged;
+}
+
+- (NSDictionary *)getCryptoEventsForBundleId:(NSString *)bundleId
+                                        args:(NSDictionary *)args
+                                       error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *container = [self captureContainerForBundleId:bundleId error:error];
+    if (!container) return nil;
+    NSString *cryptoLogPath = [container stringByAppendingPathComponent:@"tmp/.mcp_crypto.jsonl"];
+
+    NSUInteger limit = [args[@"limit"] respondsToSelector:@selector(unsignedIntegerValue)] ? [args[@"limit"] unsignedIntegerValue] : 100;
+    if (limit == 0) limit = 100;
+    if (limit > 2000) limit = 2000;
+    NSString *primitiveFilter = [args[@"primitive_filter"] isKindOfClass:[NSString class]] ? [args[@"primitive_filter"] lowercaseString] : nil;
+    NSString *algorithmFilter = [args[@"algorithm_filter"] isKindOfClass:[NSString class]] ? [args[@"algorithm_filter"] lowercaseString] : nil;
+    BOOL clear = [args[@"clear"] boolValue];
+
+    NSMutableArray<NSDictionary *> *allEvents = [NSMutableArray array];
+    NSDictionary *liveRes = [[MCPEngineManager sharedInstance] getCryptoEventsForBundleId:bundleId
+                                                                                     args:@{@"limit": @(limit), @"clear": @(clear)}
+                                                                                    error:nil];
+    if ([liveRes[@"events"] isKindOfClass:[NSArray class]]) {
+        [allEvents addObjectsFromArray:liveRes[@"events"]];
+    }
+
+    NSData *diskData = [self readCaptureFileDataAtPath:cryptoLogPath];
+    if (diskData.length) {
+        NSString *text = [[NSString alloc] initWithData:diskData encoding:NSUTF8StringEncoding];
+        for (NSString *line in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+            if (!line.length) continue;
+            NSData *lineData = [line dataUsingEncoding:NSUTF8StringEncoding];
+            NSDictionary *ev = lineData ? [NSJSONSerialization JSONObjectWithData:lineData options:0 error:NULL] : nil;
+            if ([ev isKindOfClass:[NSDictionary class]]) {
+                [allEvents addObject:ev];
+            }
+        }
+    }
+
+    NSMutableSet<NSString *> *seenIds = [NSMutableSet set];
+    NSMutableArray<NSDictionary *> *filtered = [NSMutableArray array];
+    for (NSDictionary *ev in allEvents) {
+        NSString *key = [NSString stringWithFormat:@"%@|%@|%@", ev[@"id"] ?: @0, ev[@"primitive"] ?: @"", ev[@"timestamp"] ?: @0];
+        if ([seenIds containsObject:key]) continue;
+        [seenIds addObject:key];
+        if (primitiveFilter.length) {
+            NSString *p = [ev[@"primitive"] isKindOfClass:[NSString class]] ? [ev[@"primitive"] lowercaseString] : @"";
+            if (![p containsString:primitiveFilter]) continue;
+        }
+        if (algorithmFilter.length) {
+            NSString *alg = [ev[@"algorithm"] isKindOfClass:[NSString class]] ? [ev[@"algorithm"] lowercaseString] : @"";
+            if (![alg containsString:algorithmFilter]) continue;
+        }
+        [filtered addObject:ev];
+    }
+
+    if (filtered.count > limit) {
+        filtered = [[filtered subarrayWithRange:NSMakeRange(filtered.count - limit, limit)] mutableCopy];
+    }
+    if (clear) {
+        [self deleteCaptureLogAtPath:cryptoLogPath];
+    }
+
+    return @{
+        @"bundle_id": bundleId,
+        @"log_path": cryptoLogPath,
+        @"tracing": liveRes[@"tracing"] ?: @NO,
+        @"count": @(filtered.count),
+        @"events": filtered
+    };
+}
+
+- (NSDictionary *)hookQuicHttp3ForBundleId:(NSString *)bundleId
+                                      args:(NSDictionary *)args
+                                     error:(NSString **)error {
+    if (error) *error = nil;
+    BOOL relaunch = [args[@"relaunch"] boolValue];
+    NSDictionary *ping = !relaunch ? [[MCPEngineManager sharedInstance] pingForBundleId:bundleId error:nil] : nil;
+    NSDictionary *inj = nil;
+    if (!ping) {
+        inj = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId
+                                                           stealthConfig:nil
+                                                                  launch:(args[@"launch"] ? [args[@"launch"] boolValue] : YES)
+                                                                   error:error];
+        if (!inj) return nil;
+    }
+    NSDictionary *res = [[MCPEngineManager sharedInstance] hookQuicHttp3ForBundleId:bundleId args:args error:error];
+    if (!res) return nil;
+    NSMutableDictionary *merged = [res mutableCopy];
+    merged[@"bundle_id"] = bundleId;
+    if (inj) merged[@"engine_injection"] = inj;
+    return merged;
+}
+
+- (NSDictionary *)decodeProtobufWithArgs:(NSDictionary *)args
+                                   error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *bundleId = [args[@"bundle_id"] isKindOfClass:[NSString class]] ? args[@"bundle_id"] : nil;
+    if (bundleId.length) {
+        NSDictionary *inProc = [[MCPEngineManager sharedInstance] decodeProtobufForBundleId:bundleId args:args error:nil];
+        if (inProc && !inProc[@"error"]) {
+            return inProc;
+        }
+    }
+    NSData *raw = nil;
+    if ([args[@"data_base64"] isKindOfClass:[NSString class]]) {
+        raw = [[NSData alloc] initWithBase64EncodedString:args[@"data_base64"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    } else if ([args[@"data_hex"] isKindOfClass:[NSString class]]) {
+        NSString *hex = [[args[@"data_hex"] stringByReplacingOccurrencesOfString:@" " withString:@""]
+                         stringByReplacingOccurrencesOfString:@"0x" withString:@""];
+        NSMutableData *m = [NSMutableData dataWithCapacity:hex.length / 2];
+        for (NSUInteger i = 0; i + 1 < hex.length; i += 2) {
+            char byteChars[3] = { (char)[hex characterAtIndex:i], (char)[hex characterAtIndex:i + 1], 0 };
+            uint8_t b = (uint8_t)strtoul(byteChars, NULL, 16);
+            [m appendBytes:&b length:1];
+        }
+        raw = m;
+    }
+    if (!raw.length) {
+        if (error) *error = @"Missing or invalid data_base64 or data_hex parameter";
+        return nil;
+    }
+    NSArray<NSDictionary *> *fields = MCPHostDecodeProtobufFields((const uint8_t *)raw.bytes, raw.length, 0);
+    return @{
+        @"byte_length": @(raw.length),
+        @"valid_protobuf": @(fields.count > 0),
+        @"field_count": @(fields.count),
+        @"fields": fields ?: @[]
+    };
+}
+
+- (NSDictionary *)replayRequestNativeForBundleId:(NSString *)bundleId
+                                            args:(NSDictionary *)args
+                                           error:(NSString **)error {
+    if (error) *error = nil;
+    NSDictionary *ping = [[MCPEngineManager sharedInstance] pingForBundleId:bundleId error:nil];
+    if (!ping) {
+        NSDictionary *inj = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId
+                                                                         stealthConfig:nil
+                                                                                launch:YES
+                                                                                 error:error];
+        if (!inj) return nil;
+    }
+    return [[MCPEngineManager sharedInstance] replayRequestForBundleId:bundleId args:args error:error];
 }
 
 @end

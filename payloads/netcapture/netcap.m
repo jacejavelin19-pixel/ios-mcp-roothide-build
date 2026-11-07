@@ -3,7 +3,9 @@
 #include "fishhook.h"
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <libkern/OSByteOrder.h>
 #include <mach-o/dyld.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
@@ -41,6 +43,92 @@ static NSDictionary *MCPNetCapSanitizeHeaders(NSDictionary *headers) {
     return clean;
 }
 
+static BOOL MCPNetCapReadVarint(const uint8_t *bytes, size_t len, size_t *offset, uint64_t *outVal) {
+    if (!bytes || !offset || !outVal || *offset >= len) return NO;
+    uint64_t result = 0;
+    int shift = 0;
+    size_t pos = *offset;
+    while (pos < len && shift < 64) {
+        uint8_t b = bytes[pos++];
+        result |= ((uint64_t)(b & 0x7F)) << shift;
+        if ((b & 0x80) == 0) {
+            *offset = pos;
+            *outVal = result;
+            return YES;
+        }
+        shift += 7;
+    }
+    return NO;
+}
+
+static NSArray<NSDictionary *> *MCPNetCapDecodeProtobufFields(const uint8_t *bytes, size_t len, int depth) {
+    if (!bytes || len == 0 || depth > 4) return nil;
+    size_t pos = 0;
+    if (depth == 0 && len >= 5 && (bytes[0] == 0x00 || bytes[0] == 0x01)) {
+        uint32_t frameLen = OSSwapBigToHostInt32(*(const uint32_t *)(bytes + 1));
+        if ((size_t)frameLen + 5 <= len && frameLen > 0) {
+            pos = 5;
+            len = 5 + (size_t)frameLen;
+        }
+    }
+    NSMutableArray<NSDictionary *> *fields = [NSMutableArray array];
+    while (pos < len && fields.count < 64) {
+        uint64_t tag = 0;
+        if (!MCPNetCapReadVarint(bytes, len, &pos, &tag) || tag == 0) return nil;
+        uint64_t fieldNum = tag >> 3;
+        uint8_t wireType = (uint8_t)(tag & 0x07);
+        if (fieldNum == 0 || fieldNum > 536870911ULL) return nil;
+        if (wireType == 0) {
+            uint64_t val = 0;
+            if (!MCPNetCapReadVarint(bytes, len, &pos, &val)) return nil;
+            int64_t zigzag = (int64_t)((val >> 1) ^ (-(int64_t)(val & 1)));
+            [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"varint", @"uint64": @(val), @"sint64_zigzag": @(zigzag)}];
+        } else if (wireType == 1) {
+            if (pos + 8 > len) return nil;
+            uint64_t raw64 = OSSwapLittleToHostInt64(*(const uint64_t *)(bytes + pos));
+            double dbl = 0;
+            memcpy(&dbl, &raw64, sizeof(dbl));
+            pos += 8;
+            [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"fixed64", @"uint64": @(raw64), @"double": isfinite(dbl) ? @(dbl) : [NSNull null]}];
+        } else if (wireType == 2) {
+            uint64_t subLen = 0;
+            if (!MCPNetCapReadVarint(bytes, len, &pos, &subLen) || pos + subLen > len) return nil;
+            const uint8_t *subBytes = bytes + pos;
+            pos += (size_t)subLen;
+            BOOL printable = subLen > 0;
+            for (size_t i = 0; i < (size_t)subLen; i++) {
+                uint8_t c = subBytes[i];
+                if (c < 0x09 || (c > 0x0D && c < 0x20)) {
+                    printable = NO;
+                    break;
+                }
+            }
+            NSString *strVal = printable ? [[NSString alloc] initWithBytes:subBytes length:(NSUInteger)subLen encoding:NSUTF8StringEncoding] : nil;
+            if (strVal) {
+                [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"length_delimited", @"type": @"string", @"value": strVal}];
+            } else {
+                NSArray<NSDictionary *> *nested = (subLen >= 2) ? MCPNetCapDecodeProtobufFields(subBytes, (size_t)subLen, depth + 1) : nil;
+                if (nested.count > 0) {
+                    [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"length_delimited", @"type": @"embedded_message", @"fields": nested}];
+                } else {
+                    NSData *rawSub = [NSData dataWithBytes:subBytes length:(NSUInteger)MIN(subLen, (uint64_t)512)];
+                    [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"bytes", @"length": @(subLen), @"base64": [rawSub base64EncodedStringWithOptions:0] ?: @""}];
+                }
+            }
+        } else if (wireType == 5) {
+            if (pos + 4 > len) return nil;
+            uint32_t raw32 = OSSwapLittleToHostInt32(*(const uint32_t *)(bytes + pos));
+            float flt = 0;
+            memcpy(&flt, &raw32, sizeof(flt));
+            pos += 4;
+            [fields addObject:@{@"field": @(fieldNum), @"wire_type": @"fixed32", @"uint32": @(raw32), @"float": isfinite(flt) ? @(flt) : [NSNull null]}];
+        } else {
+            return nil;
+        }
+    }
+    return (pos == len && fields.count > 0) ? fields : nil;
+}
+
 static NSDictionary *MCPNetCapEncodeBodyPreview(NSData *data) {
     if (!data || data.length == 0) {
         return @{@"size": @0, @"encoding": @"utf8", @"preview": @"", @"truncated": @NO};
@@ -56,12 +144,17 @@ static NSDictionary *MCPNetCapEncodeBodyPreview(NSData *data) {
             @"truncated": @(truncated)
         };
     }
-    return @{
+    NSMutableDictionary *res = [NSMutableDictionary dictionaryWithDictionary:@{
         @"size": @(data.length),
         @"encoding": @"base64",
         @"preview": [slice base64EncodedStringWithOptions:0] ?: @"",
         @"truncated": @(truncated)
-    };
+    }];
+    NSArray<NSDictionary *> *pbFields = MCPNetCapDecodeProtobufFields((const uint8_t *)slice.bytes, slice.length, 0);
+    if (pbFields.count > 0) {
+        res[@"protobuf_fields"] = pbFields;
+    }
+    return res;
 }
 
 static NSData *MCPNetCapReadRequestBody(NSURLRequest *request, BOOL allowConsumeStream, NSMutableURLRequest *forwardReq) {

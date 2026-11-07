@@ -53,6 +53,7 @@ static NSDictionary *MEDispatch(NSString *op, NSDictionary *a) {
     if (!r) r = MEMemory(op,a);
     if (!r) r = MENetCap(op,a);
     if (!r) r = MERE(op,a);
+    if (!r) r = MECrypto(op,a);
     if (!r) MEFail([@"Unknown op: " stringByAppendingString:op]);
     return r;
 }

@@ -138,4 +138,24 @@
                              script:(NSString *)script
                               error:(NSString **)error;
 
+/// Phase 3: Crypto tracing, QUIC/HTTP3 hooks, Protobuf wire decoding, native request replay
+- (NSDictionary *)traceCryptoForBundleId:(NSString *)bundleId
+                                    args:(NSDictionary *)args
+                                   error:(NSString **)error;
+- (NSDictionary *)getCryptoEventsForBundleId:(NSString *)bundleId
+                                        args:(NSDictionary *)args
+                                       error:(NSString **)error;
+- (NSDictionary *)stopCryptoForBundleId:(NSString *)bundleId
+                                   args:(NSDictionary *)args
+                                  error:(NSString **)error;
+- (NSDictionary *)hookQuicHttp3ForBundleId:(NSString *)bundleId
+                                      args:(NSDictionary *)args
+                                     error:(NSString **)error;
+- (NSDictionary *)decodeProtobufForBundleId:(NSString *)bundleId
+                                       args:(NSDictionary *)args
+                                      error:(NSString **)error;
+- (NSDictionary *)replayRequestForBundleId:(NSString *)bundleId
+                                      args:(NSDictionary *)args
+                                     error:(NSString **)error;
+
 @end
