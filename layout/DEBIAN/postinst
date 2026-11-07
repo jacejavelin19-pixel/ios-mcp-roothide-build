@@ -48,9 +48,12 @@ fix_perms() {
             chown -R 501:501 "$d" 2>/dev/null || true
             chmod -R 0777 "$d" 2>/dev/null || true
         done
+        if [ -d "${base}/var/tmp" ]; then
+            ( cd "${base}/var/tmp" && rm -rf ./-* FridaCompanion-* NetworkCapture-* SSLKillSwitch-* fishhook-* probe-* apt.* fix_*.sh gadget_arm64.dylib iii-filelist.txt rh.plist tt_ents.plist ent.plist verify_c.log tmp.* 17D5EB58* DEAE416E* *.deb *.ipa *.macho *.sqlite 2>/dev/null || true )
+        fi
     fi
     rm -f /rootfs/var/tmp/ios-mcp-appsync-frontboard.log /var/tmp/ios-mcp-appsync-frontboard.log 2>/dev/null || true
-    rm -rf /rootfs/var/mobile/Library/ios-mcp 2>/dev/null || true
+    rm -rf /rootfs/var/mobile/Library/ios-mcp "/rootfs/var/root/Library/Cookies" "/rootfs/var/root/Library/Saved Application State" "/rootfs/var/root/Library/Application Support/adc3" 2>/dev/null || true
 }
 
 # Resolve an ABSOLUTE, existing path to mcp-helperd. launchd (which spawns the

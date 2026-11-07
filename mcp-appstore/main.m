@@ -26,6 +26,11 @@ static id MCPMsgSend2(id target, SEL sel, id a1, id a2) {
     return ((id (*)(id, SEL, id, id))objc_msgSend)(target, sel, a1, a2);
 }
 
+static void MCPMsgSendVoid0(id target, SEL sel) {
+    if (!target || !sel || ![target respondsToSelector:sel]) return;
+    ((void (*)(id, SEL))objc_msgSend)(target, sel);
+}
+
 static void MCPMsgSendVoid1(id target, SEL sel, id a1) {
     if (!target || !sel || ![target respondsToSelector:sel]) return;
     ((void (*)(id, SEL, id))objc_msgSend)(target, sel, a1);
