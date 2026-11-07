@@ -774,7 +774,7 @@ static NSDictionary *MCPDecompileInstructionBuffer(const uint8_t *codeBytes,
         else if (insn == 0xD50323FFU) { mnemonic = @"autibsp"; operands = @""; isPAC = YES; comment = @"PAC stripped"; }
         else if (insn == 0xD50323BFU) { mnemonic = @"autiasp"; operands = @""; isPAC = YES; comment = @"PAC stripped"; }
         else if (insn == 0xD503201FU) { mnemonic = @"nop"; operands = @""; }
-        else if ((insn & 0xFFFFFC1FU) == 0xDAC143E0U) {
+        else if ((insn & 0xFFFFFBE0U) == 0xDAC143E0U) {
             unsigned rd = insn & 0x1F;
             mnemonic = @"xpaci";
             operands = MCPArm64RegName(rd, YES, NO);
@@ -893,7 +893,7 @@ static NSDictionary *MCPDecompileInstructionBuffer(const uint8_t *codeBytes,
             [pseudoCLines addObject:[NSString stringWithFormat:@"    if (((%@ >> %u) & 1) %s 0) goto loc_%llx;", symExpr, bit, isNz ? "!=" : "==", (unsigned long long)target]];
         }
         // 7. BLR / BR / BLRAA / BLRAB / BRAA / BRAB
-        else if ((insn & 0xFE1FFC1FU) == 0xD61F0000U || (insn & 0xFE1F0000U) == 0xD71F0000U) {
+        else if ((insn & 0xFE1FFC1FU) == 0xD61F0000U || (insn & 0xFF1F0000U) == 0xD71F0000U) {
             unsigned rn = (insn >> 5) & 0x1F;
             BOOL isLink = ((insn >> 21) & 0x3) == 1;
             BOOL isAuth = (insn & 0x01000000U) != 0 || ((insn >> 10) & 0x3F) != 0;
