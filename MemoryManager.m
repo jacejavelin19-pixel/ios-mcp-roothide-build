@@ -111,6 +111,10 @@ static uint64_t MCPStripPAC(uint64_t ptr, uint64_t vaMask) {
     return ptr & vaMask;
 }
 
+static uint64_t MCPStripRemotePointer(uint64_t ptr, uint64_t vaMask) {
+    return MCPStripPAC(ptr, vaMask);
+}
+
 static BOOL MCPRemoteReadExact(mach_port_t task, uint64_t addr, void *buf, size_t len, uint64_t vaMask) {
     if (!addr || !buf || !len) return NO;
     uint64_t clean = MCPStripPAC(addr, vaMask);
@@ -158,6 +162,32 @@ static NSString *MCPRemoteReadCString(mach_port_t task, uint64_t addr, size_t ma
     size_t slen = strlen(buf);
     if (slen == 0) return nil;
     return [[NSString alloc] initWithBytes:buf length:slen encoding:NSUTF8StringEncoding];
+}
+
+static NSArray<NSDictionary *> *MCPRemoteEnumerateDyldImages(mach_port_t task, uint64_t *outVaMask) {
+    uint64_t vaMask = MCPComputeRemoteVAMask(task);
+    if (outVaMask) *outVaMask = vaMask;
+    NSMutableArray<NSDictionary *> *images = [NSMutableArray array];
+    task_dyld_info_data_t dyldInfo = {0};
+    mach_msg_type_number_t dyldCount = TASK_DYLD_INFO_COUNT;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&dyldInfo, &dyldCount) == KERN_SUCCESS &&
+        dyldInfo.all_image_info_addr != 0) {
+        MCPRemoteDyldAllImageInfos allInfos = {0};
+        if (MCPRemoteReadExact(task, dyldInfo.all_image_info_addr, &allInfos, sizeof(allInfos), vaMask) &&
+            allInfos.infoArray != 0 && allInfos.infoArrayCount > 0) {
+            uint32_t imgCount = MIN(allInfos.infoArrayCount, 2048U);
+            NSMutableData *arrData = [NSMutableData dataWithLength:imgCount * sizeof(MCPRemoteDyldImageInfo)];
+            if (MCPRemoteReadExact(task, allInfos.infoArray, arrData.mutableBytes, arrData.length, vaMask)) {
+                const MCPRemoteDyldImageInfo *entries = arrData.bytes;
+                for (uint32_t i = 0; i < imgCount; i++) {
+                    uint64_t base = MCPStripPAC(entries[i].imageLoadAddress, vaMask);
+                    NSString *path = MCPRemoteReadCString(task, entries[i].imageFilePath, 512, vaMask) ?: @"";
+                    if (base) [images addObject:@{@"address": @(base), @"base": @(base), @"path": path}];
+                }
+            }
+        }
+    }
+    return images;
 }
 
 static BOOL MCPLooksLikeObjCIdentifier(NSString *str, BOOL allowColons) {

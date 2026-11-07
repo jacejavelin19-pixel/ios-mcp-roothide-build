@@ -6,6 +6,7 @@
 #import "MemoryManager.h"
 #import <ctype.h>
 #import <dlfcn.h>
+#import <errno.h>
 #import <libkern/OSByteOrder.h>
 #import <mach-o/fat.h>
 #import <mach-o/loader.h>
