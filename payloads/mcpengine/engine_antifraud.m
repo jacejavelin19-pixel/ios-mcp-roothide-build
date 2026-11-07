@@ -1353,7 +1353,7 @@ static NSDictionary *MEAFAuditCheck(int index, NSString *category, NSString *nam
 
 static NSDictionary *MEAFRun50PointAudit(void) {
     NSMutableArray<NSDictionary *> *checks = [NSMutableArray arrayWithCapacity:50];
-    int id = 1;
+    int checkId = 1;
 
     // 1..10: Filesystem & RootHide / Jailbreak Path Cloaking
     const char *jbPaths[10] = {
@@ -1365,7 +1365,7 @@ static NSDictionary *MEAFRun50PointAudit(void) {
         struct stat st;
         int rc = hook_af_stat(jbPaths[i], &st);
         BOOL ok = (rc == -1 && errno == ENOENT);
-        [checks addObject:MEAFAuditCheck(id++, @"filesystem_cloak", [NSString stringWithFormat:@"stat(%s)", jbPaths[i]], ok, ok ? @"ENOENT" : @"leaked")];
+        [checks addObject:MEAFAuditCheck(checkId++, @"filesystem_cloak", [NSString stringWithFormat:@"stat(%s)", jbPaths[i]], ok, ok ? @"ENOENT" : @"leaked")];
     }
 
     // 11..15: DYLD & Image Enumeration Cloaking
@@ -1378,32 +1378,32 @@ static NSDictionary *MEAFRun50PointAudit(void) {
             break;
         }
     }
-    [checks addObject:MEAFAuditCheck(id++, @"dyld_cloak", @"_dyld_image_count / _dyld_get_image_name filter", !leakedImage, [NSString stringWithFormat:@"visible=%u", visCount])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"dyld_cloak", @"_dyld_image_count / _dyld_get_image_name filter", !leakedImage, [NSString stringWithFormat:@"visible=%u", visCount])];
     Dl_info selfDl = {0};
     int dlRc = hook_af_dladdr((const void *)&MEAFRun50PointAudit, &selfDl);
-    [checks addObject:MEAFAuditCheck(id++, @"dyld_cloak", @"dladdr(engine_address) hidden", dlRc == 0, dlRc == 0 ? @"0 (hidden)" : @"leaked")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"dyld_cloak", @"dladdr(engine_address) hidden", dlRc == 0, dlRc == 0 ? @"0 (hidden)" : @"leaked")];
     char *dyldEnv = hook_af_getenv("DYLD_INSERT_LIBRARIES");
-    [checks addObject:MEAFAuditCheck(id++, @"dyld_cloak", @"getenv(DYLD_INSERT_LIBRARIES)", dyldEnv == NULL, @"NULL")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"dyld_cloak", @"getenv(DYLD_INSERT_LIBRARIES)", dyldEnv == NULL, @"NULL")];
     char *safeModeEnv = hook_af_getenv("MSSafeMode");
-    [checks addObject:MEAFAuditCheck(id++, @"dyld_cloak", @"getenv(MSSafeMode)", safeModeEnv == NULL, @"NULL")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"dyld_cloak", @"getenv(MSSafeMode)", safeModeEnv == NULL, @"NULL")];
     char *fridaEnv = hook_af_getenv("FRIDA_GADGET_CONFIG");
-    [checks addObject:MEAFAuditCheck(id++, @"dyld_cloak", @"getenv(FRIDA_*)", fridaEnv == NULL, @"NULL")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"dyld_cloak", @"getenv(FRIDA_*)", fridaEnv == NULL, @"NULL")];
 
     // 16..21: Kernel / Process / Anti-Debug Cloak
     uint32_t csFlags = 0;
     hook_af_csops(getpid(), CS_OPS_STATUS, &csFlags, sizeof(csFlags));
     BOOL csClean = ((csFlags & CS_DEBUGGED) == 0) && ((csFlags & CS_VALID) != 0);
-    [checks addObject:MEAFAuditCheck(id++, @"kernel_proc_cloak", @"csops(CS_OPS_STATUS) CS_DEBUGGED stripped", csClean, [NSString stringWithFormat:@"flags=0x%08x", csFlags])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"kernel_proc_cloak", @"csops(CS_OPS_STATUS) CS_DEBUGGED stripped", csClean, [NSString stringWithFormat:@"flags=0x%08x", csFlags])];
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
     struct kinfo_proc kp = {0};
     size_t kpLen = sizeof(kp);
     hook_af_sysctl(mib, 4, &kp, &kpLen, NULL, 0);
     BOOL pTracedClean = ((kp.kp_proc.p_flag & P_TRACED) == 0);
-    [checks addObject:MEAFAuditCheck(id++, @"kernel_proc_cloak", @"sysctl(KERN_PROC_PID) P_TRACED masked", pTracedClean, @"P_TRACED=0")];
-    [checks addObject:MEAFAuditCheck(id++, @"kernel_proc_cloak", @"getppid() == 1 (launchd)", hook_af_getppid() == 1, @"ppid=1")];
-    [checks addObject:MEAFAuditCheck(id++, @"kernel_proc_cloak", @"ptrace(PT_DENY_ATTACH) neutralized", hook_af_ptrace(PT_DENY_ATTACH, 0, NULL, 0) == 0, @"rc=0")];
-    [checks addObject:MEAFAuditCheck(id++, @"kernel_proc_cloak", @"isatty(0) == 0", hook_af_isatty(0) == 0, @"not a tty")];
-    [checks addObject:MEAFAuditCheck(id++, @"kernel_proc_cloak", @"fork() sandbox blocked", hook_af_fork() == -1, @"rc=-1 EPERM")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"kernel_proc_cloak", @"sysctl(KERN_PROC_PID) P_TRACED masked", pTracedClean, @"P_TRACED=0")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"kernel_proc_cloak", @"getppid() == 1 (launchd)", hook_af_getppid() == 1, @"ppid=1")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"kernel_proc_cloak", @"ptrace(PT_DENY_ATTACH) neutralized", hook_af_ptrace(PT_DENY_ATTACH, 0, NULL, 0) == 0, @"rc=0")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"kernel_proc_cloak", @"isatty(0) == 0", hook_af_isatty(0) == 0, @"not a tty")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"kernel_proc_cloak", @"fork() sandbox blocked", hook_af_fork() == -1, @"rc=-1 EPERM")];
 
     // 22..25: Mach Exception Port & Thread / Stack Cloak
     exception_mask_t masks[EXC_TYPES_COUNT];
@@ -1412,27 +1412,27 @@ static NSDictionary *MEAFRun50PointAudit(void) {
     exception_behavior_t behaviors[EXC_TYPES_COUNT];
     thread_state_flavor_t flavors[EXC_TYPES_COUNT];
     hook_af_task_get_exception_ports(mach_task_self(), EXC_MASK_ALL, masks, &masksCnt, handlers, behaviors, flavors);
-    [checks addObject:MEAFAuditCheck(id++, @"thread_stack_cloak", @"task_get_exception_ports cloaked", masksCnt == 0, @"masksCnt=0")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"thread_stack_cloak", @"task_get_exception_ports cloaked", masksCnt == 0, @"masksCnt=0")];
     NSArray<NSString *> *stackSyms = swizzled_af_callStackSymbols([NSThread class], @selector(callStackSymbols));
     BOOL stackClean = YES;
     for (NSString *s in stackSyms) {
         if (MEAFIsHiddenImageName(s.UTF8String)) { stackClean = NO; break; }
     }
-    [checks addObject:MEAFAuditCheck(id++, @"thread_stack_cloak", @"NSThread.callStackSymbols scrubbed", stackClean, [NSString stringWithFormat:@"frames=%lu", (unsigned long)stackSyms.count])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"thread_stack_cloak", @"NSThread.callStackSymbols scrubbed", stackClean, [NSString stringWithFormat:@"frames=%lu", (unsigned long)stackSyms.count])];
     void *btBuf[32] = {0};
     int btCount = hook_af_backtrace(btBuf, 32);
-    [checks addObject:MEAFAuditCheck(id++, @"thread_stack_cloak", @"backtrace() scrubbed", btCount >= 0, [NSString stringWithFormat:@"frames=%d", btCount])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"thread_stack_cloak", @"backtrace() scrubbed", btCount >= 0, [NSString stringWithFormat:@"frames=%d", btCount])];
     Method mIdfv = class_getInstanceMethod([UIDevice class], @selector(identifierForVendor));
     IMP reportedIMP = hook_af_method_getImplementation(mIdfv);
     Dl_info impDl = {0};
     hook_af_dladdr((const void *)reportedIMP, &impDl);
     BOOL impClean = (reportedIMP != (IMP)swizzled_af_idfv);
-    [checks addObject:MEAFAuditCheck(id++, @"objc_integrity_cloak", @"method_getImplementation returns original IMP", impClean, MEHex((uintptr_t)reportedIMP))];
+    [checks addObject:MEAFAuditCheck(checkId++, @"objc_integrity_cloak", @"method_getImplementation returns original IMP", impClean, MEHex((uintptr_t)reportedIMP))];
 
     // 26..31: Network, Proxy, VPN (utun*) & Reachability Cloak
     CFDictionaryRef proxyDict = hook_af_CFNetworkCopySystemProxySettings();
     NSDictionary *nsProxy = CFBridgingRelease(proxyDict);
-    [checks addObject:MEAFAuditCheck(id++, @"network_vpn_cloak", @"CFNetworkCopySystemProxySettings empty", nsProxy.count == 0, @"@{}")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"network_vpn_cloak", @"CFNetworkCopySystemProxySettings empty", nsProxy.count == 0, @"@{}")];
     struct ifaddrs *ifap = NULL;
     BOOL utunFound = NO;
     if (hook_af_getifaddrs(&ifap) == 0 && ifap) {
@@ -1444,10 +1444,10 @@ static NSDictionary *MEAFRun50PointAudit(void) {
         }
         freeifaddrs(ifap);
     }
-    [checks addObject:MEAFAuditCheck(id++, @"network_vpn_cloak", @"getifaddrs() utun*/ppp*/ipsec* stripped", !utunFound, @"0 tunnel interfaces")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"network_vpn_cloak", @"getifaddrs() utun*/ppp*/ipsec* stripped", !utunFound, @"0 tunnel interfaces")];
     SCNetworkReachabilityFlags reachFlags = kSCNetworkReachabilityFlagsTransientConnection;
     hook_af_SCNetworkReachabilityGetFlags(NULL, &reachFlags);
-    [checks addObject:MEAFAuditCheck(id++, @"network_vpn_cloak", @"SCNetworkReachabilityGetFlags direct", (reachFlags & kSCNetworkReachabilityFlagsTransientConnection) == 0, [NSString stringWithFormat:@"flags=0x%x", reachFlags])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"network_vpn_cloak", @"SCNetworkReachabilityGetFlags direct", (reachFlags & kSCNetworkReachabilityFlagsTransientConnection) == 0, [NSString stringWithFormat:@"flags=0x%x", reachFlags])];
 
     // Localhost Port-Scan Sinkhole (27042, 27043, 22)
     uint16_t probePorts[3] = {27042, 27043, 22};
@@ -1459,48 +1459,48 @@ static NSDictionary *MEAFRun50PointAudit(void) {
         sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         int rc = hook_af_connect(-1, (const struct sockaddr *)&sin, sizeof(sin));
         BOOL blocked = (rc == -1 && errno == ECONNREFUSED);
-        [checks addObject:MEAFAuditCheck(id++, @"port_scan_sinkhole", [NSString stringWithFormat:@"connect(127.0.0.1:%u) sinkholed", probePorts[i]], blocked, @"ECONNREFUSED")];
+        [checks addObject:MEAFAuditCheck(checkId++, @"port_scan_sinkhole", [NSString stringWithFormat:@"connect(127.0.0.1:%u) sinkholed", probePorts[i]], blocked, @"ECONNREFUSED")];
     }
 
     // 32..37: Jailbreak URL Scheme Probe Filter
     NSArray<NSString *> *schemes = @[@"cydia://", @"sileo://", @"zbra://", @"filza://", @"roothide://", @"trollstore://"];
     for (NSString *sch in schemes) {
         BOOL canOpen = swizzled_af_canOpenURL([UIApplication sharedApplication], @selector(canOpenURL:), [NSURL URLWithString:sch]);
-        [checks addObject:MEAFAuditCheck(id++, @"url_scheme_cloak", [NSString stringWithFormat:@"canOpenURL(%@)", sch], !canOpen, @"NO")];
+        [checks addObject:MEAFAuditCheck(checkId++, @"url_scheme_cloak", [NSString stringWithFormat:@"canOpenURL(%@)", sch], !canOpen, @"NO")];
     }
 
     // 38..45: Hardware Identity, MobileGestalt, Timezone, Locale, Carrier & Battery Coherence
     NSUUID *idfv = swizzled_af_idfv([UIDevice currentDevice], @selector(identifierForVendor));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"UIDevice.identifierForVendor valid", idfv != nil, idfv.UUIDString ?: @"")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"UIDevice.identifierForVendor valid", idfv != nil, idfv.UUIDString ?: @"")];
     UIDeviceBatteryState bState = swizzled_af_batteryState([UIDevice currentDevice], @selector(batteryState));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"UIDevice.batteryState == Unplugged", bState == UIDeviceBatteryStateUnplugged, @"UIDeviceBatteryStateUnplugged")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"UIDevice.batteryState == Unplugged", bState == UIDeviceBatteryStateUnplugged, @"UIDeviceBatteryStateUnplugged")];
     float bLevel = swizzled_af_batteryLevel([UIDevice currentDevice], @selector(batteryLevel));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"UIDevice.batteryLevel natural discharge", bLevel > 0.15f && bLevel < 0.99f, [NSString stringWithFormat:@"%.3f", bLevel])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"UIDevice.batteryLevel natural discharge", bLevel > 0.15f && bLevel < 0.99f, [NSString stringWithFormat:@"%.3f", bLevel])];
     NSTimeZone *tz = swizzled_af_localTimeZone([NSTimeZone class], @selector(localTimeZone));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"NSTimeZone.localTimeZone coherent", tz.name.length > 0, tz.name ?: @"")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"NSTimeZone.localTimeZone coherent", tz.name.length > 0, tz.name ?: @"")];
     NSLocale *loc = swizzled_af_currentLocale([NSLocale class], @selector(currentLocale));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"NSLocale.currentLocale coherent", loc.localeIdentifier.length > 0, loc.localeIdentifier ?: @"")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"NSLocale.currentLocale coherent", loc.localeIdentifier.length > 0, loc.localeIdentifier ?: @"")];
     NSString *carrier = swizzled_af_carrierName(nil, @selector(carrierName));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"CTCarrier.carrierName coherent", carrier.length > 0, carrier ?: @"")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"CTCarrier.carrierName coherent", carrier.length > 0, carrier ?: @"")];
     NSString *mcc = swizzled_af_mcc(nil, @selector(mobileCountryCode));
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"CTCarrier.mobileCountryCode coherent", mcc.length > 0, mcc ?: @"")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"CTCarrier.mobileCountryCode coherent", mcc.length > 0, mcc ?: @"")];
     struct statfs sfs = {0};
     hook_af_statfs("/var/mobile", &sfs);
-    [checks addObject:MEAFAuditCheck(id++, @"persona_identity", @"statfs(/var/mobile) f_fsid active", sfs.f_fsid.val[0] != 0, [NSString stringWithFormat:@"0x%x:0x%x", sfs.f_fsid.val[0], sfs.f_fsid.val[1]])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"statfs(/var/mobile) f_fsid active", sfs.f_fsid.val[0] != 0, [NSString stringWithFormat:@"0x%x:0x%x", sfs.f_fsid.val[0], sfs.f_fsid.val[1]])];
 
     // 46..50: Risk Dictionary Sanitizer, Canvas Entropy, Direct Syscall Scan & BirthTime Jitter
     NSDictionary *dirtyRisk = @{@"isJailbroken": @YES, @"isDebuggerAttached": @YES, @"fridaDetected": @YES};
     NSData *sanitizedData = swizzled_af_jsonDataWithObject([NSJSONSerialization class], @selector(dataWithJSONObject:options:error:), dirtyRisk, 0, NULL);
     NSDictionary *parsedClean = sanitizedData ? [NSJSONSerialization JSONObjectWithData:sanitizedData options:0 error:NULL] : @{};
     BOOL dictClean = ([parsedClean[@"isJailbroken"] boolValue] == NO && [parsedClean[@"isDebuggerAttached"] boolValue] == NO && [parsedClean[@"fridaDetected"] boolValue] == NO);
-    [checks addObject:MEAFAuditCheck(id++, @"sdk_sanitizer", @"NSJSONSerialization risk dictionary sanitizer", dictClean, @"isJailbroken=false")];
-    [checks addObject:MEAFAuditCheck(id++, @"canvas_entropy", @"CGBitmapContextCreateImage LSB mutator active", atomic_load(&g_af_canvas_active) != 0, @"enabled")];
-    [checks addObject:MEAFAuditCheck(id++, @"ghost_biometrics", @"Touch-to-IMU recoil & pasteboard cloak active", atomic_load(&g_af_ghost_active) != 0, @"enabled")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"sdk_sanitizer", @"NSJSONSerialization risk dictionary sanitizer", dictClean, @"isJailbroken=false")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"canvas_entropy", @"CGBitmapContextCreateImage LSB mutator active", atomic_load(&g_af_canvas_active) != 0, @"enabled")];
+    [checks addObject:MEAFAuditCheck(checkId++, @"ghost_biometrics", @"Touch-to-IMU recoil & pasteboard cloak active", atomic_load(&g_af_ghost_active) != 0, @"enabled")];
     struct stat mobileSt = {0};
     hook_af_stat("/var/mobile", &mobileSt);
-    [checks addObject:MEAFAuditCheck(id++, @"canary_wiper", @"st_birthtimespec persona jitter active", mobileSt.st_birthtimespec.tv_sec > 0, [NSString stringWithFormat:@"%ld.%09ld", (long)mobileSt.st_birthtimespec.tv_sec, mobileSt.st_birthtimespec.tv_nsec])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"canary_wiper", @"st_birthtimespec persona jitter active", mobileSt.st_birthtimespec.tv_sec > 0, [NSString stringWithFormat:@"%ld.%09ld", (long)mobileSt.st_birthtimespec.tv_sec, mobileSt.st_birthtimespec.tv_nsec])];
     NSArray *svcSites = MEAFScanDirectSyscalls(NO);
-    [checks addObject:MEAFAuditCheck(id++, @"syscall_shield", @"Direct SVC #0x80 scanner & shield operational", YES, [NSString stringWithFormat:@"svc_sites=%lu", (unsigned long)svcSites.count])];
+    [checks addObject:MEAFAuditCheck(checkId++, @"syscall_shield", @"Direct SVC #0x80 scanner & shield operational", YES, [NSString stringWithFormat:@"svc_sites=%lu", (unsigned long)svcSites.count])];
 
     NSUInteger passedCount = 0;
     for (NSDictionary *c in checks) {
@@ -1763,10 +1763,12 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
         }
         Class dcAppAttest = NSClassFromString(@"DCAppAttestService");
         BOOL supported = NO;
-        if (dcAppAttest && [dcAppAttest respondsToSelector:@selector(sharedService)]) {
-            id svc = [dcAppAttest performSelector:@selector(sharedService)];
-            if ([svc respondsToSelector:@selector(isSupported)]) {
-                supported = ((BOOL (*)(id, SEL))objc_msgSend)(svc, @selector(isSupported));
+        SEL sharedSvcSel = NSSelectorFromString(@"sharedService");
+        SEL isSuppSel = NSSelectorFromString(@"isSupported");
+        if (dcAppAttest && [dcAppAttest respondsToSelector:sharedSvcSel]) {
+            id svc = ((id (*)(id, SEL))objc_msgSend)(dcAppAttest, sharedSvcSel);
+            if ([svc respondsToSelector:isSuppSel]) {
+                supported = ((BOOL (*)(id, SEL))objc_msgSend)(svc, isSuppSel);
             }
         }
         NSArray *events = nil;

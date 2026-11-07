@@ -972,8 +972,8 @@ static void MCPCapInstallTLSHooks(NSMutableArray<NSDictionary *> *allSlots,
 
 #pragma mark - Layer 3: Network.framework QUIC / HTTP/3 / nw_connection C hooks
 
-typedef void (*nw_send_completion_block_t)(void *error);
-typedef void (*nw_receive_completion_block_t)(dispatch_data_t content, void *context, bool is_complete, void *error);
+typedef void (^nw_send_completion_block_t)(void *error);
+typedef void (^nw_receive_completion_block_t)(dispatch_data_t content, void *context, bool is_complete, void *error);
 
 static void (*orig_cap_nw_connection_send)(void *connection, dispatch_data_t content, void *context, bool is_complete, nw_send_completion_block_t completion) = NULL;
 static void (*orig_cap_nw_connection_receive)(void *connection, uint32_t minimum_incomplete_length, uint32_t maximum_length, nw_receive_completion_block_t completion) = NULL;

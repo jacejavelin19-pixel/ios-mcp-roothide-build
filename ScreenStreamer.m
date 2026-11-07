@@ -16,10 +16,12 @@
 }
 
 static BOOL MCPStreamWriteAll(int fd, const void *buf, size_t len) {
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
     const uint8_t *p = (const uint8_t *)buf;
     size_t rem = len;
     while (rem > 0) {
-        ssize_t w = send(fd, p, rem, MSG_NOSIGNAL);
+        ssize_t w = send(fd, p, rem, 0);
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return NO;
         p += (size_t)w;

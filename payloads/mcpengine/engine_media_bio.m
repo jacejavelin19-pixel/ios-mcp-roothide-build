@@ -14,6 +14,7 @@
 #import <objc/message.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <libkern/OSByteOrder.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <mach-o/dyld.h>

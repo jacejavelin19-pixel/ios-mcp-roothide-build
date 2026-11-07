@@ -373,10 +373,10 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     do {
         [parsedMessages removeAllObjects];
         NSString *sqlErr = nil;
-        NSDictionary *qRes = [[SQLiteQueryManager sharedInstance] executeQueryWithPath:chatDBPath
-                                                                                 query:sql
-                                                                              maxRows:limit
-                                                                                 error:&sqlErr];
+        NSDictionary *qRes = [[SQLiteQueryManager sharedInstance] queryDatabaseAtPath:chatDBPath
+                                                                                  sql:sql
+                                                                                limit:limit
+                                                                                error:&sqlErr];
         rows = [qRes[@"rows"] isKindOfClass:NSArray.class] ? qRes[@"rows"] : @[];
         for (NSDictionary *r in rows) {
             NSString *sender = [r[@"sender"] isKindOfClass:NSString.class] ? r[@"sender"] : @"";
@@ -541,7 +541,7 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     }
 
     NSArray *activityTypes = [infoPlist[@"NSUserActivityTypes"] isKindOfClass:NSArray.class] ? infoPlist[@"NSUserActivityTypes"] : @[];
-    NSDictionary *entRes = [[EntitlementManager sharedInstance] dumpEntitlementsWithArgs:@{@"bundle_id": bundleId} error:NULL];
+    NSDictionary *entRes = [[EntitlementManager sharedInstance] dumpEntitlementsForBundleId:bundleId error:NULL];
     NSDictionary *ents = [entRes[@"entitlements"] isKindOfClass:NSDictionary.class] ? entRes[@"entitlements"] : @{};
     NSArray *associatedDomains = [ents[@"com.apple.developer.associated-domains"] isKindOfClass:NSArray.class]
         ? ents[@"com.apple.developer.associated-domains"]
@@ -776,7 +776,7 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
         return nil;
     }
 
-    NSDictionary *entRes = [[EntitlementManager sharedInstance] dumpEntitlementsWithArgs:@{@"bundle_id": bundleId} error:NULL];
+    NSDictionary *entRes = [[EntitlementManager sharedInstance] dumpEntitlementsForBundleId:bundleId error:NULL];
     NSDictionary *ents = [entRes[@"entitlements"] isKindOfClass:NSDictionary.class] ? entRes[@"entitlements"] : @{};
     NSArray<NSString *> *groupIds = [ents[@"com.apple.security.application-groups"] isKindOfClass:NSArray.class]
         ? ents[@"com.apple.security.application-groups"]
