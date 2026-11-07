@@ -1009,10 +1009,23 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
         _largeResponseSemaphore = dispatch_semaphore_create(MCP_MAX_CONCURRENT_LARGE_RESPONSES);
         _lifecycleState = MCPServerLifecycleStateStopped;
         _activeClients = [NSMutableDictionary dictionary];
-        _sessionId = [[NSUUID UUID] UUIDString];
+        NSString *sessFile = [MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work") stringByAppendingPathComponent:@".mcp_session_id"];
+        NSString *savedSess = [[NSString stringWithContentsOfFile:sessFile encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (savedSess.length > 0) {
+            _sessionId = [savedSess copy];
+        } else {
+            _sessionId = [[NSUUID UUID] UUIDString];
+            [savedSess ?: _sessionId writeToFile:sessFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
         _negotiatedProtocolVersion = MCP_PROTOCOL_VERSION_LATEST;
     }
     return self;
+}
+
+- (NSString *)currentSessionId {
+    @synchronized (self) {
+        return _sessionId ?: @"";
+    }
 }
 
 - (NSString *)negotiatedProtocolVersion {
@@ -2025,6 +2038,15 @@ static NSString *MCPLogId(id reqId) {
 }
 
 - (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId session:(NSString *)session {
+    if ([session isKindOfClass:[NSString class]] && session.length > 0) {
+        @synchronized (self) {
+            if (![_sessionId isEqualToString:session]) {
+                _sessionId = [session copy];
+                NSString *sessFile = [MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work") stringByAppendingPathComponent:@".mcp_session_id"];
+                [_sessionId writeToFile:sessFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+        }
+    }
     NSDate *mcpStart = [NSDate date];
     id logReqId = nil;
     NSString *methodName = @"<parse_error>";
@@ -7298,7 +7320,7 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         @"MCP-Protocol-Version: %@\r\n"
         @"Connection: close\r\n"
         @"\r\n",
-        status, (unsigned long)jsonData.length, _sessionId, [self negotiatedProtocolVersion]];
+        status, (unsigned long)jsonData.length, [self currentSessionId], [self negotiatedProtocolVersion]];
 
     NSMutableData *responseData = [NSMutableData dataWithData:[response dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
@@ -7406,7 +7428,7 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         @"MCP-Protocol-Version: %@\r\n"
         @"Connection: close\r\n"
         @"\r\n",
-        status, _sessionId, [self negotiatedProtocolVersion]];
+        status, [self currentSessionId], [self negotiatedProtocolVersion]];
 
     NSData *data = [response dataUsingEncoding:NSUTF8StringEncoding];
     if (requestLogId.length > 0) {

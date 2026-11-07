@@ -157,7 +157,7 @@ EOF
               sleep 1
               _w=$((_w + 1))
           done
-          sleep 1
+          sleep 2
           "$helper_abs" --daemon </dev/null >/dev/null 2>&1 || true
           if command -v launchctl >/dev/null 2>&1; then
               timeout 5 launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
