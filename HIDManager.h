@@ -60,4 +60,17 @@ typedef NS_ENUM(NSUInteger, TouchPhase) {
                 steps:(NSInteger)steps
            completion:(void (^)(BOOL success, NSString *error))completion;
 
+/// [Upgrade 22] Human Touch Physics Engine (Bezier Fitts's Law curves, Gaussian jitter, capacitive radius arch)
+@property (nonatomic, assign) BOOL humanizeEnabled;
+
+- (void)humanTapAtPoint:(CGPoint)point
+           jitterRadius:(CGFloat)jitterRadius
+             completion:(void (^)(BOOL success, NSString *error, NSDictionary *telemetry))completion;
+
+- (void)humanSwipeFromPoint:(CGPoint)from
+                    toPoint:(CGPoint)to
+                   duration:(NSTimeInterval)durationMs
+                      steps:(NSInteger)steps
+                 completion:(void (^)(BOOL success, NSString *error, NSDictionary *telemetry))completion;
+
 @end

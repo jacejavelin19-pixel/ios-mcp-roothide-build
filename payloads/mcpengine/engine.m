@@ -55,6 +55,8 @@ static NSDictionary *MEDispatch(NSString *op, NSDictionary *a) {
     if (!r) r = MERE(op,a);
     if (!r) r = MECrypto(op,a);
     if (!r) r = MEAntiFraud(op,a);
+    if (!r) r = MEWebView(op,a);
+    if (!r) r = MEMediaBio(op,a);
     if (!r) MEFail([@"Unknown op: " stringByAppendingString:op]);
     return r;
 }

@@ -43,6 +43,8 @@ NSDictionary *MENetCap(NSString *op, NSDictionary *a);
 NSDictionary *MERE(NSString *op, NSDictionary *a);
 NSDictionary *MECrypto(NSString *op, NSDictionary *a);
 NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a);
+NSDictionary *MEWebView(NSString *op, NSDictionary *a);
+NSDictionary *MEMediaBio(NSString *op, NSDictionary *a);
 IMP MEOriginalIMPForReplacement(IMP imp);
 void MERegisterEngineServerThread(pthread_t thread);
 void *MEResolve(NSDictionary *a);

@@ -3,6 +3,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <math.h>
 #import "MCPLogger.h"
 
 #define HID_LOG(fmt, ...) do { \
@@ -211,8 +212,8 @@ static IOHIDEventRef createChildTouchEvent(TouchPhase phase, int index, CGPoint 
     );
     if (!child) return NULL;
 
-    IOHIDEventSetFloatValue(child, 0xb0014, 0.04f);
-    IOHIDEventSetFloatValue(child, 0xb0015, 0.04f);
+    IOHIDEventSetFloatValue(child, 0xb0014, 0.038f + ((float)(arc4random_uniform(140)) / 10000.0f));
+    IOHIDEventSetFloatValue(child, 0xb0015, 0.036f + ((float)(arc4random_uniform(140)) / 10000.0f));
     return child;
 }
 
@@ -546,6 +547,130 @@ static void appendChildTouchEvent(IOHIDEventRef parent, TouchPhase phase, int in
              moveDuration:moveMs
                     steps:steps
                completion:completion];
+}
+
+#pragma mark - [Upgrade 22] Human Touch Physics Engine
+
+static double MCPGaussianRandom(double mean, double stddev) {
+    double u1 = ((double)arc4random() + 1.0) / ((double)UINT32_MAX + 2.0);
+    double u2 = ((double)arc4random() + 1.0) / ((double)UINT32_MAX + 2.0);
+    double z0 = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+    return mean + z0 * stddev;
+}
+
+- (void)humanTapAtPoint:(CGPoint)point
+           jitterRadius:(CGFloat)jitterRadius
+             completion:(void (^)(BOOL, NSString *, NSDictionary *))completion {
+    dispatch_async(_hidQueue, ^{
+        @try {
+            CGFloat sigma = jitterRadius > 0 ? (jitterRadius / 2.0) : 1.25;
+            CGFloat jx = (CGFloat)MCPGaussianRandom(0.0, sigma);
+            CGFloat jy = (CGFloat)MCPGaussianRandom(0.0, sigma);
+            CGPoint downPt = CGPointMake(MAX(1.0, point.x + jx), MAX(1.0, point.y + jy));
+            CGPoint driftPt = CGPointMake(downPt.x + (CGFloat)MCPGaussianRandom(0.0, 0.35),
+                                          downPt.y + (CGFloat)MCPGaussianRandom(0.0, 0.35));
+            useconds_t dwellUs = (useconds_t)((58.0 + fabs(MCPGaussianRandom(0.0, 18.0))) * 1000.0);
+
+            NSString *error = nil;
+            if (![self performTouchAtPoint:downPt phase:TouchPhaseBegan error:&error]) {
+                if (completion) completion(NO, error, nil);
+                return;
+            }
+            usleep(dwellUs / 2);
+            if (![self performTouchAtPoint:driftPt phase:TouchPhaseMoved error:&error]) {
+                if (completion) completion(NO, error, nil);
+                return;
+            }
+            usleep(dwellUs / 2);
+            if (![self performTouchAtPoint:driftPt phase:TouchPhaseEnded error:&error]) {
+                if (completion) completion(NO, error, nil);
+                return;
+            }
+            NSDictionary *telemetry = @{
+                @"mode": @"human_tap_fitts_gaussian",
+                @"target_point": @{@"x": @(point.x), @"y": @(point.y)},
+                @"touch_down_point": @{@"x": @(downPt.x), @"y": @(downPt.y)},
+                @"touch_up_point": @{@"x": @(driftPt.x), @"y": @(driftPt.y)},
+                @"dwell_ms": @((double)dwellUs / 1000.0)
+            };
+            if (completion) completion(YES, nil, telemetry);
+        } @catch (NSException *exception) {
+            if (completion) completion(NO, exception.reason ?: @"Human tap exception", nil);
+        }
+    });
+}
+
+- (void)humanSwipeFromPoint:(CGPoint)from
+                    toPoint:(CGPoint)to
+                   duration:(NSTimeInterval)durationMs
+                      steps:(NSInteger)steps
+                 completion:(void (^)(BOOL, NSString *, NSDictionary *))completion {
+    dispatch_async(_hidQueue, ^{
+        @try {
+            NSString *error = nil;
+            NSTimeInterval duration = durationMs > 0 ? durationMs : (260.0 + fabs(MCPGaussianRandom(0.0, 45.0)));
+            NSInteger totalSteps = steps > 0 ? steps : 28;
+            useconds_t baseDelay = (useconds_t)((duration * 1000.0) / totalSteps);
+
+            CGFloat dx = to.x - from.x;
+            CGFloat dy = to.y - from.y;
+            CGFloat dist = hypot(dx, dy);
+            CGFloat nx = dist > 1.0 ? (-dy / dist) : 0.0;
+            CGFloat ny = dist > 1.0 ? (dx / dist) : 0.0;
+            CGFloat arcAmp = (CGFloat)MCPGaussianRandom(0.0, MIN(18.0, dist * 0.08 + 2.0));
+
+            CGPoint cp1 = CGPointMake(from.x + dx * 0.33 + nx * arcAmp,
+                                      from.y + dy * 0.33 + ny * arcAmp);
+            CGPoint cp2 = CGPointMake(from.x + dx * 0.68 + nx * (arcAmp * 0.6),
+                                      from.y + dy * 0.68 + ny * (arcAmp * 0.6));
+
+            if (![self performTouchAtPoint:from phase:TouchPhaseBegan error:&error]) {
+                if (completion) completion(NO, error, nil);
+                return;
+            }
+            usleep(baseDelay);
+
+            NSMutableArray *sampledTrajectory = [NSMutableArray array];
+            for (NSInteger i = 1; i <= totalSteps; i++) {
+                CGFloat rawT = (CGFloat)i / (CGFloat)totalSteps;
+                CGFloat t = rawT * rawT * (3.0 - 2.0 * rawT);
+                CGFloat u = 1.0 - t;
+                CGFloat bx = u*u*u*from.x + 3*u*u*t*cp1.x + 3*u*t*t*cp2.x + t*t*t*to.x;
+                CGFloat by = u*u*u*from.y + 3*u*u*t*cp1.y + 3*u*t*t*cp2.y + t*t*t*to.y;
+                CGPoint cur = CGPointMake(bx + (CGFloat)MCPGaussianRandom(0.0, 0.35),
+                                          by + (CGFloat)MCPGaussianRandom(0.0, 0.35));
+                if (![self performTouchAtPoint:cur phase:TouchPhaseMoved error:&error]) {
+                    if (completion) completion(NO, error, nil);
+                    return;
+                }
+                if (i == 1 || i == totalSteps / 2 || i == totalSteps) {
+                    [sampledTrajectory addObject:@{@"step": @(i), @"x": @(cur.x), @"y": @(cur.y)}];
+                }
+                if (i < totalSteps) {
+                    usleep(baseDelay);
+                }
+            }
+
+            usleep(12000);
+            if (![self performTouchAtPoint:to phase:TouchPhaseEnded error:&error]) {
+                if (completion) completion(NO, error, nil);
+                return;
+            }
+            NSDictionary *telemetry = @{
+                @"mode": @"human_cubic_bezier_minimum_jerk",
+                @"from": @{@"x": @(from.x), @"y": @(from.y)},
+                @"to": @{@"x": @(to.x), @"y": @(to.y)},
+                @"control_point_1": @{@"x": @(cp1.x), @"y": @(cp1.y)},
+                @"control_point_2": @{@"x": @(cp2.x), @"y": @(cp2.y)},
+                @"steps": @(totalSteps),
+                @"duration_ms": @(duration),
+                @"sampled_points": sampledTrajectory
+            };
+            if (completion) completion(YES, nil, telemetry);
+        } @catch (NSException *exception) {
+            if (completion) completion(NO, exception.reason ?: @"Human swipe exception", nil);
+        }
+    });
 }
 
 @end

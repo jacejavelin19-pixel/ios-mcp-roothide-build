@@ -23,6 +23,8 @@
 #import "AppStoreManager.h"
 #import "BinaryInspector.h"
 #import "PersonaManager.h"
+#import "ScreenStreamer.h"
+#import "SystemCapabilitiesManager.h"
 #import "SQLiteQueryManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
@@ -619,7 +621,20 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"thread_mach_port_and_stack_cloaker",
             @"wipe_fraud_canaries",
             @"apply_fraud_persona",
-            @"audit_fraud_surface"
+            @"audit_fraud_surface",
+            @"checkpoint_app_state",
+            @"virtual_camera_and_mic_feed",
+            @"telephony_sms_otp_controller",
+            @"biometric_passkey_se_vault",
+            @"webkit_cdp_dom_bridge",
+            @"gps_motion_sensor_teleporter",
+            @"xpc_mach_ipc_sniffer_fuzzer",
+            @"apns_notification_deeplink_bus",
+            @"wireless_radio_recon_suite",
+            @"fs_io_and_iokit_tracer",
+            @"human_touch_physics_and_stream",
+            @"background_immortality_governor",
+            @"appgroup_icloud_account_inspector"
         ];
     });
     return tools;
@@ -910,6 +925,19 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeWipeFraudCanaries:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeApplyFraudPersona:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeAuditFraudSurface:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeCheckpointAppState:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeVirtualCameraAndMicFeed:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeTelephonySmsOtpController:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeBiometricPasskeySeVault:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWebkitCdpDomBridge:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeGpsMotionSensorTeleporter:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeXpcMachIpcSnifferFuzzer:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeApnsNotificationDeeplinkBus:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWirelessRadioReconSuite:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeFsIoAndIokitTracer:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeHumanTouchPhysicsAndStream:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeBackgroundImmortalityGovernor:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeAppgroupIcloudAccountInspector:(id)reqId args:(NSDictionary *)args;
 - (NSString *)jsonTextForObject:(id)object;
 - (NSString *)jsonTextForDictionary:(NSDictionary *)dict;
 - (NSDictionary *)sanitizeFrontmostInfo:(NSDictionary *)info debug:(BOOL)debug;
@@ -1525,6 +1553,17 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
         [self handleDownloadFileRequestPath:path clientSocket:clientSocket requestLogId:requestLogId];
     } else if ([basePath isEqualToString:@"/download_file"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"GET" message:@"Method Not Allowed" requestLogId:requestLogId];
+    } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/stream.mjpeg"]) {
+        NSInteger fps = 15;
+        CGFloat quality = 0.65;
+        NSInteger maxFrames = 300;
+        NSURLComponents *comp = [NSURLComponents componentsWithString:path];
+        for (NSURLQueryItem *item in comp.queryItems) {
+            if ([item.name isEqualToString:@"fps"] && item.value.length > 0) fps = [item.value integerValue];
+            else if ([item.name isEqualToString:@"quality"] && item.value.length > 0) quality = (CGFloat)[item.value doubleValue];
+            else if ([item.name isEqualToString:@"max_frames"] && item.value.length > 0) maxFrames = [item.value integerValue];
+        }
+        [[ScreenStreamer sharedInstance] streamMJPEGToSocket:clientSocket fps:fps quality:quality maxFrames:maxFrames];
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
         NSDictionary *health = @{
             @"status": @"ok",
@@ -3773,6 +3812,193 @@ static NSString *MCPLogId(id reqId) {
                 },
                 @"required": @[@"bundle_id"]
             }
+        },
+        // ═══════════════════════════════════════════════════════════════════
+        // Phase 5: System Capabilities, WebKit, Biometrics, Media & Telemetry
+        // ═══════════════════════════════════════════════════════════════════
+        @{
+            @"name": @"checkpoint_app_state",
+            @"description": @"Instant sandbox (Documents, Library, tmp) & Keychain snapshot, diffing, and rollback engine. Creates named checkpoints before destructive actions, computes file-level added/modified/deleted diffs since any checkpoint, and restores exact app + keychain state in seconds.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"action": @{@"type": @"string", @"description": @"Action: 'create' (default), 'restore', 'diff', 'list', or 'delete'."},
+                    @"name": @{@"type": @"string", @"description": @"Checkpoint name (default 'default')."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"virtual_camera_and_mic_feed",
+            @"description": @"In-process AVCaptureSession / AVCaptureVideoDataOutput CMSampleBuffer frame/QR-code injector & AudioUnit PCM microphone feed injector. Synthesizes pixel-accurate QR codes via CIQRCodeGenerator or streams custom image/video frames and WAV audio directly into camera/mic delegates.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"qr_payload": @{@"type": @"string", @"description": @"String payload to synthesize into a live camera QR code frame via CoreImage CIQRCodeGenerator."},
+                    @"image_path": @{@"type": @"string", @"description": @"Optional path to a PNG/JPEG image on device to feed into AVCaptureVideoDataOutput."},
+                    @"image_base64": @{@"type": @"string", @"description": @"Optional base64-encoded PNG/JPEG image to feed into the camera."},
+                    @"audio_path": @{@"type": @"string", @"description": @"Optional path to a 16-bit PCM WAV file on device to feed into AudioUnitRender microphone callbacks."},
+                    @"enable": @{@"type": @"boolean", @"description": @"Enable or disable the virtual camera/microphone hooks (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"telephony_sms_otp_controller",
+            @"description": @"Real-time /var/mobile/Library/SMS/chat.db SQLite + WAL watcher, automatic 4–8 digit SMS/iMessage 2FA OTP code extractor, CoreTelephony SIM/carrier/RAT/cellular IP inspector, and tel:// dialer.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Action: 'wait_for_otp' (default), 'recent_messages', 'sim_info', or 'dial'."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Maximum wait time in ms for 'wait_for_otp' (default 15000)."},
+                    @"sender_filter": @{@"type": @"string", @"description": @"Optional sender phone/handle substring filter."},
+                    @"limit": @{@"type": @"number", @"description": @"Number of recent SMS/iMessage rows to fetch for 'recent_messages' (default 20)."},
+                    @"number": @{@"type": @"string", @"description": @"Phone number to dial when action='dial'."}
+                }
+            }
+        },
+        @{
+            @"name": @"biometric_passkey_se_vault",
+            @"description": @"LocalAuthentication (LAContext FaceID/TouchID), Security.framework SecAccessControl, and AuthenticationServices (ASAuthorizationController WebAuthn Passkey / Sign in with Apple) interceptor & auto-responder.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"mode": @{@"type": @"string", @"description": @"Biometric evaluation override mode: 'auto_pass' (default), 'auto_fail', or 'passthrough'."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear previously recorded biometric & passkey events."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"webkit_cdp_dom_bridge",
+            @"description": @"Live in-app WKWebView inspector, synchronous JavaScript evaluator, DOM tree + screen-coordinate bounding-box dumper (with ready-to-tap screen coordinates), and WKHTTPCookieStore / localStorage / sessionStorage extractor.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"action": @{@"type": @"string", @"description": @"Action: 'list' (default), 'eval_js', 'dump_dom', or 'cookies_storage'."},
+                    @"webview_index": @{@"type": @"number", @"description": @"Index of the target WKWebView from 'list' (default 0)."},
+                    @"script": @{@"type": @"string", @"description": @"JavaScript expression to evaluate when action='eval_js'."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"gps_motion_sensor_teleporter",
+            @"description": @"System-wide CLSimulationManager + in-process CLLocationManager GPS coordinate, altitude, accuracy, speed, and course teleporter.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional target app bundle ID for in-process CLLocationManager delegate injection."},
+                    @"lat": @{@"type": @"number", @"description": @"Target latitude in decimal degrees (default 37.7749)."},
+                    @"lon": @{@"type": @"number", @"description": @"Target longitude in decimal degrees (default -122.4194)."},
+                    @"alt": @{@"type": @"number", @"description": @"Target altitude in meters (default 15.0)."},
+                    @"accuracy": @{@"type": @"number", @"description": @"Horizontal accuracy in meters (default 4.5)."},
+                    @"speed": @{@"type": @"number", @"description": @"Speed in m/s (default 0.0)."},
+                    @"course": @{@"type": @"number", @"description": @"Course heading in degrees (default 0.0)."},
+                    @"enable": @{@"type": @"boolean", @"description": @"Enable or stop GPS simulation (default true)."}
+                }
+            }
+        },
+        @{
+            @"name": @"xpc_mach_ipc_sniffer_fuzzer",
+            @"description": @"In-process libxpc (xpc_connection_send_message / with_reply / with_reply_sync) sniffer & dictionary inspector. Hooks outgoing and incoming XPC messages, resolves peer service names and PIDs, and serializes xpc_object_t payloads.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"enable": @{@"type": @"boolean", @"description": @"Enable XPC message interception (default true)."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear captured XPC traffic ring buffer."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"apns_notification_deeplink_bus",
+            @"description": @"Custom URL scheme (CFBundleURLTypes), Universal Link (com.apple.developer.associated-domains), NSUserActivity enumerator, deep-link router, and UNUserNotificationCenter local/APNs push payload forger.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Action: 'enumerate_deeplinks' (default), 'open_deeplink', or 'forge_push'."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"url": @{@"type": @"string", @"description": @"Deep-link URL or Universal Link to open when action='open_deeplink'."},
+                    @"title": @{@"type": @"string", @"description": @"Notification title when action='forge_push'."},
+                    @"body": @{@"type": @"string", @"description": @"Notification body when action='forge_push'."},
+                    @"payload": @{@"type": @"object", @"description": @"Custom APNs userInfo dictionary when action='forge_push'."}
+                }
+            }
+        },
+        @{
+            @"name": @"wireless_radio_recon_suite",
+            @"description": @"Wi-Fi (en0), Cellular (pdp_ip0), AWDL (awdl0), IPv4/IPv6/MAC interface inspector, BLE advertisement scanner, and CoreNFC session state recon suite.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Action: 'wifi_info' / 'lan_scan' (default), 'ble_scan', or 'nfc_hook'."}
+                }
+            }
+        },
+        @{
+            @"name": @"fs_io_and_iokit_tracer",
+            @"description": @"Real-time sandbox file-system unlink/rename watcher with automatic deleted-file quarantine preservation (<DataContainer>/tmp/.mcp_quarantine/) and IOKit IOConnectCallMethod kernel driver call tracer.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"enable": @{@"type": @"boolean", @"description": @"Enable file-system and IOKit tracing (default true)."},
+                    @"preserve_unlinked_files": @{@"type": @"boolean", @"description": @"Copy transient files into .mcp_quarantine before unlink() deletes them (default true)."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear recorded FS/IOKit events."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"human_touch_physics_and_stream",
+            @"description": @"Fitts's Law minimum-jerk cubic Bezier touch synthesizer (with Box-Muller Gaussian spatial jitter and digitizer radius variance) + high-FPS multipart MJPEG screen streamer (GET /stream.mjpeg) & burst frame capturer.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Action: 'human_tap' (default), 'human_swipe', or 'stream_burst'."},
+                    @"x": @{@"type": @"number", @"description": @"Target X coordinate for 'human_tap'."},
+                    @"y": @{@"type": @"number", @"description": @"Target Y coordinate for 'human_tap'."},
+                    @"jitter_radius": @{@"type": @"number", @"description": @"Gaussian jitter standard deviation in points for 'human_tap' (default 2.5)."},
+                    @"start_x": @{@"type": @"number", @"description": @"Start X coordinate for 'human_swipe'."},
+                    @"start_y": @{@"type": @"number", @"description": @"Start Y coordinate for 'human_swipe'."},
+                    @"end_x": @{@"type": @"number", @"description": @"End X coordinate for 'human_swipe'."},
+                    @"end_y": @{@"type": @"number", @"description": @"End Y coordinate for 'human_swipe'."},
+                    @"duration": @{@"type": @"number", @"description": @"Swipe duration in seconds for 'human_swipe' (default 0.35)."},
+                    @"steps": @{@"type": @"number", @"description": @"Bezier interpolation steps for 'human_swipe' (default 36)."},
+                    @"frames": @{@"type": @"number", @"description": @"Number of frames to capture for 'stream_burst' (default 5)."},
+                    @"fps": @{@"type": @"number", @"description": @"Capture FPS for 'stream_burst' (default 15)."},
+                    @"quality": @{@"type": @"number", @"description": @"JPEG quality 0.1..1.0 for 'stream_burst' (default 0.65)."}
+                }
+            }
+        },
+        @{
+            @"name": @"background_immortality_governor",
+            @"description": @"Acquires RunningBoard / AssertionServices BKSProcessAssertion (PreventSuspend | PreventThrottleDownCPU | WantsForegroundResourcePriority) and kernel memorystatus_control Jetsam high-water-mark immunity so target apps never suspend in background, plus live IOPS/NSProcessInfo thermal & battery telemetry.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Action: 'set_immortal' (default) or 'thermal_battery'."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID when action='set_immortal'."},
+                    @"pid": @{@"type": @"number", @"description": @"Optional target PID when action='set_immortal'."},
+                    @"memory_limit_mb": @{@"type": @"number", @"description": @"Jetsam high-water-mark memory limit in MB (default 2048)."}
+                }
+            }
+        },
+        @{
+            @"name": @"appgroup_icloud_account_inspector",
+            @"description": @"Maps com.apple.security.application-groups entitlements to on-disk /var/mobile/Containers/Shared/AppGroup/<UUID> directories, dumps shared NSUserDefaults plists and SQLite databases, and inspects iCloud Ubiquity / CloudKit containers.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional app bundle ID to inspect specific App Group and iCloud entitlements (if omitted, scans all shared AppGroup containers on disk)."}
+                }
+            }
         }
     ];
 
@@ -4062,6 +4288,32 @@ static NSString *MCPLogId(id reqId) {
         return [self executeApplyFraudPersona:reqId args:args];
     } else if ([toolName isEqualToString:@"audit_fraud_surface"]) {
         return [self executeAuditFraudSurface:reqId args:args];
+    } else if ([toolName isEqualToString:@"checkpoint_app_state"]) {
+        return [self executeCheckpointAppState:reqId args:args];
+    } else if ([toolName isEqualToString:@"virtual_camera_and_mic_feed"]) {
+        return [self executeVirtualCameraAndMicFeed:reqId args:args];
+    } else if ([toolName isEqualToString:@"telephony_sms_otp_controller"]) {
+        return [self executeTelephonySmsOtpController:reqId args:args];
+    } else if ([toolName isEqualToString:@"biometric_passkey_se_vault"]) {
+        return [self executeBiometricPasskeySeVault:reqId args:args];
+    } else if ([toolName isEqualToString:@"webkit_cdp_dom_bridge"]) {
+        return [self executeWebkitCdpDomBridge:reqId args:args];
+    } else if ([toolName isEqualToString:@"gps_motion_sensor_teleporter"]) {
+        return [self executeGpsMotionSensorTeleporter:reqId args:args];
+    } else if ([toolName isEqualToString:@"xpc_mach_ipc_sniffer_fuzzer"]) {
+        return [self executeXpcMachIpcSnifferFuzzer:reqId args:args];
+    } else if ([toolName isEqualToString:@"apns_notification_deeplink_bus"]) {
+        return [self executeApnsNotificationDeeplinkBus:reqId args:args];
+    } else if ([toolName isEqualToString:@"wireless_radio_recon_suite"]) {
+        return [self executeWirelessRadioReconSuite:reqId args:args];
+    } else if ([toolName isEqualToString:@"fs_io_and_iokit_tracer"]) {
+        return [self executeFsIoAndIokitTracer:reqId args:args];
+    } else if ([toolName isEqualToString:@"human_touch_physics_and_stream"]) {
+        return [self executeHumanTouchPhysicsAndStream:reqId args:args];
+    } else if ([toolName isEqualToString:@"background_immortality_governor"]) {
+        return [self executeBackgroundImmortalityGovernor:reqId args:args];
+    } else if ([toolName isEqualToString:@"appgroup_icloud_account_inspector"]) {
+        return [self executeAppgroupIcloudAccountInspector:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -6814,6 +7066,124 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *err = nil;
     NSDictionary *result = [[PersonaManager sharedInstance] auditFraudSurfaceForBundleId:bundleId args:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"audit_fraud_surface failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+#pragma mark - Phase 5: System Capabilities, WebKit, Biometrics, Media & Telemetry
+
+- (NSDictionary *)executeCheckpointAppState:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] checkpointAppStateForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"checkpoint_app_state failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeVirtualCameraAndMicFeed:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] virtualCameraAndMicFeedForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"virtual_camera_and_mic_feed failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeTelephonySmsOtpController:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] telephonySmsOtpControllerWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"telephony_sms_otp_controller failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeBiometricPasskeySeVault:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] biometricPasskeySeVaultForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"biometric_passkey_se_vault failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeWebkitCdpDomBridge:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] webkitCdpDomBridgeForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"webkit_cdp_dom_bridge failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeGpsMotionSensorTeleporter:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = [args[@"bundle_id"] isKindOfClass:[NSString class]] ? args[@"bundle_id"] : nil;
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] gpsMotionSensorTeleporterForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"gps_motion_sensor_teleporter failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeXpcMachIpcSnifferFuzzer:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] xpcMachIpcSnifferFuzzerForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"xpc_mach_ipc_sniffer_fuzzer failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeApnsNotificationDeeplinkBus:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] apnsNotificationDeeplinkBusWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"apns_notification_deeplink_bus failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeWirelessRadioReconSuite:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] wirelessRadioReconSuiteWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"wireless_radio_recon_suite failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeFsIoAndIokitTracer:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] fsIoAndIokitTracerForBundleId:bundleId args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"fs_io_and_iokit_tracer failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeHumanTouchPhysicsAndStream:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] humanTouchPhysicsAndStreamWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"human_touch_physics_and_stream failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeBackgroundImmortalityGovernor:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] backgroundImmortalityGovernorWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"background_immortality_governor failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeAppgroupIcloudAccountInspector:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] appgroupIcloudAccountInspectorWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"appgroup_icloud_account_inspector failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 
