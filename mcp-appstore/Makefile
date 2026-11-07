@@ -12,7 +12,7 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = mcp-appstore
 mcp-appstore_FILES = main.m
-mcp-appstore_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
+mcp-appstore_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
 mcp-appstore_FRAMEWORKS = Foundation Security CFNetwork
 mcp-appstore_CODESIGN_FLAGS = -Sentitlements.plist
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)

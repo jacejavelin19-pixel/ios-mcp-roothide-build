@@ -12,7 +12,7 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = mcp-helperd
 mcp-helperd_FILES = main.m
-mcp-helperd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+mcp-helperd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
 mcp-helperd_FRAMEWORKS = Foundation
 mcp-helperd_CODESIGN_FLAGS = -Sentitlements.plist
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)

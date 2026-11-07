@@ -12,7 +12,7 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = mcp-logreader
 mcp-logreader_FILES = main.m
-mcp-logreader_CFLAGS = -fobjc-arc -fvisibility=hidden
+mcp-logreader_CFLAGS = -fobjc-arc -fvisibility=hidden -Wno-deprecated-declarations -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
 mcp-logreader_FRAMEWORKS = Foundation
 # OSLogEventLiveStream lives in the private LoggingSupport framework; link weakly and
 # dlopen at runtime so the binary loads even where the framework path differs.

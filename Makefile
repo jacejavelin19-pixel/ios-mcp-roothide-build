@@ -29,7 +29,7 @@ else ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
 endif
 
 iosmcpprefs_FILES = prefs/IOSMCPRootListController.m prefs/IOSMCPQRCodeCell.m prefs/IOSMCPLocalization.m MCPLogger.m
-iosmcpprefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
+iosmcpprefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
 iosmcpprefs_FRAMEWORKS = UIKit CoreGraphics
 iosmcpprefs_PRIVATE_FRAMEWORKS = Preferences
 iosmcpprefs_LDFLAGS = -F$(THEOS)/sdks/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks

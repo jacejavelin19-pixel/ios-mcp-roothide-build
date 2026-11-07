@@ -12,7 +12,7 @@ include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = mcp-keychain
 mcp-keychain_FILES = main.m
-mcp-keychain_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
+mcp-keychain_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
 mcp-keychain_FRAMEWORKS = Foundation Security
 mcp-keychain_CODESIGN_FLAGS = -Sentitlements.plist
 mcp-keychain_INSTALL_PATH = /usr/libexec/ios-mcp
