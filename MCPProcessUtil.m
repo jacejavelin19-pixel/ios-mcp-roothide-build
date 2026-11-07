@@ -18,7 +18,7 @@
 
 extern char **environ;
 
-#define MCP_HELPERD_SOCK_PATH "/var/mobile/Library/Caches/ios-mcp-work/.helperd.sock"
+#define MCP_HELPERD_SOCK_REL  "/var/tmp/.mcp-helperd.sock"
 #define MCP_HELPERD_TCP_PORT  48091
 
 // SpringBoard may have closed stdio descriptors 0/1/2. Move pipe FDs >= 3 so
@@ -91,7 +91,15 @@ int MCPConnectHelperDaemon(void) {
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        strlcpy(addr.sun_path, MCP_HELPERD_SOCK_PATH, sizeof(addr.sun_path));
+#ifdef MCP_ROOTHIDE
+        NSString *sockPathObj = jbroot(@MCP_HELPERD_SOCK_REL);
+#elif defined(MCP_ROOTLESS)
+        NSString *sockPathObj = [@"/var/jb" stringByAppendingString:@MCP_HELPERD_SOCK_REL];
+#else
+        NSString *sockPathObj = @MCP_HELPERD_SOCK_REL;
+#endif
+        const char *sockPath = sockPathObj.fileSystemRepresentation ?: MCP_HELPERD_SOCK_REL;
+        strlcpy(addr.sun_path, sockPath, sizeof(addr.sun_path));
         if (connect(unixFD, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             MCPKeepFDAboveStdio(&unixFD);
             return unixFD;

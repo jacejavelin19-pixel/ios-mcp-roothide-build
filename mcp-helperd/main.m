@@ -22,8 +22,8 @@
 extern char **environ;
 
 #define MCP_HELPERD_WORK_DIR  "/var/mobile/Library/Caches/ios-mcp-work"
-#define MCP_HELPERD_SOCK_PATH "/var/mobile/Library/Caches/ios-mcp-work/.helperd.sock"
-#define MCP_HELPERD_PID_PATH  "/var/mobile/Library/Caches/ios-mcp-work/.helperd.pid"
+#define MCP_HELPERD_SOCK_REL  "/var/tmp/.mcp-helperd.sock"
+#define MCP_HELPERD_PID_REL   "/var/mobile/Library/Caches/ios-mcp-work/.helperd.pid"
 #define MCP_HELPERD_TCP_PORT  48091
 #define MCP_HELPERD_OCR_MAGIC 0x4F435231U
 
@@ -499,7 +499,10 @@ static int MCPCreateTCPListener(uint16_t port) {
 }
 
 static void MCPKillPreviousHelperDaemon(void) {
-    FILE *f = fopen(MCP_HELPERD_PID_PATH, "r");
+    NSString *pidPath = MCPResolveJBPath(@MCP_HELPERD_PID_REL);
+    const char *fsPid = pidPath.fileSystemRepresentation;
+    if (!fsPid || !*fsPid) return;
+    FILE *f = fopen(fsPid, "r");
     if (!f) return;
     int oldPid = 0;
     if (fscanf(f, "%d", &oldPid) == 1 && oldPid > 1 && oldPid != (int)getpid()) {
@@ -507,15 +510,18 @@ static void MCPKillPreviousHelperDaemon(void) {
         usleep(50000);
     }
     fclose(f);
-    unlink(MCP_HELPERD_PID_PATH);
+    unlink(fsPid);
 }
 
 static void MCPWritePidFile(void) {
-    FILE *f = fopen(MCP_HELPERD_PID_PATH, "w");
+    NSString *pidPath = MCPResolveJBPath(@MCP_HELPERD_PID_REL);
+    const char *fsPid = pidPath.fileSystemRepresentation;
+    if (!fsPid || !*fsPid) return;
+    FILE *f = fopen(fsPid, "w");
     if (!f) return;
     fprintf(f, "%d\n", (int)getpid());
     fclose(f);
-    chmod(MCP_HELPERD_PID_PATH, 0644);
+    chmod(fsPid, 0644);
 }
 
 static int MCPSpawnDetachedDaemon(const char *arg0) {
@@ -554,9 +560,19 @@ int main(int argc, char *argv[]) {
     @autoreleasepool {
         signal(SIGPIPE, SIG_IGN);
 
-        mkdir(MCP_HELPERD_WORK_DIR, 0755);
-        chmod(MCP_HELPERD_WORK_DIR, 0755);
-        chown(MCP_HELPERD_WORK_DIR, 501, 501);
+        NSString *workDir = MCPResolveJBPath(@MCP_HELPERD_WORK_DIR);
+        NSString *tmpDir = MCPResolveJBPath(@"/var/tmp");
+        const char *fsWorkDir = workDir.fileSystemRepresentation;
+        const char *fsTmpDir = tmpDir.fileSystemRepresentation;
+        if (fsWorkDir && *fsWorkDir) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
+            chmod(fsWorkDir, 0777);
+            chown(fsWorkDir, 501, 501);
+        }
+        if (fsTmpDir && *fsTmpDir) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
+            chmod(fsTmpDir, 01777);
+        }
 
         if (argc > 1 && strcmp(argv[1], "--daemon") == 0) {
             MCPKillPreviousHelperDaemon();
@@ -573,11 +589,14 @@ int main(int argc, char *argv[]) {
             seteuid(501);
         }
 
-        mkdir(MCP_HELPERD_WORK_DIR, 0755);
-        chmod(MCP_HELPERD_WORK_DIR, 0755);
+        if (fsWorkDir && *fsWorkDir) {
+            mkdir(fsWorkDir, 0777);
+            chmod(fsWorkDir, 0777);
+        }
         MCPWritePidFile();
 
-        int unixFD = MCPCreateUnixListener(MCP_HELPERD_SOCK_PATH);
+        NSString *sockPath = MCPResolveJBPath(@MCP_HELPERD_SOCK_REL);
+        int unixFD = sockPath.length ? MCPCreateUnixListener(sockPath.fileSystemRepresentation) : -1;
         int tcpFD = MCPCreateTCPListener(MCP_HELPERD_TCP_PORT);
         if (unixFD < 0 && tcpFD < 0) {
             return 1;
