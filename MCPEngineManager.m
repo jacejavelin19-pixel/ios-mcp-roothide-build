@@ -42,12 +42,12 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *dir = MCPResolvedJailbreakPath(kMCPEngineSessionsDir);
     [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    chmod([dir stringByDeletingLastPathComponent].UTF8String, 0777);
+    chmod(dir.UTF8String, 0777);
     if ([fm isWritableFileAtPath:dir]) return dir;
-    // A legacy jbroot directory may be owned by root. Keep engine sessions in
-    // the server user's writable cache rather than silently discarding them.
-    NSString *cache = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-    dir = [cache stringByAppendingPathComponent:@"ios-mcp/engine-sessions"];
+    dir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work/engine-sessions");
     [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    chmod(dir.UTF8String, 0777);
     return dir;
 }
 

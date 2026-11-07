@@ -52,6 +52,19 @@ static void MCPTryEnsureProcessDebugged(pid_t pid) {
     }
 }
 
+static NSString *MCPMemoryEnsureWorkDir(void) {
+    NSString *dir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    glob_t g = {0};
+    if (glob("/var/containers/Bundle/Application/.jbroot-*/var/mobile/Library/Caches", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+        dir = [[NSString stringWithUTF8String:g.gl_pathv[0]] stringByAppendingPathComponent:@"ios-mcp-work"];
+    }
+    globfree(&g);
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    chmod(dir.UTF8String, 0777);
+    chown(dir.UTF8String, 501, 501);
+    return dir;
+}
+
 static kern_return_t MCPTryHookdVmProtect(pid_t pid, mach_vm_address_t addr, mach_vm_size_t size, vm_prot_t prot) {
     void *h = MCPLoadLibJailbreak();
     if (!h) return KERN_FAILURE;
@@ -383,6 +396,7 @@ static NSArray<NSDictionary *> *MCPRemoteReadIvarList(mach_port_t task, uint64_t
         }
         return task;
     }
+    MCPTryEnsureProcessDebugged(pid);
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t result = task_for_pid(mach_task_self(), pid, &task);
     if (result != KERN_SUCCESS && error) *error = MCPMachError(result);
@@ -1234,7 +1248,7 @@ static BOOL MCPParseSliceEncryptionInfo(const uint8_t *sliceBase,
         }
     }
 
-    NSString *stageRoot = [NSTemporaryDirectory() stringByAppendingPathComponent:
+    NSString *stageRoot = [MCPMemoryEnsureWorkDir() stringByAppendingPathComponent:
                            [NSString stringWithFormat:@"ios-mcp-decrypt-%d-%u", pid, arc4random()]];
     NSString *payloadDir = [stageRoot stringByAppendingPathComponent:@"Payload"];
     NSString *stagedAppPath = [payloadDir stringByAppendingPathComponent:bundlePath.lastPathComponent];
@@ -1391,7 +1405,8 @@ static BOOL MCPParseSliceEncryptionInfo(const uint8_t *sliceBase,
     if (!outputPath.length) {
         NSString *bundleId = infoPlist[@"CFBundleIdentifier"] ?: @"decrypted-app";
         NSString *shortVer = infoPlist[@"CFBundleShortVersionString"] ?: @"1.0";
-        outputPath = [NSString stringWithFormat:@"/tmp/%@-%@-decrypted.ipa", bundleId, shortVer];
+        outputPath = [MCPMemoryEnsureWorkDir() stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"%@-%@-decrypted.ipa", bundleId, shortVer]];
     }
 
     NSString *zipErr = nil;
@@ -1400,6 +1415,8 @@ static BOOL MCPParseSliceEncryptionInfo(const uint8_t *sliceBase,
         if (error) *error = zipErr ?: @"Failed to package decrypted IPA";
         return nil;
     }
+    chmod(outputPath.UTF8String, 0666);
+    chown(outputPath.UTF8String, 501, 501);
 
     NSDictionary *ipaAttrs = [fm attributesOfItemAtPath:outputPath error:nil];
     uint64_t ipaSize = [ipaAttrs[NSFileSize] unsignedLongLongValue];
@@ -2005,6 +2022,18 @@ typedef struct {
             dic->weak_bind_off = 0; dic->weak_bind_size = 0;
             dic->lazy_bind_off = 0; dic->lazy_bind_size = 0;
             dic->export_off = 0; dic->export_size = 0;
+        } else if ((lc->cmd == LC_CODE_SIGNATURE ||
+                    lc->cmd == LC_SEGMENT_SPLIT_INFO ||
+                    lc->cmd == LC_FUNCTION_STARTS ||
+                    lc->cmd == LC_DATA_IN_CODE ||
+                    lc->cmd == LC_DYLIB_CODE_SIGN_DRS ||
+                    lc->cmd == LC_LINKER_OPTIMIZATION_HINT ||
+                    lc->cmd == 0x80000033U /* LC_DYLD_EXPORTS_TRIE */ ||
+                    lc->cmd == 0x80000034U /* LC_DYLD_CHAINED_FIXUPS */) &&
+                   lc->cmdsize >= sizeof(struct linkedit_data_command)) {
+            struct linkedit_data_command *ldc = (struct linkedit_data_command *)lc;
+            ldc->dataoff = 0;
+            ldc->datasize = 0;
         }
         off += lc->cmdsize;
     }
@@ -2044,16 +2073,23 @@ typedef struct {
 
     if (!outputPath.length) {
         NSString *safeBase = matchedPath.lastPathComponent ?: @"extracted_dylib";
-        outputPath = [NSString stringWithFormat:@"/tmp/%@.extracted.macho", safeBase];
+        outputPath = [MCPMemoryEnsureWorkDir() stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"%@.extracted.macho", safeBase]];
     }
     NSString *parentDir = [outputPath stringByDeletingLastPathComponent];
     if (parentDir.length) {
         [[NSFileManager defaultManager] createDirectoryAtPath:parentDir withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([parentDir hasSuffix:@"/ios-mcp-work"]) {
+            chmod(parentDir.UTF8String, 0777);
+            chown(parentDir.UTF8String, 501, 501);
+        }
     }
     if (![outFileData writeToFile:outputPath atomically:YES]) {
         if (error) *error = [NSString stringWithFormat:@"Failed to write extracted Mach-O to %@", outputPath];
         return nil;
     }
+    chmod(outputPath.UTF8String, 0666);
+    chown(outputPath.UTF8String, 501, 501);
 
     return @{
         @"pid": @(targetPid),

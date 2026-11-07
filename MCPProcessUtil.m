@@ -267,6 +267,24 @@ NSString *MCPResolvedJailbreakPath(NSString *path) {
         }
     }
 
+    BOOL forceJBRoot =
+        [path isEqualToString:@"/var/mobile/Library/ios-mcp"] ||
+        [path hasPrefix:@"/var/mobile/Library/ios-mcp/"] ||
+        [path isEqualToString:@"/private/var/mobile/Library/ios-mcp"] ||
+        [path hasPrefix:@"/private/var/mobile/Library/ios-mcp/"] ||
+        [path isEqualToString:@"/var/mobile/Library/Caches/ios-mcp-work"] ||
+        [path hasPrefix:@"/var/mobile/Library/Caches/ios-mcp-work/"] ||
+        [path isEqualToString:@"/var/mobile/Library/Caches/ios-mcp-uploads"] ||
+        [path hasPrefix:@"/var/mobile/Library/Caches/ios-mcp-uploads/"] ||
+        [path isEqualToString:@"/var/mobile/Library/Caches/ios-mcp-appmod"] ||
+        [path hasPrefix:@"/var/mobile/Library/Caches/ios-mcp-appmod/"] ||
+        [path isEqualToString:@"/var/mobile/Library/RootHide"] ||
+        [path hasPrefix:@"/var/mobile/Library/RootHide/"];
+    if (forceJBRoot) {
+        NSString *jb = jbroot(path);
+        if (jb.length) return jb;
+    }
+
     BOOL preferRealRootFS =
         [path hasPrefix:@"/var/mobile/"] || [path isEqualToString:@"/var/mobile"] ||
         [path hasPrefix:@"/private/var/mobile/"] || [path isEqualToString:@"/private/var/mobile"] ||

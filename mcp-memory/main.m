@@ -59,7 +59,7 @@ int main(int argc, const char *argv[]) {
                 result = [[MemoryManager sharedInstance] listRegionsPID:(pid_t)pid limit:(NSUInteger)limit error:&failure];
             }
         } else if (strcmp(argv[1], "classdump") == 0) {
-            NSString *filter = (argc >= 4 && argv[3][0] != '\0') ? [NSString stringWithUTF8String:argv[3]] : nil;
+            NSString *filter = (argc >= 4 && argv[3][0] != '\0' && strcmp(argv[3], "-") != 0) ? [NSString stringWithUTF8String:argv[3]] : nil;
             uint64_t limit = 500;
             BOOL includeSystem = NO;
             if (argc >= 5 && !parseUnsigned(argv[4], &limit)) {

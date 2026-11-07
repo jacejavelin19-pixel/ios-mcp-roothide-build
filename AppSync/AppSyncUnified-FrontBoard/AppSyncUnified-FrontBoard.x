@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 
-static void MCPAppSyncFrontBoardLog(NSString *message) {
+static void MCPAppSyncFrontBoardLog(__unused NSString *message) {
+#if defined(DEBUG) && DEBUG
 	NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message ?: @""];
 	NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
 	if (!data) return;
@@ -23,6 +24,7 @@ static void MCPAppSyncFrontBoardLog(NSString *message) {
 	} @finally {
 		[handle closeFile];
 	}
+#endif
 }
 
 #ifdef DEBUG

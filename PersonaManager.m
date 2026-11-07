@@ -2,7 +2,9 @@
 #import "MCPEngineManager.h"
 #import "AppManager.h"
 #import "KeychainManager.h"
+#import "PlistPatchManager.h"
 #import "MCPProcessUtil.h"
+#import <sys/stat.h>
 
 static NSString *const kMCPSpoofDir = @"/var/mobile/Library/ios-mcp/spoof";
 
@@ -111,12 +113,37 @@ static NSDictionary *MCPCountryPreset(NSString *countryCode) {
 
 - (NSString *)spoofDirectory {
     NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:kMCPSpoofDir withIntermediateDirectories:YES attributes:nil error:NULL];
-    if ([fm isWritableFileAtPath:kMCPSpoofDir]) return kMCPSpoofDir;
-    NSString *cache = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *fallback = [cache stringByAppendingPathComponent:@"ios-mcp/spoof"];
+    NSString *resolved = MCPResolvedJailbreakPath(kMCPSpoofDir);
+    [fm createDirectoryAtPath:resolved withIntermediateDirectories:YES attributes:nil error:NULL];
+    chmod([resolved stringByDeletingLastPathComponent].UTF8String, 0777);
+    chmod(resolved.UTF8String, 0777);
+    if ([fm isWritableFileAtPath:resolved]) return resolved;
+    NSString *fallback = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work/spoof");
     [fm createDirectoryAtPath:fallback withIntermediateDirectories:YES attributes:nil error:NULL];
+    chmod(fallback.UTF8String, 0777);
     return fallback;
+}
+
+- (NSDictionary *)syncRootHideBlacklistForBundleId:(NSString *)bundleId
+                                        desiredValue:(id)desiredObj {
+    NSString *cfgPath = MCPResolvedJailbreakPath(@"/var/mobile/Library/RootHide/RootHideConfig.plist");
+    if (!cfgPath.length || ![[NSFileManager defaultManager] fileExistsAtPath:cfgPath]) {
+        return @{@"available": @NO};
+    }
+    NSString *kp = [NSString stringWithFormat:@"appconfig.%@", bundleId];
+    if (desiredObj != nil && ([desiredObj isKindOfClass:[NSNumber class]] || [desiredObj isKindOfClass:[NSString class]])) {
+        BOOL flag = [desiredObj boolValue];
+        NSString *err = nil;
+        [[PlistPatchManager sharedInstance] setValue:@(flag) atPath:cfgPath keypath:kp error:&err];
+    }
+    NSString *readErr = nil;
+    NSDictionary *readRes = [[PlistPatchManager sharedInstance] valueAtPath:cfgPath keypath:kp error:&readErr];
+    BOOL blacklisted = [readRes[@"value"] respondsToSelector:@selector(boolValue)] ? [readRes[@"value"] boolValue] : NO;
+    return @{
+        @"available": @YES,
+        @"config_path": cfgPath,
+        @"blacklisted": @(blacklisted)
+    };
 }
 
 - (NSString *)spoofFileForBundleId:(NSString *)bundleId {
@@ -424,12 +451,14 @@ static NSDictionary *MCPCountryPreset(NSString *countryCode) {
                                                                      forBundleId:bundleId
                                                                             args:(args ?: @{})
                                                                            error:&inProcErr];
+    NSDictionary *rhInfo = [self syncRootHideBlacklistForBundleId:bundleId desiredValue:args[@"roothide_blacklist"]];
     return @{
         @"bundle_id": bundleId,
         @"wiped": @YES,
         @"wiped_vectors": wipedVectors,
         @"sandbox_files_removed": @(deletedFiles),
         @"birthtime_jitter_nsec": persona[@"birthtime_jitter_nsec"] ?: @0,
+        @"roothide_blacklist": rhInfo ?: @{},
         @"in_process_wipe": inProcRes ?: @{@"status": @"app_not_attached_cleaned_on_disk"}
     };
 }
@@ -468,6 +497,8 @@ static NSDictionary *MCPCountryPreset(NSString *countryCode) {
     NSMutableDictionary *finalRes = [applyRes mutableCopy];
     finalRes[@"bundle_id"] = bundleId;
     finalRes[@"persona_path"] = [self spoofFileForBundleId:bundleId];
+    NSDictionary *rhInfo = [self syncRootHideBlacklistForBundleId:bundleId desiredValue:args[@"roothide_blacklist"]];
+    if (rhInfo) finalRes[@"roothide_blacklist"] = rhInfo;
     if (postPatchAudit) {
         finalRes[@"audit"] = postPatchAudit;
     }

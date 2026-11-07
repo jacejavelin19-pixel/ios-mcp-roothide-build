@@ -1,6 +1,7 @@
 #import "ClassDumpManager.h"
 #import "AppManager.h"
 #import "MCPProcessUtil.h"
+#import "MemoryManager.h"
 #import <unistd.h>
 
 @implementation ClassDumpManager
@@ -61,6 +62,21 @@
 
     if (limit == 0) limit = 200;
     if (limit > 2000) limit = 2000;
+
+    if (pid == getpid()) {
+        NSString *inProcErr = nil;
+        NSDictionary *inProc = [[MemoryManager sharedInstance] dumpClassesPID:pid
+                                                                       filter:(filter.length > 0 ? filter : nil)
+                                                                        limit:limit
+                                                                includeSystem:includeSystem
+                                                                        error:&inProcErr];
+        if (inProc) {
+            NSMutableDictionary *result = [inProc mutableCopy];
+            result[@"bundle_id"] = bundleId;
+            result[@"pid"] = @(pid);
+            return result;
+        }
+    }
 
     NSArray<NSString *> *helperArgs = @[
         @"classdump",

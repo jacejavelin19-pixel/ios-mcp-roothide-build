@@ -117,7 +117,8 @@ static NSString *MCPAMCreateWorkDir(NSString **error) {
         base = @"/var/tmp/ios-mcp-appmod";
         [fm createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    chmod(base.fileSystemRepresentation, 0755);
+    chmod(base.fileSystemRepresentation, 0777);
+    chown(base.fileSystemRepresentation, 501, 501);
     NSString *work = [base stringByAppendingPathComponent:
                       [NSString stringWithFormat:@"work-%d-%@", getpid(), [NSUUID UUID].UUIDString]];
     if (![fm createDirectoryAtPath:work withIntermediateDirectories:YES attributes:nil error:&err]) {

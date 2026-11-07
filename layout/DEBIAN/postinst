@@ -39,6 +39,18 @@ fix_perms() {
             chmod 0755 "${base}/usr/libexec/ios-mcp/${helper}" 2>/dev/null || true
         fi
     done
+    if [ -n "$base" ]; then
+        for d in "${base}/var/mobile/Library/Caches/ios-mcp-work" \
+                 "${base}/var/mobile/Library/Caches/ios-mcp-uploads" \
+                 "${base}/var/mobile/Library/Caches/ios-mcp-appmod" \
+                 "${base}/var/mobile/Library/ios-mcp"; do
+            mkdir -p "$d" 2>/dev/null || true
+            chown -R 501:501 "$d" 2>/dev/null || true
+            chmod -R 0777 "$d" 2>/dev/null || true
+        done
+    fi
+    rm -f /rootfs/var/tmp/ios-mcp-appsync-frontboard.log /var/tmp/ios-mcp-appsync-frontboard.log 2>/dev/null || true
+    rm -rf /rootfs/var/mobile/Library/ios-mcp 2>/dev/null || true
 }
 
 # Resolve an ABSOLUTE, existing path to mcp-helperd. launchd (which spawns the
@@ -136,7 +148,13 @@ EOF
     done
 
     if [ "$_in_helperd" -eq 1 ]; then
-        ( sleep 1
+        _dpkg_pid="$PPID"
+        ( _w=0
+          while [ "$_w" -lt 30 ] && [ -n "$_dpkg_pid" ] && kill -0 "$_dpkg_pid" 2>/dev/null; do
+              sleep 1
+              _w=$((_w + 1))
+          done
+          sleep 1
           "$helper_abs" --daemon </dev/null >/dev/null 2>&1 || true
           if command -v launchctl >/dev/null 2>&1; then
               timeout 5 launchctl bootstrap system "$plist" >/dev/null 2>&1 || true

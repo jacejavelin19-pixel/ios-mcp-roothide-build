@@ -1,6 +1,13 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <WebKit/WebKit.h>
+#import <CoreLocation/CoreLocation.h>
+#import <CoreMotion/CoreMotion.h>
+#import <CommonCrypto/CommonCryptor.h>
+#import <CommonCrypto/CommonHMAC.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <sqlite3.h>
 #import <dlfcn.h>
 #import <errno.h>
@@ -74,6 +81,11 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
 - (void)writeRuntimeStateSnapshot;
 - (uintptr_t)engineScratchAddress;
 - (NSInteger)runEngineProbe;
+- (NSDictionary *)runCryptoProbe;
+- (NSDictionary *)runBiometricProbe;
+- (NSDictionary *)readLocationAndSensors;
+- (void)triggerProtobufFetch;
+- (NSDictionary *)runFullSuiteProbe;
 
 @end
 
@@ -89,7 +101,7 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
 }
 
 + (NSString *)vaultVersion {
-    return @"1.2.9-roothide";
+    return @"2.1.1-roothide";
 }
 
 - (instancetype)init {
@@ -125,11 +137,104 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
         (void)write(fd, marker, sizeof(marker)-1);
         close(fd);
     }
+    // Also exercise ephemeral unlinked canary file for fs_io_and_iokit_tracer
+    NSString *canaryPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ephemeral_canary_211.bin"];
+    int cfd = open(canaryPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (cfd >= 0) {
+        const char canaryPayload[] = "CANARY_SECRET_211_UNLINKED";
+        (void)write(cfd, canaryPayload, sizeof(canaryPayload) - 1);
+        close(cfd);
+        unlink(canaryPath.fileSystemRepresentation);
+    }
     NSDictionary *result = @{@"pid":@(getpid()), @"pin_result":@(pinResult),
-                              @"file_opened":@(fd >= 0), @"foreground":@([UIApplication sharedApplication].applicationState == UIApplicationStateActive)};
+                              @"file_opened":@(fd >= 0), @"ephemeral_canary_written":@(cfd >= 0),
+                              @"foreground":@([UIApplication sharedApplication].applicationState == UIApplicationStateActive)};
     [[NSJSONSerialization dataWithJSONObject:result options:0 error:NULL]
         writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"engine_probe.json"] atomically:YES];
     return pinResult;
+}
+
+- (NSDictionary *)runCryptoProbe {
+    const uint8_t key[32] = "0123456789abcdef0123456789abcdef";
+    const uint8_t iv[16]  = "fedcba9876543210";
+    const char *plain = "MCP_CRYPTO_PLAINTEXT_211";
+    size_t plainLen = strlen(plain);
+    uint8_t cipherBuf[64] = {0};
+    size_t cipherLen = 0;
+    CCCryptorStatus encStatus = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                        key, sizeof(key), iv, plain, plainLen,
+                                        cipherBuf, sizeof(cipherBuf), &cipherLen);
+    uint8_t decBuf[64] = {0};
+    size_t decLen = 0;
+    CCCryptorStatus decStatus = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                        key, sizeof(key), iv, cipherBuf, cipherLen,
+                                        decBuf, sizeof(decBuf), &decLen);
+    uint8_t hmacOut[CC_SHA256_DIGEST_LENGTH] = {0};
+    CCHmac(kCCHmacAlgSHA256, key, sizeof(key), plain, plainLen, hmacOut);
+    uint8_t shaOut[CC_SHA256_DIGEST_LENGTH] = {0};
+    CC_SHA256(plain, (CC_LONG)plainLen, shaOut);
+
+    NSMutableString *cipherHex = [NSMutableString stringWithCapacity:cipherLen * 2];
+    for (size_t i = 0; i < cipherLen; i++) [cipherHex appendFormat:@"%02x", cipherBuf[i]];
+    NSMutableString *hmacHex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (size_t i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [hmacHex appendFormat:@"%02x", hmacOut[i]];
+
+    NSString *decStr = (decStatus == kCCSuccess)
+        ? ([[NSString alloc] initWithBytes:decBuf length:decLen encoding:NSUTF8StringEncoding] ?: @"")
+        : @"";
+    NSDictionary *res = @{
+        @"enc_status": @(encStatus),
+        @"dec_status": @(decStatus),
+        @"cipher_hex": cipherHex,
+        @"decrypted": decStr,
+        @"hmac_sha256": hmacHex
+    };
+    [[NSJSONSerialization dataWithJSONObject:res options:NSJSONWritingPrettyPrinted error:NULL]
+        writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"crypto_probe.json"] atomically:YES];
+    return res;
+}
+
+- (NSDictionary *)runBiometricProbe {
+    LAContext *ctx = [[LAContext alloc] init];
+    NSError *canErr = nil;
+    BOOL canEval = [ctx canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&canErr];
+    __block BOOL evalSuccess = NO;
+    __block NSString *evalErrStr = canErr ? (canErr.localizedDescription ?: @"") : @"";
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [ctx evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
+        localizedReason:@"MCPTestTarget 2.1.1 Biometric Vault Probe"
+                  reply:^(BOOL success, NSError *error) {
+        evalSuccess = success;
+        if (error) evalErrStr = error.localizedDescription ?: @"error";
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)));
+    NSDictionary *res = @{
+        @"can_evaluate_biometrics": @(canEval),
+        @"evaluate_success": @(evalSuccess),
+        @"biometry_type": @((NSInteger)ctx.biometryType),
+        @"error": evalErrStr ?: @""
+    };
+    [[NSJSONSerialization dataWithJSONObject:res options:NSJSONWritingPrettyPrinted error:NULL]
+        writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"biometric_probe.json"] atomically:YES];
+    return res;
+}
+
+- (NSDictionary *)readLocationAndSensors {
+    CLLocation *loc = [[CLLocation alloc] initWithLatitude:37.33182 longitude:-122.03118];
+    CLLocationCoordinate2D coord = loc.coordinate;
+    CMMotionManager *mm = [[CMMotionManager alloc] init];
+    NSDictionary *res = @{
+        @"latitude": @(coord.latitude),
+        @"longitude": @(coord.longitude),
+        @"altitude": @(loc.altitude),
+        @"speed": @(loc.speed),
+        @"accelerometer_available": @(mm.isAccelerometerAvailable),
+        @"gyro_available": @(mm.isGyroAvailable)
+    };
+    [[NSJSONSerialization dataWithJSONObject:res options:NSJSONWritingPrettyPrinted error:NULL]
+        writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"location_probe.json"] atomically:YES];
+    return res;
 }
 
 - (NSString *)computeVaultDigest:(NSString *)seed {
@@ -276,6 +381,56 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
     [task resume];
 }
 
+- (void)triggerProtobufFetch {
+    if (_localEchoPort == 0) [self startLocalEchoServer];
+    if (_localEchoPort == 0) return;
+
+    NSString *urlStr = [NSString stringWithFormat:@"http://127.0.0.1:%u/api/v1/vault/proto?format=protobuf", (unsigned)_localEchoPort];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+
+    // Wire-format protobuf payload:
+    // field 1 (string, tag 0x0a, len 13): "mcp-proto-211"
+    // field 2 (varint, tag 0x10): 2359 (0xb7 0x12)
+    // field 3 (nested msg, tag 0x1a, len 17): { field 1 (string, tag 0x0a, len 15): "roothide-arm64e" }
+    static const uint8_t kProtoBytes[] = {
+        0x0a, 0x0d, 'm','c','p','-','p','r','o','t','o','-','2','1','1',
+        0x10, 0xb7, 0x12,
+        0x1a, 0x11, 0x0a, 0x0f, 'r','o','o','t','h','i','d','e','-','a','r','m','6','4','e'
+    };
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/x-protobuf" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"2.1.1-roothide" forHTTPHeaderField:@"X-Vault-Proto"];
+    req.HTTPBody = [NSData dataWithBytes:kProtoBytes length:sizeof(kProtoBytes)];
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+                                                                 completionHandler:^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+    }];
+    [task resume];
+}
+
+- (NSDictionary *)runFullSuiteProbe {
+    NSDictionary *crypto = [self runCryptoProbe];
+    NSDictionary *bio = [self runBiometricProbe];
+    NSDictionary *loc = [self readLocationAndSensors];
+    NSInteger pin = [self runEngineProbe];
+    [self triggerLocalHTTPFetch];
+    [self triggerProtobufFetch];
+    [self writeRuntimeStateSnapshot];
+    NSDictionary *suite = @{
+        @"version": [MCPTestVault vaultVersion],
+        @"pid": @(getpid()),
+        @"pin_probe": @(pin),
+        @"crypto": crypto ?: @{},
+        @"biometrics": bio ?: @{},
+        @"location": loc ?: @{}
+    };
+    [[NSJSONSerialization dataWithJSONObject:suite options:NSJSONWritingPrettyPrinted error:NULL]
+        writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"full_suite_probe.json"] atomically:YES];
+    return suite;
+}
+
 - (void)seedSQLiteFixture {
     NSString *dbPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vault_fixture.sqlite"];
     sqlite3 *db = NULL;
@@ -289,6 +444,27 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
         "INSERT INTO vault_records (id, label, clearance) VALUES (1, 'alpha_sector', 10), (2, 'bravo_key', 20), (3, 'charlie_root', 30);";
     sqlite3_exec(db, sql, NULL, NULL, NULL);
     sqlite3_close(db);
+
+    // Seed plist fixture
+    NSString *plistPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"vault_config.plist"];
+    NSDictionary *plistDict = @{
+        @"vault_version": @"2.1.1",
+        @"security_level": @3,
+        @"features": @{@"crypto": @YES, @"webkit": @YES, @"roothide": @YES}
+    };
+    [plistDict writeToFile:plistPath atomically:YES];
+
+    // Seed keychain fixture
+    NSDictionary *kcQuery = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"com.iosmcp.testtarget.vault",
+        (__bridge id)kSecAttrAccount: @"vault_master_key"
+    };
+    SecItemDelete((__bridge CFDictionaryRef)kcQuery);
+    NSMutableDictionary *kcAdd = [kcQuery mutableCopy];
+    kcAdd[(__bridge id)kSecValueData] = [@"MASTER_KEY_211_ROOTHIDE" dataUsingEncoding:NSUTF8StringEncoding];
+    kcAdd[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+    SecItemAdd((__bridge CFDictionaryRef)kcAdd, NULL);
 }
 
 - (void)writeRuntimeStateSnapshot {
@@ -492,6 +668,7 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
 
 @interface MCPTestViewController : UIViewController
 @property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) WKWebView *webView;
 @end
 
 @implementation MCPTestViewController
@@ -500,17 +677,17 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithRed:0.08 green:0.10 blue:0.14 alpha:1.0];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 56, self.view.bounds.size.width - 40, 32)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 48, self.view.bounds.size.width - 40, 28)];
     title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    title.text = @"MCPTestTarget 1.2.9";
-    title.font = [UIFont boldSystemFontOfSize:22];
+    title.text = @"MCPTestTarget 2.1.1";
+    title.font = [UIFont boldSystemFontOfSize:20];
     title.textColor = [UIColor whiteColor];
     [self.view addSubview:title];
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 96, self.view.bounds.size.width - 40, 140)];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, self.view.bounds.size.width - 40, 108)];
     self.statusLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     self.statusLabel.numberOfLines = 0;
-    self.statusLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    self.statusLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     self.statusLabel.textColor = [UIColor colorWithRed:0.72 green:0.92 blue:0.80 alpha:1.0];
     self.statusLabel.text = [NSString stringWithFormat:@"PID: %d\nVault: %@\nMarker: %@",
                              getpid(),
@@ -523,13 +700,14 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
         @[@"Run HTTP Fetch", NSStringFromSelector(@selector(onRunHTTP))],
         @[@"Run Anti-Detection Audit", NSStringFromSelector(@selector(onRunAudit))],
         @[@"Refresh Vault State", NSStringFromSelector(@selector(onRefreshState))],
-        @[@"Run Engine Probe", NSStringFromSelector(@selector(onEngineProbe))]
+        @[@"Run Engine Probe", NSStringFromSelector(@selector(onEngineProbe))],
+        @[@"Run Full v2.1.1 Suite", NSStringFromSelector(@selector(onRunFullSuite))]
     ];
 
-    CGFloat y = 250.0;
+    CGFloat y = 196.0;
     for (NSArray *spec in buttons) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(20, y, self.view.bounds.size.width - 40, 44);
+        btn.frame = CGRectMake(20, y, self.view.bounds.size.width - 40, 38);
         btn.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         btn.backgroundColor = [UIColor colorWithRed:0.16 green:0.24 blue:0.36 alpha:1.0];
         btn.layer.cornerRadius = 8.0;
@@ -538,8 +716,23 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
         btn.accessibilityLabel = spec[0];
         [btn addTarget:self action:NSSelectorFromString(spec[1]) forControlEvents:UIControlEventTouchUpInside];
         [self.view addSubview:btn];
-        y += 54.0;
+        y += 44.0;
     }
+
+    WKWebViewConfiguration *wkCfg = [[WKWebViewConfiguration alloc] init];
+    self.webView = [[WKWebView alloc] initWithFrame:CGRectMake(20, y + 4.0, self.view.bounds.size.width - 40, 120) configuration:wkCfg];
+    self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.webView.layer.cornerRadius = 8.0;
+    self.webView.clipsToBounds = YES;
+    NSString *html = @"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                     @"<style>body{margin:8px;font-family:-apple-system;background:#141c28;color:#d0f0df;font-size:12px}"
+                     @"input,button{font-size:12px;padding:4px 8px;border-radius:4px;border:1px solid #3a506b;background:#1c2541;color:#fff}</style></head>"
+                     @"<body><div id='vault-banner' data-token='MCP_DOM_211'>MCP WebKit Bridge 2.1.1 Ready</div>"
+                     @"<div style='margin-top:6px'><input id='vault-input' name='vault_code' value='initial_211'/> "
+                     @"<button id='vault-btn' onclick=\"window.__mcpClicks=(window.__mcpClicks||0)+1;document.getElementById('vault-banner').innerText='DOM Clicked '+window.__mcpClicks;\">Tap DOM</button></div>"
+                     @"<script>document.cookie='mcp_webview_session=active_211; path=/';</script></body></html>";
+    [self.webView loadHTMLString:html baseURL:[NSURL URLWithString:@"https://vault.iosmcp.local/"]];
+    [self.view addSubview:self.webView];
 }
 
 - (void)onRunTLS {
@@ -569,6 +762,12 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
                              getpid(), [[MCPTestVault sharedVault] currentHeapMarkerString]];
 }
 
+- (void)onRunFullSuite {
+    NSDictionary *suite = [[MCPTestVault sharedVault] runFullSuiteProbe];
+    self.statusLabel.text = [NSString stringWithFormat:@"PID: %d\nSuite: %@ | PIN: %@\nCrypto Dec: %@",
+                             getpid(), suite[@"version"], suite[@"pin_probe"], suite[@"crypto"][@"decrypted"]];
+}
+
 @end
 
 @interface MCPTestAppDelegate : UIResponder <UIApplicationDelegate>
@@ -585,6 +784,8 @@ static const uint8_t kMCPSelfSignedCertDER[336] = {
     [vault writeRuntimeStateSnapshot];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         [vault triggerLocalHTTPFetch];
+        [vault triggerProtobufFetch];
+        [vault runCryptoProbe];
     });
 
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];

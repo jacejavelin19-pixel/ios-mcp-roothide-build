@@ -121,8 +121,19 @@ static NSDictionary<NSString *, NSDictionary *> *MCPBuildContainerManifest(NSStr
                        [[NSCharacterSet characterSetWithCharactersInString:
                          @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"] invertedSet]]
                       componentsJoinedByString:@"_"];
-    NSString *dir = [kMCPCheckpointsDir stringByAppendingPathComponent:safe];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *base = MCPResolvedJailbreakPath(kMCPCheckpointsDir);
+    [fm createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:NULL];
+    chmod([base stringByDeletingLastPathComponent].UTF8String, 0777);
+    chmod(base.UTF8String, 0777);
+    if (![fm isWritableFileAtPath:base]) {
+        base = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work/checkpoints");
+        [fm createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:NULL];
+        chmod(base.UTF8String, 0777);
+    }
+    NSString *dir = [base stringByAppendingPathComponent:safe];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:NULL];
+    chmod(dir.UTF8String, 0777);
     return dir;
 }
 

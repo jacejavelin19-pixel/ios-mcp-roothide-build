@@ -593,6 +593,8 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
 - (NSString *)sessionsDirectory {
     NSString *dir = [MCPResolvedJailbreakPath(kMCPPreservedFridaDir) stringByAppendingPathComponent:@"sessions"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    chmod([dir stringByDeletingLastPathComponent].UTF8String, 0777);
+    chmod(dir.UTF8String, 0777);
     return dir;
 }
 
@@ -663,12 +665,16 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
         chmod(destPath.fileSystemRepresentation, 0666);
         return YES;
     }
-    NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
+    chmod(workDir.UTF8String, 0777);
     NSString *tmpPath = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"cfg-%@.json", [NSUUID UUID].UUIDString]];
     if (![data writeToFile:tmpPath options:NSDataWritingAtomic error:&jsonErr]) {
-        if (error) *error = jsonErr.localizedDescription ?: @"Failed to write temp file";
-        return NO;
+        tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"cfg-%@.json", [NSUUID UUID].UUIDString]];
+        if (![data writeToFile:tmpPath options:NSDataWritingAtomic error:&jsonErr]) {
+            if (error) *error = jsonErr.localizedDescription ?: @"Failed to write temp file";
+            return NO;
+        }
     }
     NSString *outStr = nil, *runErr = nil;
     int code = -1;

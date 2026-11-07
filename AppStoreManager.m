@@ -1,11 +1,183 @@
 #import "AppStoreManager.h"
 #import "AppManager.h"
+#import "AccessibilityManager.h"
+#import "OCRManager.h"
+#import "HIDManager.h"
 #import "ClassDumpManager.h"
 #import "EntitlementManager.h"
 #import "MCPMachOUtil.h"
 #import "MCPProcessUtil.h"
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
+#import <stdatomic.h>
+#import <sys/stat.h>
+
+static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
+    // 1. Check Accessibility compact UI elements for an App Store / StoreKit confirmation button
+    __block NSDictionary *axPayload = nil;
+    dispatch_semaphore_t axSem = dispatch_semaphore_create(0);
+    [[AccessibilityManager sharedInstance] getCompactUIElementsWithMaxElements:250
+                                                                   visibleOnly:YES
+                                                                 clickableOnly:NO
+                                                                    completion:^(NSDictionary *payload, __unused NSString *error) {
+        axPayload = payload;
+        dispatch_semaphore_signal(axSem);
+    }];
+    dispatch_semaphore_wait(axSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)));
+
+    NSArray *elements = [axPayload[@"elements"] isKindOfClass:[NSArray class]] ? axPayload[@"elements"] : @[];
+    BOOL axHasDialogContext = NO;
+    for (NSDictionary *el in elements) {
+        if (![el isKindOfClass:[NSDictionary class]]) continue;
+        for (NSString *k in @[@"text", @"label", @"value", @"identifier"]) {
+            NSString *val = [el[k] isKindOfClass:[NSString class]] ? [el[k] lowercaseString] : nil;
+            if (!val.length) continue;
+            if ([val containsString:@"app store"] ||
+                [val isEqualToString:@"cancel"] ||
+                [val containsString:@"apple id"] ||
+                [val containsString:@"apple account"] ||
+                [val containsString:@"account"] ||
+                [val isEqualToString:@"free"] ||
+                [val containsString:@"confirm"] ||
+                [val containsString:@"redownload"]) {
+                axHasDialogContext = YES;
+                break;
+            }
+        }
+        if (axHasDialogContext) break;
+    }
+
+    for (NSDictionary *el in elements) {
+        if (![el isKindOfClass:[NSDictionary class]]) continue;
+        NSString *matchedLabel = nil;
+        for (NSString *k in @[@"text", @"label", @"identifier"]) {
+            NSString *raw = [el[k] isKindOfClass:[NSString class]] ? el[k] : nil;
+            NSString *trim = [[raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+            if (!trim.length) continue;
+            if ([trim isEqualToString:@"install"] ||
+                [trim isEqualToString:@"get"] ||
+                [trim isEqualToString:@"redownload"] ||
+                [trim isEqualToString:@"confirm"] ||
+                (axHasDialogContext && ([trim isEqualToString:@"buy"] || [trim isEqualToString:@"ok"] || [trim isEqualToString:@"continue"] || [trim isEqualToString:@"always require"] || [trim isEqualToString:@"require after 15 minutes"]))) {
+                matchedLabel = raw;
+                break;
+            }
+        }
+        if (!matchedLabel) continue;
+
+        double tapX = 0, tapY = 0;
+        BOOL hasTap = NO;
+        NSDictionary *tap = [el[@"tap"] isKindOfClass:[NSDictionary class]] ? el[@"tap"] : nil;
+        if ([tap[@"x"] respondsToSelector:@selector(doubleValue)] && [tap[@"y"] respondsToSelector:@selector(doubleValue)]) {
+            tapX = [tap[@"x"] doubleValue];
+            tapY = [tap[@"y"] doubleValue];
+            hasTap = YES;
+        } else if ([el[@"frame"] isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *fr = el[@"frame"];
+            if ([fr[@"x"] respondsToSelector:@selector(doubleValue)] &&
+                [fr[@"y"] respondsToSelector:@selector(doubleValue)] &&
+                [fr[@"width"] respondsToSelector:@selector(doubleValue)] &&
+                [fr[@"height"] respondsToSelector:@selector(doubleValue)]) {
+                tapX = [fr[@"x"] doubleValue] + [fr[@"width"] doubleValue] * 0.5;
+                tapY = [fr[@"y"] doubleValue] + [fr[@"height"] doubleValue] * 0.5;
+                hasTap = YES;
+            }
+        }
+        if (hasTap && tapY >= 160.0 && (axHasDialogContext || tapY >= 240.0)) {
+            __block BOOL tappedOK = NO;
+            dispatch_semaphore_t tapSem = dispatch_semaphore_create(0);
+            [[IOSMCPHIDManager sharedInstance] tapAtPoint:CGPointMake(tapX, tapY) completion:^(BOOL success, __unused NSString *err) {
+                tappedOK = success;
+                dispatch_semaphore_signal(tapSem);
+            }];
+            dispatch_semaphore_wait(tapSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+            if (tappedOK) {
+                return @{
+                    @"source": @"accessibility",
+                    @"button": matchedLabel,
+                    @"x": @(tapX),
+                    @"y": @(tapY),
+                    @"timestamp": @([[NSDate date] timeIntervalSince1970])
+                };
+            }
+        }
+    }
+
+    // 2. Fallback to fast Vision OCR for out-of-process payment/confirmation sheets (StoreKitUIService / PassbookUIService)
+    NSString *ocrErr = nil;
+    NSDictionary *ocrRes = [[OCRManager sharedInstance] recognizeTextWithLanguages:@[@"en-US"]
+                                                                     minConfidence:0.35
+                                                                            region:nil
+                                                                              fast:YES
+                                                                            engine:@"vision"
+                                                                             error:&ocrErr];
+    NSArray *texts = [ocrRes[@"texts"] isKindOfClass:[NSArray class]] ? ocrRes[@"texts"] : @[];
+    if (!texts.count) return nil;
+
+    BOOL ocrHasSheetContext = NO;
+    for (NSDictionary *item in texts) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *t = [item[@"text"] isKindOfClass:[NSString class]] ? [item[@"text"] lowercaseString] : @"";
+        if ([t containsString:@"app store"] ||
+            [t isEqualToString:@"cancel"] ||
+            [t containsString:@"account"] ||
+            [t containsString:@"apple id"] ||
+            [t containsString:@"free"] ||
+            [t containsString:@"price"] ||
+            [t containsString:@"age"] ||
+            [t containsString:@"confirm"] ||
+            [t containsString:@"sign in"] ||
+            [t containsString:@"password"]) {
+            ocrHasSheetContext = YES;
+            break;
+        }
+    }
+    if (!ocrHasSheetContext) return nil;
+
+    for (NSDictionary *item in texts) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *raw = [item[@"text"] isKindOfClass:[NSString class]] ? item[@"text"] : @"";
+        NSString *clean = [[raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+        if (!clean.length) continue;
+
+        BOOL isConfirmBtn =
+            [clean isEqualToString:@"install"] ||
+            [clean isEqualToString:@"get"] ||
+            [clean isEqualToString:@"redownload"] ||
+            [clean isEqualToString:@"confirm"] ||
+            [clean isEqualToString:@"ok"] ||
+            [clean isEqualToString:@"continue"] ||
+            [clean isEqualToString:@"buy"];
+        if (!isConfirmBtn) continue;
+
+        NSDictionary *tap = [item[@"tap"] isKindOfClass:[NSDictionary class]] ? item[@"tap"] : nil;
+        if (![tap[@"x"] respondsToSelector:@selector(doubleValue)] || ![tap[@"y"] respondsToSelector:@selector(doubleValue)]) {
+            continue;
+        }
+        double tapX = [tap[@"x"] doubleValue];
+        double tapY = [tap[@"y"] doubleValue];
+        if (tapY < 180.0) continue;
+
+        __block BOOL tappedOK = NO;
+        dispatch_semaphore_t tapSem = dispatch_semaphore_create(0);
+        [[IOSMCPHIDManager sharedInstance] tapAtPoint:CGPointMake(tapX, tapY) completion:^(BOOL success, __unused NSString *err) {
+            tappedOK = success;
+            dispatch_semaphore_signal(tapSem);
+        }];
+        dispatch_semaphore_wait(tapSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+        if (tappedOK) {
+            return @{
+                @"source": @"vision_ocr",
+                @"button": raw,
+                @"x": @(tapX),
+                @"y": @(tapY),
+                @"timestamp": @([[NSDate date] timeIntervalSince1970])
+            };
+        }
+    }
+
+    return nil;
+}
 
 @implementation AppStoreManager
 
@@ -27,19 +199,60 @@
     req[@"op"] = op;
     req[@"action"] = op;
 
-    NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workDir
                               withIntermediateDirectories:YES
                                                attributes:nil
                                                     error:nil];
+    chmod(workDir.UTF8String, 0777);
     NSString *reqFile = [workDir stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"appstore-req-%@.json", [NSUUID UUID].UUIDString]];
 
     NSError *jsonErr = nil;
     NSData *reqData = [NSJSONSerialization dataWithJSONObject:req options:0 error:&jsonErr];
-    if (!reqData || ![reqData writeToFile:reqFile options:NSDataWritingAtomic error:&jsonErr]) {
-        if (error) *error = jsonErr.localizedDescription ?: @"Failed to write mcp-appstore request file";
+    if (!reqData) {
+        if (error) *error = jsonErr.localizedDescription ?: @"Failed to serialize mcp-appstore request";
         return nil;
+    }
+    if (![reqData writeToFile:reqFile options:NSDataWritingAtomic error:&jsonErr]) {
+        NSString *fallbackDir = NSTemporaryDirectory();
+        reqFile = [fallbackDir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"appstore-req-%@.json", [NSUUID UUID].UUIDString]];
+        if (![reqData writeToFile:reqFile options:NSDataWritingAtomic error:&jsonErr]) {
+            if (error) *error = jsonErr.localizedDescription ?: @"Failed to write mcp-appstore request file";
+            return nil;
+        }
+    }
+    chmod(reqFile.UTF8String, 0666);
+
+    BOOL watchPrompts = ([op isEqualToString:@"install"] || [op isEqualToString:@"downgrade"]) &&
+                        (!args[@"auto_confirm"] || [args[@"auto_confirm"] boolValue]);
+    __block atomic_bool watcherStop = ATOMIC_VAR_INIT(false);
+    NSMutableArray<NSDictionary *> *confirmedPrompts = [NSMutableArray array];
+    NSLock *promptsLock = [[NSLock alloc] init];
+
+    if (watchPrompts) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            usleep(1200 * 1000);
+            while (!atomic_load(&watcherStop)) {
+                @autoreleasepool {
+                    NSDictionary *hit = MCPTryAutoConfirmAppStorePromptOnce();
+                    if (hit) {
+                        [promptsLock lock];
+                        [confirmedPrompts addObject:hit];
+                        [promptsLock unlock];
+                        // Give the sheet 2.0s to dismiss after tapping before polling again
+                        for (int i = 0; i < 10 && !atomic_load(&watcherStop); i++) {
+                            usleep(200 * 1000);
+                        }
+                    } else {
+                        for (int i = 0; i < 6 && !atomic_load(&watcherStop); i++) {
+                            usleep(200 * 1000);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     @try {
@@ -67,6 +280,8 @@
                                      &runErr);
         }
 
+        atomic_store(&watcherStop, true);
+
         NSData *respData = [outStr dataUsingEncoding:NSUTF8StringEncoding];
         NSDictionary *resp = respData ? [NSJSONSerialization JSONObjectWithData:respData options:0 error:NULL] : nil;
         if (!launched || ![resp isKindOfClass:[NSDictionary class]]) {
@@ -77,9 +292,16 @@
             if (error) *error = [resp[@"error"] isKindOfClass:[NSString class]] ? resp[@"error"] : @"mcp-appstore operation failed";
             return nil;
         }
-        NSDictionary *result = [resp[@"result"] isKindOfClass:[NSDictionary class]] ? resp[@"result"] : @{};
+        NSMutableDictionary *result = [([resp[@"result"] isKindOfClass:[NSDictionary class]] ? resp[@"result"] : @{}) mutableCopy];
+        [promptsLock lock];
+        if (confirmedPrompts.count > 0) {
+            result[@"auto_confirmed_prompts"] = [confirmedPrompts copy];
+            result[@"auto_confirmed_count"] = @(confirmedPrompts.count);
+        }
+        [promptsLock unlock];
         return result;
     } @finally {
+        atomic_store(&watcherStop, true);
         [[NSFileManager defaultManager] removeItemAtPath:reqFile error:nil];
     }
 }

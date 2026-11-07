@@ -126,8 +126,9 @@ static BOOL MCPParseArrayIndex(NSString *segment, NSUInteger *outIndex) {
         if (error) *error = @"path must be absolute";
         return nil;
     }
-    NSArray<NSString *> *keys = [keypath componentsSeparatedByString:@"."];
-    if (![keypath isKindOfClass:[NSString class]] || !keypath.length || [keys containsObject:@""]) {
+    BOOL readFullRoot = (!write && (!keypath.length || [keypath isEqualToString:@"."] || [keypath isEqualToString:@"/"]));
+    NSArray<NSString *> *keys = readFullRoot ? @[] : [keypath componentsSeparatedByString:@"."];
+    if (!readFullRoot && (![keypath isKindOfClass:[NSString class]] || !keypath.length || [keys containsObject:@""])) {
         if (error) *error = @"keypath must contain nonempty dot-separated keys";
         return nil;
     }
@@ -177,6 +178,24 @@ static BOOL MCPParseArrayIndex(NSString *segment, NSUInteger *outIndex) {
         return nil;
     }
 
+    NSString *formatName = (format == NSPropertyListBinaryFormat_v1_0) ? @"binary" : @"xml";
+    if (readFullRoot) {
+        id jsonSafeRoot = MCPPlistValueToJSONSafe(root);
+        if (!jsonSafeRoot || ![NSJSONSerialization isValidJSONObject:@[jsonSafeRoot]]) {
+            if (error) *error = @"property-list root is not JSON representable";
+            return nil;
+        }
+        NSString *rootType = [root isKindOfClass:[NSDictionary class]] ? @"dictionary" : ([root isKindOfClass:[NSArray class]] ? @"array" : (NSStringFromClass([root class]) ?: @"unknown"));
+        return @{
+            @"path": path,
+            @"resolved_path": resolvedPath,
+            @"keypath": keypath ?: @"",
+            @"format": formatName,
+            @"type": rootType,
+            @"value": jsonSafeRoot
+        };
+    }
+
     id parent = root;
     for (NSUInteger i = 0; i + 1 < keys.count; i++) {
         NSString *seg = keys[i];
@@ -207,7 +226,6 @@ static BOOL MCPParseArrayIndex(NSString *segment, NSUInteger *outIndex) {
     }
 
     NSString *lastKey = keys.lastObject;
-    NSString *formatName = (format == NSPropertyListBinaryFormat_v1_0) ? @"binary" : @"xml";
 
     if (write) {
         NSString *convErr = nil;
@@ -246,10 +264,15 @@ static BOOL MCPParseArrayIndex(NSString *segment, NSUInteger *outIndex) {
         }
 #if defined(MCP_ROOTHIDE) || defined(MCP_ROOTLESS)
         if (!wroteDirect) {
-            NSString *cacheDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+            NSString *cacheDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
             [[NSFileManager defaultManager] createDirectoryAtPath:cacheDir withIntermediateDirectories:YES attributes:nil error:nil];
+            chmod(cacheDir.UTF8String, 0777);
             NSString *tmpPath = [cacheDir stringByAppendingPathComponent:
                                  [NSString stringWithFormat:@"mcp-plist-%@.plist", [NSUUID UUID].UUIDString]];
+            if (![output writeToFile:tmpPath options:NSDataWritingAtomic error:nil]) {
+                tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                           [NSString stringWithFormat:@"mcp-plist-%@.plist", [NSUUID UUID].UUIDString]];
+            }
             if ([output writeToFile:tmpPath options:NSDataWritingAtomic error:nil]) {
                 NSString *outStr = nil;
                 NSString *rootErr = nil;

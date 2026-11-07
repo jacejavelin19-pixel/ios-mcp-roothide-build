@@ -52,8 +52,8 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"2.1.0"
-static NSString *const kMCPServerVersion = @"2.1.0";
+#define MCP_SERVER_VERSION          @"2.1.1"
+static NSString *const kMCPServerVersion = @"2.1.1";
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
@@ -2700,9 +2700,9 @@ static NSString *MCPLogId(id reqId) {
                 @"type": @"object",
                 @"properties": @{
                     @"path": @{@"type": @"string", @"description": @"Absolute plist path on device."},
-                    @"keypath": @{@"type": @"string", @"description": @"Dot-separated keypath (empty string '' returns full root plist)."}
+                    @"keypath": @{@"type": @"string", @"description": @"Optional dot-separated keypath (omit or pass '' / '.' to return full root plist)."}
                 },
-                @"required": @[@"path", @"keypath"]
+                @"required": @[@"path"]
             }
         },
         @{
@@ -6003,7 +6003,9 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
     if (pidValue <= 0 && bundleId.length > 0) {
-        pid_t resolvedPid = [[AppManager sharedInstance] pidForBundleId:bundleId];
+        pid_t resolvedPid = [bundleId isEqualToString:@"com.apple.springboard"]
+            ? getpid()
+            : [[AppManager sharedInstance] pidForBundleId:bundleId];
         if (resolvedPid <= 0) {
             return [self mcpSuccess:reqId text:[NSString stringWithFormat:@"Process for bundle_id '%@' is not running", bundleId] isError:YES];
         }
@@ -6013,6 +6015,7 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         return [self mcpError:reqId code:-32602 message:@"Missing or invalid pid (provide a positive integer pid or running bundle_id)"];
     }
 
+    pid_t targetPid = (pid_t)pidValue;
     NSString *pidText = [NSString stringWithFormat:@"%d", (int)pidValue];
     NSMutableArray<NSString *> *helperArgs = [NSMutableArray array];
 
@@ -6023,6 +6026,11 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         }
         if (limit < 1) limit = 1;
         if (limit > 4096) limit = 4096;
+        if (targetPid == getpid()) {
+            NSString *inErr = nil;
+            NSDictionary *inRes = [[MemoryManager sharedInstance] listRegionsPID:targetPid limit:(NSUInteger)limit error:&inErr];
+            if (inRes) return [self mcpSuccess:reqId structuredContent:inRes];
+        }
         [helperArgs addObjectsFromArray:@[@"regions", pidText, [NSString stringWithFormat:@"%lu", (unsigned long)limit]]];
     } else if ([operation isEqualToString:@"read_memory"]) {
         NSString *addressText = nil;
@@ -6034,6 +6042,11 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         }
         if (!MCPParseMemoryAddress(addressText, &address) || length <= 0 || length > 1048576 || floor(length) != length) {
             return [self mcpError:reqId code:-32602 message:@"Invalid address or length (1..1048576)"];
+        }
+        if (targetPid == getpid()) {
+            NSString *inErr = nil;
+            NSDictionary *inRes = [[MemoryManager sharedInstance] readPID:targetPid address:address length:(NSUInteger)length error:&inErr];
+            if (inRes) return [self mcpSuccess:reqId structuredContent:inRes];
         }
         [helperArgs addObjectsFromArray:@[@"read", pidText, addressText, [NSString stringWithFormat:@"%lu", (unsigned long)length]]];
     } else if ([operation isEqualToString:@"write_memory"]) {
@@ -6050,6 +6063,11 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
         if (!data || !data.length || data.length > 65536) {
             return [self mcpError:reqId code:-32602 message:@"Invalid base64 data or payload exceeds 65536 bytes"];
+        }
+        if (targetPid == getpid()) {
+            NSString *inErr = nil;
+            NSDictionary *inRes = [[MemoryManager sharedInstance] writePID:targetPid address:address data:data error:&inErr];
+            if (inRes) return [self mcpSuccess:reqId structuredContent:inRes];
         }
         [helperArgs addObjectsFromArray:@[@"write", pidText, addressText, encoded]];
     } else {
@@ -6078,6 +6096,11 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         NSData *data = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
         if (!data || !data.length || data.length > 65536) {
             return [self mcpError:reqId code:-32602 message:@"Invalid base64 data or payload exceeds 65536 bytes"];
+        }
+        if (targetPid == getpid()) {
+            NSString *inErr = nil;
+            NSDictionary *inRes = [[MemoryManager sharedInstance] searchPID:targetPid start:address end:end pattern:data error:&inErr];
+            if (inRes) return [self mcpSuccess:reqId structuredContent:inRes];
         }
         [helperArgs addObjectsFromArray:@[@"search", pidText, addressText, endText, encoded]];
     }
@@ -6642,12 +6665,12 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
 - (NSDictionary *)executePlistValue:(id)reqId args:(NSDictionary *)args write:(BOOL)write {
     NSString *path = nil, *keypath = nil, *paramError = nil;
     if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
-        !MCPStringFromArgs(args, @"keypath", YES, &keypath, &paramError)) {
+        !MCPStringFromArgs(args, @"keypath", write, &keypath, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
     if (write && !args[@"value"]) return [self mcpError:reqId code:-32602 message:@"Missing value"];
     NSString *err = nil;
-    NSDictionary *result = write ? [[PlistPatchManager sharedInstance] setValue:args[@"value"] atPath:path keypath:keypath error:&err] : [[PlistPatchManager sharedInstance] valueAtPath:path keypath:keypath error:&err];
+    NSDictionary *result = write ? [[PlistPatchManager sharedInstance] setValue:args[@"value"] atPath:path keypath:keypath error:&err] : [[PlistPatchManager sharedInstance] valueAtPath:path keypath:(keypath ?: @"") error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"Property list operation failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }

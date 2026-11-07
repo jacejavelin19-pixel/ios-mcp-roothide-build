@@ -225,10 +225,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci-output
-          ROOTLESS_DEB="packages/com.witchan.ios-mcp_2.1.0_iphoneos-arm64.deb"
-          DEB="packages/com.witchan.ios-mcp_2.1.0_iphoneos-arm64e.deb"
+          ROOTLESS_DEB="packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm64.deb"
+          DEB="packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm64e.deb"
           cp "$ROOTLESS_DEB" "$DEB" ci-output/
-          python3 tests/paddle_package_test.py --version 2.1.0 --arch arm64 --arch arm64e --out ci-output/paddle-package-audit.json
+          python3 tests/paddle_package_test.py --version 2.1.1 --arch arm64 --arch arm64e --out ci-output/paddle-package-audit.json
 
           python3 - "$DEB" ci-output/macho-package-audit.json <<'PY'
           import io, json, os, subprocess, sys, tarfile, tempfile
@@ -320,6 +320,7 @@ jobs:
             -isysroot "$IOS_SDK" \
             -Wl,-headerpad_max_install_names -Wl,-no_data_const \
             -framework UIKit -framework Foundation -framework Security \
+            -framework LocalAuthentication -framework WebKit -framework CoreLocation -framework CoreMotion \
             -lsqlite3 \
             tests/test_target_app/main.m \
             -o "$APP_DIR/MCPTestTarget"
@@ -338,7 +339,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ios-mcp-2.1.0-roothide
+          name: ios-mcp-2.1.1-roothide
           path: ci-output/
           if-no-files-found: error
           retention-days: 7

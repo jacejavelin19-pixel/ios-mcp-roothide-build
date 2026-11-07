@@ -149,6 +149,17 @@ typedef struct {
     return (const uint8_t *)self.fileData.bytes + self.sliceOffset;
 }
 
+- (uint64_t)sliceOffsetToVMAddr:(size_t)sliceOff {
+    for (NSValue *v in self.sections) {
+        MCPSectionEntry sec;
+        [v getValue:&sec];
+        if (sliceOff >= sec.offset && sliceOff < (size_t)sec.offset + (size_t)sec.size) {
+            return sec.addr + (uint64_t)(sliceOff - sec.offset);
+        }
+    }
+    return self.textVMAddr + (uint64_t)sliceOff;
+}
+
 - (BOOL)vmAddrToSliceOffset:(uint64_t)vmAddr outOffset:(size_t *)outOffset {
     uint64_t stripped = vmAddr & 0x00007fffffffffffULL;
     // Also handle on-diskchained fixups where high bits encode dyld_chained_ptr_64_rebase target
@@ -163,22 +174,28 @@ typedef struct {
             }
         }
     }
-    // Check low 36-bit offset for arm64e dyld_chained_ptr_arm64e_rebase / dyld_chained_ptr_64_rebase
-    uint64_t low36 = vmAddr & 0x0000000fffffffffULL;
-    uint64_t rebased = self.textVMAddr + low36;
-    for (NSValue *v in self.sections) {
-        MCPSectionEntry sec;
-        [v getValue:&sec];
-        if (rebased >= sec.addr && rebased < sec.addr + sec.size) {
-            size_t off = (size_t)sec.offset + (size_t)(rebased - sec.addr);
-            if (off < self.sliceSize) {
-                if (outOffset) *outOffset = off;
+    // Check low 36-bit and low 32-bit offsets for arm64e / arm64 dyld_chained_ptr_*_rebase
+    uint64_t candidates[2] = {
+        vmAddr & 0x0000000fffffffffULL,
+        vmAddr & 0x00000000ffffffffULL
+    };
+    for (size_t c = 0; c < 2; c++) {
+        uint64_t low = candidates[c];
+        uint64_t rebased = self.textVMAddr + low;
+        for (NSValue *v in self.sections) {
+            MCPSectionEntry sec;
+            [v getValue:&sec];
+            if (rebased >= sec.addr && rebased < sec.addr + sec.size) {
+                size_t off = (size_t)sec.offset + (size_t)(rebased - sec.addr);
+                if (off < self.sliceSize) {
+                    if (outOffset) *outOffset = off;
+                    return YES;
+                }
+            }
+            if (low >= sec.offset && low < (uint64_t)sec.offset + sec.size) {
+                if (outOffset) *outOffset = (size_t)low;
                 return YES;
             }
-        }
-        if (low36 >= sec.offset && low36 < (uint64_t)sec.offset + sec.size) {
-            if (outOffset) *outOffset = (size_t)low36;
-            return YES;
         }
     }
     return NO;
@@ -530,58 +547,77 @@ static MCPMachOSliceContext *MCPLoadMachOSliceContext(NSString *path, NSString *
                 if (!clsName.length) continue;
 
                 // Map class pointer & classref
-                uint64_t cleanClsVA = ctx.textVMAddr + (clsOff - 0);
+                uint64_t cleanClsVA = [ctx sliceOffsetToVMAddr:clsOff];
                 ctx.symbolsByAddr[@(cleanClsVA)] = [@"_OBJC_CLASS_$_" stringByAppendingString:clsName];
 
-                size_t mOff = 0;
-                if (methodsVM != 0 && [ctx vmAddrToSliceOffset:methodsVM outOffset:&mOff] && mOff + 8 <= sliceLen) {
-                    uint32_t entsizeAndFlags = *(const uint32_t *)(sbase + mOff);
-                    uint32_t mCount = *(const uint32_t *)(sbase + mOff + 4);
-                    BOOL isRelative = (entsizeAndFlags & 0x80000000U) != 0;
-                    uint32_t entsize = entsizeAndFlags & ~0x80000003U;
-                    if (entsize == 0) entsize = isRelative ? 12 : 24;
-                    size_t curM = mOff + 8;
-                    for (uint32_t m = 0; m < mCount && curM + entsize <= sliceLen; m++, curM += entsize) {
-                        NSString *selStr = nil;
-                        uint64_t impVA = 0;
-                        if (isRelative && entsize >= 12) {
-                            int32_t nameRel = *(const int32_t *)(sbase + curM);
-                            int32_t impRel = *(const int32_t *)(sbase + curM + 8);
-                            // Compute VMAddr of curM
-                            uint64_t entryVA = (methodsVM & 0x00007fffffffffffULL) + 8 + (uint64_t)m * entsize;
-                            uint64_t nameTargetVA = (uint64_t)((int64_t)entryVA + nameRel);
-                            selStr = ctx.selRefsByAddr[@(nameTargetVA)];
-                            if (!selStr.length) {
-                                size_t selPtrOff = 0;
-                                if ([ctx vmAddrToSliceOffset:nameTargetVA outOffset:&selPtrOff] && selPtrOff + 8 <= sliceLen) {
-                                    uint64_t derefVA = *(const uint64_t *)(sbase + selPtrOff);
-                                    selStr = [ctx readCStringAtVMAddr:derefVA maxLen:256];
-                                }
+                uint64_t metaMethodsVM = 0;
+                size_t metaClsOff = 0;
+                if ([ctx vmAddrToSliceOffset:clsWords[0] outOffset:&metaClsOff] && metaClsOff + 40 <= sliceLen && metaClsOff != clsOff) {
+                    const uint64_t *metaWords = (const uint64_t *)(sbase + metaClsOff);
+                    uint64_t metaDataPtr = metaWords[4] & ~7ULL;
+                    size_t metaRoOff = 0;
+                    if ([ctx vmAddrToSliceOffset:metaDataPtr outOffset:&metaRoOff] && metaRoOff + 48 <= sliceLen) {
+                        metaMethodsVM = *(const uint64_t *)(sbase + metaRoOff + 32);
+                    }
+                }
+
+                uint64_t methodLists[2] = { methodsVM, metaMethodsVM };
+                for (int pass = 0; pass < 2; pass++) {
+                    uint64_t curMethodsVM = methodLists[pass];
+                    BOOL isClassMethod = (pass == 1);
+                    size_t mOff = 0;
+                    if (curMethodsVM != 0 && [ctx vmAddrToSliceOffset:curMethodsVM outOffset:&mOff] && mOff + 8 <= sliceLen) {
+                        uint32_t entsizeAndFlags = *(const uint32_t *)(sbase + mOff);
+                        uint32_t mCount = *(const uint32_t *)(sbase + mOff + 4);
+                        BOOL isRelative = (entsizeAndFlags & 0x80000000U) != 0;
+                        uint32_t entsize = entsizeAndFlags & ~0x80000003U;
+                        if (entsize == 0) entsize = isRelative ? 12 : 24;
+                        size_t curM = mOff + 8;
+                        for (uint32_t m = 0; m < mCount && curM + entsize <= sliceLen; m++, curM += entsize) {
+                            NSString *selStr = nil;
+                            uint64_t impVA = 0;
+                            if (isRelative && entsize >= 12) {
+                                int32_t nameRel = *(const int32_t *)(sbase + curM);
+                                int32_t impRel = *(const int32_t *)(sbase + curM + 8);
+                                // Compute actual VMAddr of curM via section table (handles chained fixups cleanly)
+                                uint64_t entryVA = [ctx sliceOffsetToVMAddr:curM];
+                                uint64_t nameTargetVA = (uint64_t)((int64_t)entryVA + nameRel);
+                                selStr = ctx.selRefsByAddr[@(nameTargetVA)];
                                 if (!selStr.length) {
-                                    selStr = [ctx readCStringAtVMAddr:nameTargetVA maxLen:256];
+                                    size_t selPtrOff = 0;
+                                    if ([ctx vmAddrToSliceOffset:nameTargetVA outOffset:&selPtrOff] && selPtrOff + 8 <= sliceLen) {
+                                        uint64_t derefVA = *(const uint64_t *)(sbase + selPtrOff);
+                                        selStr = [ctx readCStringAtVMAddr:derefVA maxLen:256];
+                                    }
+                                    if (!selStr.length) {
+                                        selStr = [ctx readCStringAtVMAddr:nameTargetVA maxLen:256];
+                                    }
+                                }
+                                impVA = (uint64_t)((int64_t)(entryVA + 8) + impRel);
+                            } else if (!isRelative && entsize >= 24) {
+                                uint64_t nameVA = *(const uint64_t *)(sbase + curM);
+                                uint64_t rawImp = *(const uint64_t *)(sbase + curM + 16);
+                                selStr = [ctx readCStringAtVMAddr:nameVA maxLen:256];
+                                size_t impOff = 0;
+                                if ([ctx vmAddrToSliceOffset:rawImp outOffset:&impOff]) {
+                                    impVA = [ctx sliceOffsetToVMAddr:impOff];
                                 }
                             }
-                            impVA = (uint64_t)((int64_t)(entryVA + 8) + impRel);
-                        } else if (!isRelative && entsize >= 24) {
-                            uint64_t nameVA = *(const uint64_t *)(sbase + curM);
-                            uint64_t rawImp = *(const uint64_t *)(sbase + curM + 16);
-                            selStr = [ctx readCStringAtVMAddr:nameVA maxLen:256];
-                            size_t impOff = 0;
-                            if ([ctx vmAddrToSliceOffset:rawImp outOffset:&impOff]) {
-                                impVA = ctx.textVMAddr + impOff;
+                            if (selStr.length && impVA != 0) {
+                                NSString *sym = [NSString stringWithFormat:@"%c[%@ %@]", isClassMethod ? '+' : '-', clsName, selStr];
+                                ctx.symbolsByAddr[@(impVA)] = sym;
+                                ctx.addrBySymbol[sym] = @(impVA);
+                                NSString *methodKey = [NSString stringWithFormat:@"%@.%@", clsName, selStr];
+                                if (!isClassMethod || !ctx.objcMethodsByKey[methodKey]) {
+                                    ctx.objcMethodsByKey[methodKey] = @{
+                                        @"class": clsName,
+                                        @"selector": selStr,
+                                        @"imp": @(impVA),
+                                        @"symbol": sym
+                                    };
+                                }
+                                [funcStartsSet addObject:@(impVA)];
                             }
-                        }
-                        if (selStr.length && impVA != 0) {
-                            NSString *sym = [NSString stringWithFormat:@"-[%@ %@]", clsName, selStr];
-                            ctx.symbolsByAddr[@(impVA)] = sym;
-                            ctx.addrBySymbol[sym] = @(impVA);
-                            ctx.objcMethodsByKey[[NSString stringWithFormat:@"%@.%@", clsName, selStr]] = @{
-                                @"class": clsName,
-                                @"selector": selStr,
-                                @"imp": @(impVA),
-                                @"symbol": sym
-                            };
-                            [funcStartsSet addObject:@(impVA)];
                         }
                     }
                 }
@@ -597,7 +633,7 @@ static MCPMachOSliceContext *MCPLoadMachOSliceContext(NSString *path, NSString *
             for (size_t i = 0; i < count; i++) {
                 size_t targetOff = 0;
                 if ([ctx vmAddrToSliceOffset:ptrs[i] outOffset:&targetOff]) {
-                    uint64_t targetVA = ctx.textVMAddr + targetOff;
+                    uint64_t targetVA = [ctx sliceOffsetToVMAddr:targetOff];
                     NSString *sym = ctx.symbolsByAddr[@(targetVA)];
                     if ([sym hasPrefix:@"_OBJC_CLASS_$_"]) {
                         ctx.classRefsByAddr[@(clsRefSec.addr + i * 8)] = [sym substringFromIndex:14];
@@ -1250,7 +1286,10 @@ static NSDictionary *MCPDecompileInstructionBuffer(const uint8_t *codeBytes,
 
     if (!outputPath.length) {
         NSString *safeName = bundleId.length ? bundleId : bundlePath.lastPathComponent.stringByDeletingPathExtension;
-        outputPath = [NSString stringWithFormat:@"/tmp/%@-decrypted.ipa", safeName];
+        NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
+        [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
+        chmod(workDir.UTF8String, 0777);
+        outputPath = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@-decrypted.ipa", safeName]];
     }
 
     NSString *outStr = nil, *runErr = nil;

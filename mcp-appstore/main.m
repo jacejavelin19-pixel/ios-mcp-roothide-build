@@ -709,8 +709,14 @@ static NSString *MCPSnapshotAppDataContainer(NSString *bundleId, NSString *dataC
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm fileExistsAtPath:dataContainerPath]) return;
 
-        NSString *workRoot = @"/var/mobile/Library/Caches/ios-mcp-work/appstore-backups";
+        NSString *workBase = @"/var/mobile/Library/Caches/ios-mcp-work";
+        [fm createDirectoryAtPath:workBase withIntermediateDirectories:YES attributes:nil error:nil];
+        chmod(workBase.UTF8String, 0777);
+        chown(workBase.UTF8String, 501, 501);
+        NSString *workRoot = [workBase stringByAppendingPathComponent:@"appstore-backups"];
         [fm createDirectoryAtPath:workRoot withIntermediateDirectories:YES attributes:nil error:nil];
+        chmod(workRoot.UTF8String, 0777);
+        chown(workRoot.UTF8String, 501, 501);
         NSString *dirName = [NSString stringWithFormat:@"%@-%llu", bundleId, (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000)];
         NSString *targetBackup = [workRoot stringByAppendingPathComponent:dirName];
         [fm createDirectoryAtPath:targetBackup withIntermediateDirectories:YES attributes:nil error:nil];
@@ -835,18 +841,174 @@ static NSDictionary *MCPQueryActiveStoreDownloads(void) {
     };
 }
 
+static id MCPCreateASDJobManagerInstance(void) {
+    Class ASDJobManagerCls = objc_getClass("ASDJobManager");
+    Class ASDJobManagerOptionsCls = objc_getClass("ASDJobManagerOptions");
+    if (!ASDJobManagerCls) return nil;
+    id jobMgr = nil;
+    if (ASDJobManagerOptionsCls) {
+        id opts = [[ASDJobManagerOptionsCls alloc] init];
+        MCPMsgSendVoid1(opts, NSSelectorFromString(@"setPersistenceIdentifier:"), @"com.witchan.mcp-appstore");
+        SEL initOptsSel = NSSelectorFromString(@"initWithOptions:");
+        if ([ASDJobManagerCls instancesRespondToSelector:initOptsSel]) {
+            jobMgr = MCPMsgSend1([ASDJobManagerCls alloc], initOptsSel, opts);
+        }
+    }
+    if (!jobMgr) jobMgr = [[ASDJobManagerCls alloc] init];
+    return jobMgr;
+}
+
+static NSDictionary *MCPResumeStoreDownloadsForApp(NSString *bundleId) {
+    MCPAppStoreLoadPrivateFrameworks();
+    __block NSMutableArray *resumedJobIDs = [NSMutableArray array];
+    __block NSUInteger resumedSSCount = 0;
+
+    MCPRunWithEffectiveUID(501, ^{
+        id jobMgr = MCPCreateASDJobManagerInstance();
+        SEL getJobsSel = NSSelectorFromString(@"getJobsUsingBlock:");
+        SEL resumeJobsSel = NSSelectorFromString(@"resumeJobsWithIDs:completionBlock:");
+        if (jobMgr && [jobMgr respondsToSelector:getJobsSel]) {
+            NSMutableArray *targetIDs = [NSMutableArray array];
+            dispatch_semaphore_t getSem = dispatch_semaphore_create(0);
+            void (^jobsBlock)(NSArray *) = ^(NSArray *jobs) {
+                for (id job in jobs) {
+                    id bid = MCPMsgSend0(job, NSSelectorFromString(@"bundleID"));
+                    BOOL matches = (!bundleId.length || ![bid isKindOfClass:[NSString class]] || [(NSString *)bid isEqualToString:bundleId] || jobs.count == 1);
+                    if (matches) {
+                        int64_t jid = MCPMsgSendInt64(job, NSSelectorFromString(@"persistentID"));
+                        if (jid != 0) [targetIDs addObject:@(jid)];
+                    }
+                }
+                dispatch_semaphore_signal(getSem);
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(jobMgr, getJobsSel, jobsBlock);
+            dispatch_semaphore_wait(getSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)));
+
+            if (targetIDs.count > 0 && [jobMgr respondsToSelector:resumeJobsSel]) {
+                dispatch_semaphore_t resSem = dispatch_semaphore_create(0);
+                void (^compBlock)(BOOL, NSError *) = ^(__unused BOOL ok, __unused NSError *err) {
+                    dispatch_semaphore_signal(resSem);
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(jobMgr, resumeJobsSel, targetIDs, compBlock);
+                dispatch_semaphore_wait(resSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)));
+                [resumedJobIDs addObjectsFromArray:targetIDs];
+            }
+        }
+
+        Class SSDownloadManagerCls = objc_getClass("SSDownloadManager");
+        if (SSDownloadManagerCls) {
+            id dlMgr = MCPMsgSend0(SSDownloadManagerCls, NSSelectorFromString(@"softwareDownloadManager"));
+            NSArray *dls = MCPMsgSend0(dlMgr, NSSelectorFromString(@"downloads"));
+            for (id dl in dls) {
+                id bid = MCPMsgSend1(dl, NSSelectorFromString(@"valueForProperty:"), @"bundle-id");
+                BOOL matches = (!bundleId.length || ![bid isKindOfClass:[NSString class]] || [(NSString *)bid isEqualToString:bundleId] || dls.count == 1);
+                if (!matches) continue;
+                SEL resumeSel = NSSelectorFromString(@"resume");
+                SEL restartSel = NSSelectorFromString(@"restart");
+                if ([dl respondsToSelector:resumeSel]) {
+                    MCPMsgSendVoid0(dl, resumeSel);
+                    resumedSSCount++;
+                } else if ([dl respondsToSelector:restartSel]) {
+                    MCPMsgSendVoid0(dl, restartSel);
+                    resumedSSCount++;
+                }
+            }
+        }
+    });
+
+    return @{
+        @"resumed_asd_job_ids": resumedJobIDs,
+        @"resumed_ss_downloads": @(resumedSSCount)
+    };
+}
+
+static NSDictionary *MCPCancelStoreDownloadsForApp(NSString *bundleId) {
+    MCPAppStoreLoadPrivateFrameworks();
+    __block NSMutableArray *canceledJobIDs = [NSMutableArray array];
+    __block NSUInteger canceledSSCount = 0;
+
+    MCPRunWithEffectiveUID(501, ^{
+        id jobMgr = MCPCreateASDJobManagerInstance();
+        SEL getJobsSel = NSSelectorFromString(@"getJobsUsingBlock:");
+        SEL cancelJobsSel = NSSelectorFromString(@"cancelJobsWithIDs:completionBlock:");
+        if (jobMgr && [jobMgr respondsToSelector:getJobsSel]) {
+            NSMutableArray *targetIDs = [NSMutableArray array];
+            dispatch_semaphore_t getSem = dispatch_semaphore_create(0);
+            void (^jobsBlock)(NSArray *) = ^(NSArray *jobs) {
+                for (id job in jobs) {
+                    id bid = MCPMsgSend0(job, NSSelectorFromString(@"bundleID"));
+                    BOOL matches = (!bundleId.length || ![bid isKindOfClass:[NSString class]] || [(NSString *)bid isEqualToString:bundleId] || jobs.count == 1);
+                    if (matches) {
+                        int64_t jid = MCPMsgSendInt64(job, NSSelectorFromString(@"persistentID"));
+                        if (jid != 0) [targetIDs addObject:@(jid)];
+                    }
+                }
+                dispatch_semaphore_signal(getSem);
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(jobMgr, getJobsSel, jobsBlock);
+            dispatch_semaphore_wait(getSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)));
+
+            if (targetIDs.count > 0 && [jobMgr respondsToSelector:cancelJobsSel]) {
+                dispatch_semaphore_t canSem = dispatch_semaphore_create(0);
+                void (^compBlock)(BOOL, NSError *) = ^(__unused BOOL ok, __unused NSError *err) {
+                    dispatch_semaphore_signal(canSem);
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(jobMgr, cancelJobsSel, targetIDs, compBlock);
+                dispatch_semaphore_wait(canSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)));
+                [canceledJobIDs addObjectsFromArray:targetIDs];
+            }
+        }
+
+        Class SSDownloadManagerCls = objc_getClass("SSDownloadManager");
+        if (SSDownloadManagerCls) {
+            id dlMgr = MCPMsgSend0(SSDownloadManagerCls, NSSelectorFromString(@"softwareDownloadManager"));
+            NSArray *dls = MCPMsgSend0(dlMgr, NSSelectorFromString(@"downloads"));
+            NSMutableArray *toCancel = [NSMutableArray array];
+            for (id dl in dls) {
+                id bid = MCPMsgSend1(dl, NSSelectorFromString(@"valueForProperty:"), @"bundle-id");
+                BOOL matches = (!bundleId.length || ![bid isKindOfClass:[NSString class]] || [(NSString *)bid isEqualToString:bundleId] || dls.count == 1);
+                if (!matches) continue;
+                [toCancel addObject:dl];
+                SEL cancelSel = NSSelectorFromString(@"cancel");
+                if ([dl respondsToSelector:cancelSel]) {
+                    MCPMsgSendVoid0(dl, cancelSel);
+                }
+            }
+            SEL cancelDlsSel = NSSelectorFromString(@"cancelDownloads:completionBlock:");
+            if (toCancel.count > 0 && dlMgr && [dlMgr respondsToSelector:cancelDlsSel]) {
+                dispatch_semaphore_t canSem = dispatch_semaphore_create(0);
+                void (^compBlock)(NSError *) = ^(__unused NSError *err) {
+                    dispatch_semaphore_signal(canSem);
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(dlMgr, cancelDlsSel, toCancel, compBlock);
+                dispatch_semaphore_wait(canSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)));
+            }
+            canceledSSCount = toCancel.count;
+        }
+    });
+
+    return @{
+        @"canceled_asd_job_ids": canceledJobIDs,
+        @"canceled_ss_downloads": @(canceledSSCount)
+    };
+}
+
 // Dispatch a single buyParameters transaction via ASDPurchaseManager & SSPurchaseRequest
-static NSDictionary *MCPDispatchPurchaseTransaction(uint64_t adamId,
-                                                    NSString *bundleId,
-                                                    uint64_t extVersionId,
-                                                    NSString *pricingParams,
-                                                    NSNumber *accountDSID) {
+static NSDictionary *MCPDispatchPurchaseTransactionEx(uint64_t adamId,
+                                                      NSString *bundleId,
+                                                      uint64_t extVersionId,
+                                                      NSString *pricingParams,
+                                                      NSNumber *accountDSID,
+                                                      BOOL preferASD) {
     MCPAppStoreLoadPrivateFrameworks();
 
+    static uint32_t sClientBuySeq = 1;
+    uint32_t buySeq = sClientBuySeq++;
     NSString *buyParams = [NSString stringWithFormat:
-        @"productType=C&price=0&salableAdamId=%llu&pricingParameters=%@&clientBuyId=1&installedVersionKronos=0%@",
+        @"productType=C&price=0&salableAdamId=%llu&pricingParameters=%@&clientBuyId=%u&installedVersionKronos=0%@",
         adamId,
         pricingParams ?: @"STDQ",
+        buySeq,
         extVersionId > 0 ? [NSString stringWithFormat:@"&appExtVrsId=%llu", extVersionId] : @""];
 
     __block BOOL dispatchedOK = NO;
@@ -854,83 +1016,12 @@ static NSDictionary *MCPDispatchPurchaseTransaction(uint64_t adamId,
     __block NSString *lastError = nil;
 
     MCPRunWithEffectiveUID(501, ^{
-        // Strategy 1: StoreServices SSPurchase + SSPurchaseRequest (MuffinStore's primary engine)
-        Class SSPurchaseCls = objc_getClass("SSPurchase");
-        Class SSPurchaseRequestCls = objc_getClass("SSPurchaseRequest");
-        if (SSPurchaseCls && SSPurchaseRequestCls) {
-            id purchase = [[SSPurchaseCls alloc] init];
-            MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setBuyParameters:"), buyParams);
-            MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setItemIdentifier:"), @(adamId));
-            if (accountDSID) {
-                MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setAccountIdentifier:"), accountDSID);
-            }
-            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setIgnoresForcedPasswordRestriction:"), YES);
-            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setCreatesDownloads:"), YES);
-            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setBackgroundPurchase:"), YES);
+        void (^tryASD)(void) = ^{
+            if (dispatchedOK) return;
+            Class ASDPurchaseCls = objc_getClass("ASDPurchase");
+            Class ASDPurchaseManagerCls = objc_getClass("ASDPurchaseManager");
+            if (!ASDPurchaseCls || !ASDPurchaseManagerCls) return;
 
-            Class SSDownloadPolicyCls = objc_getClass("SSDownloadPolicy");
-            if (SSDownloadPolicyCls) {
-                SEL initPolicySel = NSSelectorFromString(@"initWithDownloadKind:URLBagType:");
-                if ([SSDownloadPolicyCls instancesRespondToSelector:initPolicySel]) {
-                    id policy = ((id (*)(id, SEL, id, int64_t))objc_msgSend)([SSDownloadPolicyCls alloc], initPolicySel, @"software", 0);
-                    if (policy) MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setDownloadPolicy:"), policy);
-                }
-            }
-
-            SEL initPurchasesSel = NSSelectorFromString(@"initWithPurchases:");
-            id req = [SSPurchaseRequestCls instancesRespondToSelector:initPurchasesSel]
-                ? MCPMsgSend1([SSPurchaseRequestCls alloc], initPurchasesSel, @[purchase])
-                : nil;
-            if (req) {
-                MCPMsgSendVoidBool(req, NSSelectorFromString(@"setBackgroundRequest:"), YES);
-                MCPMsgSendVoidBool(req, NSSelectorFromString(@"setCreatesDownloads:"), YES);
-
-                SEL startRespSel = NSSelectorFromString(@"startWithPurchaseResponseBlock:completionBlock:");
-                SEL startBlkSel = NSSelectorFromString(@"startWithPurchaseBlock:completionBlock:");
-                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-                __block NSError *ssErr = nil;
-
-                if ([req respondsToSelector:startRespSel]) {
-                    void (^respBlock)(id) = ^(id response) {
-                        NSError *rErr = MCPMsgSend0(response, NSSelectorFromString(@"error"));
-                        if (rErr) ssErr = rErr;
-                    };
-                    void (^compBlock)(NSError *) = ^(NSError *error) {
-                        if (error && !ssErr) ssErr = error;
-                        dispatch_semaphore_signal(sem);
-                    };
-                    ((void (*)(id, SEL, id, id))objc_msgSend)(req, startRespSel, respBlock, compBlock);
-                    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
-                    if (!ssErr) {
-                        dispatchedOK = YES;
-                        engineUsed = @"SSPurchaseRequest";
-                    } else {
-                        lastError = ssErr.localizedDescription;
-                    }
-                } else if ([req respondsToSelector:startBlkSel]) {
-                    void (^pBlock)(id, NSError *) = ^(id p, NSError *error) {
-                        if (error) ssErr = error;
-                    };
-                    void (^compBlock)(NSError *) = ^(NSError *error) {
-                        if (error && !ssErr) ssErr = error;
-                        dispatch_semaphore_signal(sem);
-                    };
-                    ((void (*)(id, SEL, id, id))objc_msgSend)(req, startBlkSel, pBlock, compBlock);
-                    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
-                    if (!ssErr) {
-                        dispatchedOK = YES;
-                        engineUsed = @"SSPurchaseRequest";
-                    } else {
-                        lastError = ssErr.localizedDescription;
-                    }
-                }
-            }
-        }
-
-        // Strategy 2: AppStoreDaemon ASDPurchase + ASDPurchaseManager (either as primary fallback or companion)
-        Class ASDPurchaseCls = objc_getClass("ASDPurchase");
-        Class ASDPurchaseManagerCls = objc_getClass("ASDPurchaseManager");
-        if (!dispatchedOK && ASDPurchaseCls && ASDPurchaseManagerCls) {
             id asdPurchase = [[ASDPurchaseCls alloc] init];
             MCPMsgSendVoid1(asdPurchase, NSSelectorFromString(@"setBuyParameters:"), buyParams);
             MCPMsgSendVoid1(asdPurchase, NSSelectorFromString(@"setItemID:"), @(adamId));
@@ -968,6 +1059,91 @@ static NSDictionary *MCPDispatchPurchaseTransaction(uint64_t adamId,
                     lastError = asdErr.localizedDescription;
                 }
             }
+        };
+
+        void (^trySS)(void) = ^{
+            if (dispatchedOK) return;
+            Class SSPurchaseCls = objc_getClass("SSPurchase");
+            Class SSPurchaseRequestCls = objc_getClass("SSPurchaseRequest");
+            if (!SSPurchaseCls || !SSPurchaseRequestCls) return;
+
+            id purchase = [[SSPurchaseCls alloc] init];
+            MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setBuyParameters:"), buyParams);
+            MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setItemIdentifier:"), @(adamId));
+            if (accountDSID) {
+                MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setAccountIdentifier:"), accountDSID);
+            }
+            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setIgnoresForcedPasswordRestriction:"), YES);
+            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setCreatesDownloads:"), YES);
+            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setBackgroundPurchase:"), YES);
+
+            Class SSDownloadPolicyCls = objc_getClass("SSDownloadPolicy");
+            if (SSDownloadPolicyCls) {
+                SEL initPolicySel = NSSelectorFromString(@"initWithDownloadKind:URLBagType:");
+                if ([SSDownloadPolicyCls instancesRespondToSelector:initPolicySel]) {
+                    id policy = ((id (*)(id, SEL, id, int64_t))objc_msgSend)([SSDownloadPolicyCls alloc], initPolicySel, @"software", 0);
+                    if (policy) MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setDownloadPolicy:"), policy);
+                }
+            }
+
+            SEL initPurchasesSel = NSSelectorFromString(@"initWithPurchases:");
+            id req = [SSPurchaseRequestCls instancesRespondToSelector:initPurchasesSel]
+                ? MCPMsgSend1([SSPurchaseRequestCls alloc], initPurchasesSel, @[purchase])
+                : nil;
+            if (!req) return;
+
+            MCPMsgSendVoidBool(req, NSSelectorFromString(@"setBackgroundRequest:"), YES);
+            MCPMsgSendVoidBool(req, NSSelectorFromString(@"setCreatesDownloads:"), YES);
+
+            SEL startRespSel = NSSelectorFromString(@"startWithPurchaseResponseBlock:completionBlock:");
+            SEL startBlkSel = NSSelectorFromString(@"startWithPurchaseBlock:completionBlock:");
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block NSError *ssErr = nil;
+
+            if ([req respondsToSelector:startRespSel]) {
+                void (^respBlock)(id) = ^(id response) {
+                    NSError *rErr = MCPMsgSend0(response, NSSelectorFromString(@"error"));
+                    if (rErr) ssErr = rErr;
+                };
+                void (^compBlock)(NSError *) = ^(NSError *error) {
+                    if (error && !ssErr) ssErr = error;
+                    dispatch_semaphore_signal(sem);
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(req, startRespSel, respBlock, compBlock);
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
+                if (!ssErr) {
+                    dispatchedOK = YES;
+                    engineUsed = @"SSPurchaseRequest";
+                    lastError = nil;
+                } else {
+                    lastError = ssErr.localizedDescription;
+                }
+            } else if ([req respondsToSelector:startBlkSel]) {
+                void (^pBlock)(id, NSError *) = ^(__unused id p, NSError *error) {
+                    if (error) ssErr = error;
+                };
+                void (^compBlock)(NSError *) = ^(NSError *error) {
+                    if (error && !ssErr) ssErr = error;
+                    dispatch_semaphore_signal(sem);
+                };
+                ((void (*)(id, SEL, id, id))objc_msgSend)(req, startBlkSel, pBlock, compBlock);
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
+                if (!ssErr) {
+                    dispatchedOK = YES;
+                    engineUsed = @"SSPurchaseRequest";
+                    lastError = nil;
+                } else {
+                    lastError = ssErr.localizedDescription;
+                }
+            }
+        };
+
+        if (preferASD) {
+            tryASD();
+            trySS();
+        } else {
+            trySS();
+            tryASD();
         }
     });
 
@@ -978,6 +1154,14 @@ static NSDictionary *MCPDispatchPurchaseTransaction(uint64_t adamId,
     res[@"pricing_parameters"] = pricingParams ?: @"STDQ";
     if (lastError.length) res[@"error"] = lastError;
     return res;
+}
+
+static NSDictionary *MCPDispatchPurchaseTransaction(uint64_t adamId,
+                                                    NSString *bundleId,
+                                                    uint64_t extVersionId,
+                                                    NSString *pricingParams,
+                                                    NSNumber *accountDSID) {
+    return MCPDispatchPurchaseTransactionEx(adamId, bundleId, extVersionId, pricingParams, accountDSID, NO);
 }
 
 static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDowngradeOp, NSString **outError) {
@@ -1113,19 +1297,54 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
         ? @[explicitPricing]
         : ((wasInstalled || isDowngradeOp) ? @[@"STDRDL", @"STDQ"] : @[@"STDQ", @"STDRDL"]);
 
+    // Clear any pre-existing stalled 0% download jobs for this bundleId before starting a fresh purchase
+    NSMutableArray<NSDictionary *> *recoveryEvents = [NSMutableArray array];
+    NSDictionary *initialDlState = MCPQueryActiveStoreDownloads();
+    if ([initialDlState[@"active_count"] integerValue] > 0) {
+        BOOL hasStuckZeroForBundle = NO;
+        for (NSDictionary *j in initialDlState[@"asd_jobs"]) {
+            NSString *jBid = [j[@"bundle_id"] isKindOfClass:[NSString class]] ? j[@"bundle_id"] : nil;
+            double pct = [j[@"percent_complete"] respondsToSelector:@selector(doubleValue)] ? [j[@"percent_complete"] doubleValue] : 0.0;
+            if ((!jBid.length || [jBid isEqualToString:bundleId]) && pct <= 0.001) {
+                hasStuckZeroForBundle = YES;
+                break;
+            }
+        }
+        for (NSDictionary *d in initialDlState[@"ss_downloads"]) {
+            NSString *dBid = [d[@"bundle_id"] isKindOfClass:[NSString class]] ? d[@"bundle_id"] : nil;
+            double pct = [d[@"percent_complete"] respondsToSelector:@selector(doubleValue)] ? [d[@"percent_complete"] doubleValue] : 0.0;
+            if ((!dBid.length || [dBid isEqualToString:bundleId]) && pct <= 0.001) {
+                hasStuckZeroForBundle = YES;
+                break;
+            }
+        }
+        if (hasStuckZeroForBundle) {
+            NSDictionary *preCancel = MCPCancelStoreDownloadsForApp(bundleId);
+            [recoveryEvents addObject:@{
+                @"action": @"clear_preexisting_stalled_job",
+                @"detail": preCancel ?: @{}
+            }];
+            [NSThread sleepForTimeInterval:0.6];
+        }
+    }
+
     NSDictionary *purchaseDispatch = nil;
     for (NSString *pricing in pricingOrder) {
-        purchaseDispatch = MCPDispatchPurchaseTransaction(adamId, bundleId, targetExtId, pricing, accountDSID);
+        purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, NO);
         if ([purchaseDispatch[@"dispatched"] boolValue]) break;
     }
 
     BOOL usedCleanReinstallFallback = NO;
     BOOL sandboxRestored = NO;
+    int stallRecoveryCount = 0;
     NSDictionary *afterInstallInfo = beforeInstallInfo;
 
     if (waitForInstall && [purchaseDispatch[@"dispatched"] boolValue]) {
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSec];
         NSDate *halfwayCheck = [NSDate dateWithTimeIntervalSinceNow:MIN(25.0, timeoutSec * 0.45)];
+        NSDate *lastProgressChangeTime = [NSDate date];
+        double bestProgress = -1.0;
+        BOOL triedResumeInCurrentWindow = NO;
         BOOL completed = NO;
 
         while ([deadline timeIntervalSinceNow] > 0) {
@@ -1148,17 +1367,78 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
                 break;
             }
 
+            // Monitor active download progress and recover from stalled queues
+            NSDictionary *dlState = MCPQueryActiveStoreDownloads();
+            double currentMaxPct = -1.0;
+            NSInteger activeJobs = [dlState[@"active_count"] integerValue];
+            for (NSDictionary *j in dlState[@"asd_jobs"]) {
+                NSString *jBid = [j[@"bundle_id"] isKindOfClass:[NSString class]] ? j[@"bundle_id"] : nil;
+                if (!jBid.length || !bundleId.length || [jBid isEqualToString:bundleId]) {
+                    double pct = [j[@"percent_complete"] respondsToSelector:@selector(doubleValue)] ? [j[@"percent_complete"] doubleValue] : 0.0;
+                    if (pct > currentMaxPct) currentMaxPct = pct;
+                }
+            }
+            for (NSDictionary *d in dlState[@"ss_downloads"]) {
+                NSString *dBid = [d[@"bundle_id"] isKindOfClass:[NSString class]] ? d[@"bundle_id"] : nil;
+                if (!dBid.length || !bundleId.length || [dBid isEqualToString:bundleId]) {
+                    double pct = [d[@"percent_complete"] respondsToSelector:@selector(doubleValue)] ? [d[@"percent_complete"] doubleValue] : 0.0;
+                    if (pct > currentMaxPct) currentMaxPct = pct;
+                }
+            }
+
+            if (currentMaxPct > bestProgress + 0.0005) {
+                bestProgress = currentMaxPct;
+                lastProgressChangeTime = [NSDate date];
+                triedResumeInCurrentWindow = NO;
+            }
+
+            NSTimeInterval stalledSec = [[NSDate date] timeIntervalSinceDate:lastProgressChangeTime];
+            if (activeJobs > 0 && !triedResumeInCurrentWindow && stalledSec >= 4.5 && stalledSec < 9.5) {
+                triedResumeInCurrentWindow = YES;
+                NSDictionary *resumed = MCPResumeStoreDownloadsForApp(bundleId);
+                [recoveryEvents addObject:@{
+                    @"action": @"resume_stalled_download",
+                    @"stalled_seconds": @(stalledSec),
+                    @"progress": @(bestProgress < 0 ? 0.0 : bestProgress),
+                    @"detail": resumed ?: @{}
+                }];
+            } else if (stalledSec >= 9.5 && stallRecoveryCount < 4 && (bestProgress < 0.85)) {
+                stallRecoveryCount++;
+                NSDictionary *canceled = MCPCancelStoreDownloadsForApp(bundleId);
+                [NSThread sleepForTimeInterval:1.0];
+                BOOL preferASD = (stallRecoveryCount % 2 == 1);
+                NSArray<NSString *> *retryPricing = (stallRecoveryCount % 2 == 1) ? @[@"STDRDL", @"STDQ"] : pricingOrder;
+                for (NSString *pricing in retryPricing) {
+                    purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, preferASD);
+                    if ([purchaseDispatch[@"dispatched"] boolValue]) break;
+                }
+                NSDictionary *resumedAfter = MCPResumeStoreDownloadsForApp(bundleId);
+                [recoveryEvents addObject:@{
+                    @"action": @"cancel_and_retrigger_download",
+                    @"attempt": @(stallRecoveryCount),
+                    @"stalled_seconds": @(stalledSec),
+                    @"prefer_asd": @(preferASD),
+                    @"canceled": canceled ?: @{},
+                    @"redispatch": purchaseDispatch ?: @{},
+                    @"resume": resumedAfter ?: @{}
+                }];
+                lastProgressChangeTime = [NSDate date];
+                bestProgress = -1.0;
+                triedResumeInCurrentWindow = NO;
+            }
+
             // If downgrading over a newer installed version and installd blocked in-place downgrade (kMIEDowngradeError),
             // unregister the old app bundle while preserving our sandbox snapshot, then re-dispatch the legacy appExtVrsId install!
             if (wasInstalled && targetExtId > 0 && !usedCleanReinstallFallback && [halfwayCheck timeIntervalSinceNow] <= 0) {
-                NSDictionary *dlState = MCPQueryActiveStoreDownloads();
-                if ([dlState[@"active_count"] integerValue] == 0 && nowExtId == beforeExtId) {
+                if (activeJobs == 0 && nowExtId == beforeExtId) {
                     usedCleanReinstallFallback = YES;
                     MCPUninstallAppBundleOnly(bundleId);
                     for (NSString *pricing in @[@"STDRDL", @"STDQ"]) {
-                        purchaseDispatch = MCPDispatchPurchaseTransaction(adamId, bundleId, targetExtId, pricing, accountDSID);
+                        purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, NO);
                         if ([purchaseDispatch[@"dispatched"] boolValue]) break;
                     }
+                    lastProgressChangeTime = [NSDate date];
+                    bestProgress = -1.0;
                 }
             }
         }
@@ -1195,6 +1475,10 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
     result[@"after_install"] = afterInstallInfo ?: @{};
     result[@"clean_reinstall_fallback_used"] = @(usedCleanReinstallFallback);
     result[@"sandbox_data_preserved"] = @(preserveData && (sandboxRestored || !usedCleanReinstallFallback));
+    result[@"stall_recovery_attempts"] = @(stallRecoveryCount);
+    if (recoveryEvents.count > 0) {
+        result[@"queue_recovery_events"] = recoveryEvents;
+    }
     result[@"downloads"] = MCPQueryActiveStoreDownloads();
     return result;
 }
@@ -1308,6 +1592,12 @@ int main(int argc, const char *argv[]) {
                 @"store_account": MCPResolveActiveStoreAccount(NULL),
                 @"downloads": MCPQueryActiveStoreDownloads()
             };
+        } else if ([op isEqualToString:@"cancel_downloads"]) {
+            NSString *bundleId = [req[@"bundle_id"] isKindOfClass:[NSString class]] ? req[@"bundle_id"] : nil;
+            result = MCPCancelStoreDownloadsForApp(bundleId);
+        } else if ([op isEqualToString:@"resume_downloads"]) {
+            NSString *bundleId = [req[@"bundle_id"] isKindOfClass:[NSString class]] ? req[@"bundle_id"] : nil;
+            result = MCPResumeStoreDownloadsForApp(bundleId);
         } else {
             errMsg = [NSString stringWithFormat:@"Unsupported mcp-appstore op: %@", op];
         }
