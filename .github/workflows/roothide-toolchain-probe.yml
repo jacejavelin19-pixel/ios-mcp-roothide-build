@@ -1,9 +1,8 @@
 name: RootHide arm64e toolchain probe
 
 on:
-  push:
-    branches: [chore-roothide-toolchain]
   workflow_dispatch:
+
 
 permissions:
   contents: read

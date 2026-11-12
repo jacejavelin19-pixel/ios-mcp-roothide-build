@@ -2402,6 +2402,19 @@ static NSArray<NSString *> *MCPExtractPrintableStrings(const uint8_t *bytes, siz
     };
 }
 
+static NSString *MCPFindExecutable(NSString *tool) {
+    if (!tool.length) return nil;
+    NSArray<NSString *> *dirs = [MCPCommandSearchPath() componentsSeparatedByString:@":"];
+    for (NSString *d in dirs) {
+        if (!d.length) continue;
+        NSString *cand = [d stringByAppendingPathComponent:tool];
+        if (MCPIsExecutableFile(cand)) return cand;
+    }
+    NSString *jbCand = MCPSubPath([@"usr/bin/" stringByAppendingString:tool]);
+    if (MCPIsExecutableFile(jbCand)) return jbCand;
+    return nil;
+}
+
 - (NSDictionary *)listHermesDecodersForArgs:(NSDictionary *)args error:(NSString **)error {
     if (error) *error = nil;
     NSMutableArray<NSDictionary *> *decoders = [NSMutableArray array];
@@ -2428,3 +2441,4 @@ static NSArray<NSString *> *MCPExtractPrintableStrings(const uint8_t *bytes, siz
 }
 
 @end
+

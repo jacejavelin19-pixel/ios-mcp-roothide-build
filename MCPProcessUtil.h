@@ -50,3 +50,11 @@ FOUNDATION_EXPORT BOOL MCPRunRootProcessData(NSString *launchPath,
                                              BOOL *truncated,
                                              int *exitCode,
                                              NSString **errorMessage);
+
+FOUNDATION_EXPORT NSString *MCPJailbreakRoot(void);
+FOUNDATION_EXPORT NSString *MCPSubPath(NSString *relPath);
+FOUNDATION_EXPORT NSString *MCPCommandSearchPath(void);
+FOUNDATION_EXPORT NSString *MCPReadCommandOutput(NSArray<NSString *> *cmdAndArgs,
+                                                 NSTimeInterval timeout,
+                                                 int *exitCodeOut);
+

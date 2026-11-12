@@ -777,3 +777,87 @@ BOOL MCPRunRootProcessData(NSString *launchPath,
                              exitCode,
                              errorMessage);
 }
+
+NSString *MCPJailbreakRoot(void) {
+#ifdef MCP_ROOTHIDE
+    NSString *r = jbroot(@"/");
+    if ([r hasSuffix:@"/"] && r.length > 1) {
+        r = [r substringToIndex:r.length - 1];
+    }
+    return r.length ? r : @"/";
+#elif defined(MCP_ROOTLESS)
+    return @"/var/jb";
+#else
+    NSString *resolved = MCPResolvedJailbreakPath(@"/Library/MobileSubstrate");
+    if ([resolved hasPrefix:@"/var/jb/"]) return @"/var/jb";
+    NSRange r = [resolved rangeOfString:@"/Library/MobileSubstrate"];
+    if (r.location != NSNotFound && r.location > 0) {
+        return [resolved substringToIndex:r.location];
+    }
+    return @"/";
+#endif
+}
+
+NSString *MCPSubPath(NSString *relPath) {
+    if (!relPath.length) return MCPJailbreakRoot();
+    NSString *withSlash = [relPath hasPrefix:@"/"] ? relPath : [@"/" stringByAppendingString:relPath];
+    return MCPResolvedJailbreakPath(withSlash);
+}
+
+NSString *MCPCommandSearchPath(void) {
+    NSDictionary<NSString *, NSString *> *env = MCPJailbreakEnvironment();
+    return env[@"PATH"] ?: @"/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
+}
+
+NSString *MCPReadCommandOutput(NSArray<NSString *> *cmdAndArgs,
+                               NSTimeInterval timeout,
+                               int *exitCodeOut) {
+    if (exitCodeOut) *exitCodeOut = -1;
+    if (![cmdAndArgs isKindOfClass:[NSArray class]] || cmdAndArgs.count == 0) {
+        return @"";
+    }
+    NSString *cmd = [cmdAndArgs[0] description];
+    NSArray<NSString *> *args = cmdAndArgs.count > 1
+        ? [cmdAndArgs subarrayWithRange:NSMakeRange(1, cmdAndArgs.count - 1)]
+        : @[];
+
+    NSString *launchPath = nil;
+    if ([cmd hasPrefix:@"/"]) {
+        NSString *resolved = MCPResolvedJailbreakPath(cmd);
+        launchPath = MCPIsExecutableFile(resolved) ? resolved : cmd;
+    } else {
+        NSArray<NSString *> *dirs = [MCPCommandSearchPath() componentsSeparatedByString:@":"];
+        for (NSString *d in dirs) {
+            if (!d.length) continue;
+            NSString *cand = [d stringByAppendingPathComponent:cmd];
+            if (MCPIsExecutableFile(cand)) {
+                launchPath = cand;
+                break;
+            }
+        }
+        if (!launchPath.length) {
+            NSString *cand = MCPSubPath([@"usr/bin/" stringByAppendingString:cmd]);
+            if (MCPIsExecutableFile(cand)) launchPath = cand;
+        }
+        if (!launchPath.length) {
+            NSString *cand = MCPSubPath([@"bin/" stringByAppendingString:cmd]);
+            if (MCPIsExecutableFile(cand)) launchPath = cand;
+        }
+        if (!launchPath.length) {
+            launchPath = [@"/usr/bin/" stringByAppendingString:cmd];
+        }
+    }
+
+    NSString *output = nil;
+    NSString *errMsg = nil;
+    int code = -1;
+    BOOL ok = MCPRunRootProcess(launchPath, args, timeout > 0 ? timeout : 15.0, 512 * 1024, &output, &code, &errMsg);
+    if (!ok) {
+        ok = MCPRunProcess(launchPath, args, MCPJailbreakEnvironment(), timeout > 0 ? timeout : 15.0, 512 * 1024, &output, &code, &errMsg);
+    }
+    if (exitCodeOut) *exitCodeOut = code;
+    if (output.length) return output;
+    if (errMsg.length) return errMsg;
+    return @"";
+}
+
