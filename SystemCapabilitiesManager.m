@@ -765,11 +765,15 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
         }];
         if (cbCentralCls) {
             @try {
-                id central = [[cbCentralCls alloc] initWithDelegate:nil queue:nil];
+                SEL initSel = NSSelectorFromString(@"initWithDelegate:queue:");
+                id central = [cbCentralCls instancesRespondToSelector:initSel]
+                    ? ((id (*)(id, SEL, id, id))objc_msgSend)([cbCentralCls alloc], initSel, nil, nil)
+                    : [[cbCentralCls alloc] init];
                 if ([central respondsToSelector:@selector(state)]) {
                     NSInteger st = ((NSInteger (*)(id, SEL))objc_msgSend)(central, @selector(state));
                     bleInfo[@"central_state"] = @(st);
                 }
+
                 if ([cbCentralCls respondsToSelector:NSSelectorFromString(@"authorization")]) {
                     NSInteger auth = ((NSInteger (*)(id, SEL))objc_msgSend)(cbCentralCls, NSSelectorFromString(@"authorization"));
                     bleInfo[@"authorization"] = @(auth);
