@@ -63,11 +63,21 @@ case "$1" in
                /private/var/mobile/Library/Caches/ios-mcp \
                /private/var/mobile/Library/Logs/iOSMCP 2>/dev/null || true
 
-        # 3. Remove engine-sessions and frida/sessions while preserving /var/mobile/Library/ios-mcp/frida/gadget.dylib*
-        rm -rf /var/mobile/Library/ios-mcp/engine-sessions \
-               /var/mobile/Library/ios-mcp/frida/sessions \
-               /private/var/mobile/Library/ios-mcp/engine-sessions \
-               /private/var/mobile/Library/ios-mcp/frida/sessions 2>/dev/null || true
+        # 3. Remove runtime subdirectories (engine-sessions, frida/sessions, personas, checkpoints, apns, tweaks, diagnostics, port_forwards, virtual_camera, sms_otp, gps_teleporter) while preserving /var/mobile/Library/ios-mcp/frida/gadget.dylib*
+        for sub in engine-sessions frida/sessions personas checkpoints apns tweaks diagnostics port_forwards virtual_camera sms_otp gps_teleporter; do
+            rm -rf "/var/mobile/Library/ios-mcp/${sub}" \
+                   "/private/var/mobile/Library/ios-mcp/${sub}" 2>/dev/null || true
+            if [ -n "$JB_BASE" ]; then
+                rm -rf "${JB_BASE}/var/mobile/Library/ios-mcp/${sub}" 2>/dev/null || true
+            fi
+        done
+
+        # Remove preferences plist on purge
+        if [ "$1" = "purge" ]; then
+            rm -f /var/mobile/Library/Preferences/com.witchan.iosmcp.plist \
+                  /private/var/mobile/Library/Preferences/com.witchan.iosmcp.plist \
+                  "${JB_BASE}/var/mobile/Library/Preferences/com.witchan.iosmcp.plist" 2>/dev/null || true
+        fi
 
         # 4. If dpkg -r was invoked through mcp-helperd, finish tearing down helperd 1s after dpkg exits 0
         if is_helperd_ancestor; then

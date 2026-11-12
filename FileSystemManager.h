@@ -28,6 +28,48 @@
                          encoding:(NSString *)encoding
                             error:(NSString **)error;
 
+/// Write a file honoring path-safety and write-approval guards.
+- (NSDictionary *)writeFileWithArgs:(NSDictionary *)args
+                              error:(NSString **)error;
+
+/// Validate whether a target path is safe/approved for writing. Returns an approval-needed
+/// dictionary in *approvalOut when write approval is required and not yet granted.
+- (BOOL)validateWritePath:(NSString *)path
+                  options:(NSDictionary *)options
+              approvalOut:(NSDictionary **)approvalOut
+                    error:(NSString **)error;
+
+/// Read a chunk of a file starting at byte offset with given length.
+- (NSDictionary *)readFileChunkAtPath:(NSString *)path
+                               offset:(uint64_t)offset
+                               length:(NSUInteger)length
+                          forceBinary:(BOOL)forceBinary
+                                error:(NSString **)error;
+
+/// Tail the last N lines of a text/log file.
+- (NSDictionary *)tailFileAtPath:(NSString *)path
+                           lines:(NSUInteger)lines
+                        maxBytes:(NSUInteger)maxBytes
+                           error:(NSString **)error;
+
+/// Compute cryptographic digests (SHA-256, SHA-1, MD5) of a file.
+- (NSDictionary *)hashFileAtPath:(NSString *)path
+                      algorithms:(NSArray<NSString *> *)algorithms
+                           error:(NSString **)error;
+
+/// Package a directory or file into a downloadable .zip / .tar.gz archive.
+- (NSDictionary *)zipDirectoryAtPath:(NSString *)path
+                          outputPath:(NSString *)outputPath
+                               error:(NSString **)error;
+
+/// Recursively search files by filename regex/substring and optional content pattern.
+- (NSDictionary *)searchFilesAtPath:(NSString *)path
+                            pattern:(NSString *)pattern
+                     contentPattern:(NSString *)contentPattern
+                           maxDepth:(NSUInteger)maxDepth
+                         maxResults:(NSUInteger)maxResults
+                              error:(NSString **)error;
+
 /// Resolve a file for HTTP download. Returns the on-disk path the server can stream
 /// (may be a temp copy staged via mcp-root for privileged sources), and whether it is temporary.
 /// Returns nil with *error on failure.

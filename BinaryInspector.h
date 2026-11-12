@@ -23,5 +23,8 @@
 
 /// [Upgrade 10] React Native Hermes Bytecode & Flutter Dart AOT Snapshot Inspector
 - (NSDictionary *)inspectHermesFlutterForArgs:(NSDictionary *)args error:(NSString **)error;
+- (NSDictionary *)inspectJsBundleForArgs:(NSDictionary *)args error:(NSString **)error;
+- (NSDictionary *)decodeJsBundleForArgs:(NSDictionary *)args error:(NSString **)error;
+- (NSDictionary *)listHermesDecodersForArgs:(NSDictionary *)args error:(NSString **)error;
 
 @end

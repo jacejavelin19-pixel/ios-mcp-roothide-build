@@ -30,6 +30,7 @@
 #import "OCRManager.h"
 #import "MCPOCRRequestContext.h"
 #import "MCPLogger.h"
+#import "IOSMCPPreferences.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -549,6 +550,207 @@ static NSDictionary *MCPJailbreakInfo(BOOL debug) {
     return [info copy];
 }
 
+static NSDictionary<NSString *, NSString *> *MCPToolAliasMap(void) {
+    static NSDictionary<NSString *, NSString *> *aliases = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        aliases = @{
+            // UI & Touch
+            @"ui_tap": @"tap_screen",
+            @"ui_tap_element": @"tap_element",
+            @"ui_swipe": @"swipe_screen",
+            @"ui_long_press": @"long_press",
+            @"ui_double_tap": @"double_tap",
+            @"ui_drag_drop": @"drag_and_drop",
+            @"ui_get_elements": @"get_ui_elements",
+            @"ui_element_at_point": @"get_element_at_point",
+            @"ui_wait_for": @"wait_for_element",
+            @"ui_wait_disappear": @"wait_for_disappear",
+            @"ui_wait_texts": @"wait_until_texts",
+            @"ui_ocr": @"ocr_screen",
+            @"ui_describe": @"describe_screen",
+            @"ui_screenshot": @"screenshot",
+            @"ui_screen_info": @"get_screen_info",
+            @"ui_input_text": @"input_text",
+            @"ui_type_text": @"type_text",
+            @"ui_press_key": @"press_key",
+            @"ui_human_touch": @"human_touch_physics_and_stream",
+            @"ui_human_pause": @"human_pause",
+            @"ui_set_otp": @"set_otp",
+            // Device & Session
+            @"device_press_home": @"press_home",
+            @"device_press_power": @"press_power",
+            @"device_press_volume_up": @"press_volume_up",
+            @"device_press_volume_down": @"press_volume_down",
+            @"device_toggle_mute": @"toggle_mute",
+            @"device_wake_and_home": @"wake_and_home",
+            @"device_info": @"get_device_info",
+            @"device_get_brightness": @"get_brightness",
+            @"device_set_brightness": @"set_brightness",
+            @"device_get_volume": @"get_volume",
+            @"device_set_volume": @"set_volume",
+            @"device_get_clipboard": @"get_clipboard",
+            @"device_set_clipboard": @"set_clipboard",
+            @"device_open_url": @"open_url",
+            @"device_run_command": @"run_command",
+            @"device_respring": @"respring",
+            @"device_force_unlock": @"session_force_unlock",
+            @"device_respawn": @"session_respawn",
+            @"device_port_forward": @"port_forward",
+            @"device_diagnose_roots": @"diagnose_roots",
+            @"device_diagnostics": @"diagnostics_collect",
+            // App & AppStore
+            @"app_launch": @"launch_app",
+            @"app_kill": @"kill_app",
+            @"app_list": @"list_apps",
+            @"app_list_running": @"list_running_apps",
+            @"app_frontmost": @"get_frontmost_app",
+            @"app_info": @"get_app_info",
+            @"app_install": @"install_app",
+            @"app_uninstall": @"uninstall_app",
+            @"app_checkpoint": @"checkpoint_app_state",
+            @"app_immortality": @"background_immortality_governor",
+            @"app_groups_icloud": @"appgroup_icloud_account_inspector",
+            // Filesystem, Plist, SQLite, Keychain, Logs
+            @"fs_list_dir": @"list_dir",
+            @"fs_read_file": @"read_file",
+            @"fs_read_chunk": @"read_file_chunk",
+            @"fs_tail_file": @"tail_file",
+            @"fs_write_file": @"write_file",
+            @"fs_hash_file": @"hash_file",
+            @"fs_zip_download": @"zip_download",
+            @"fs_search_files": @"search_files",
+            @"plist_get": @"get_plist_value",
+            @"plist_set": @"set_plist_value",
+            @"sqlite_query": @"query_sqlite",
+            @"keychain_get": @"get_keychain_item",
+            @"keychain_set": @"set_keychain_item",
+            @"keychain_delete": @"delete_keychain_item",
+            @"log_get_syslog": @"get_syslog",
+            @"log_list_crashes": @"get_crash_logs",
+            @"log_read_crash": @"read_crash_log",
+            @"log_symbolicate_crash": @"symbolicate_crash",
+            // Network & Crypto
+            @"net_start_capture": @"start_capture",
+            @"net_stop_capture": @"stop_capture",
+            @"net_get_requests": @"get_captured_requests",
+            @"net_bypass_pinning": @"bypass_pinning",
+            @"net_restore_pinning": @"restore_pinning",
+            @"net_hook_quic": @"hook_quic_http3",
+            @"net_decode_protobuf": @"decode_protobuf",
+            @"net_replay_request": @"replay_request_native",
+            @"net_tls_cloak": @"tls_ja3_ja4_http2_cloak",
+            @"crypto_trace": @"trace_crypto_primitives",
+            @"crypto_get_events": @"get_crypto_events",
+            // Memory & Reverse Engineering
+            @"mem_read": @"read_memory",
+            @"mem_write": @"write_memory",
+            @"mem_search": @"search_memory",
+            @"mem_list_regions": @"list_memory_regions",
+            @"re_inspect_macho": @"inspect_macho",
+            @"re_dump_classes": @"dump_classes",
+            @"re_dump_entitlements": @"dump_entitlements",
+            @"re_patch_entitlements": @"patch_entitlements",
+            @"re_inject_dylib": @"inject_dylib",
+            @"re_remove_dylib": @"remove_dylib",
+            @"re_dump_il2cpp": @"dump_il2cpp",
+            @"re_decrypt_ipa": @"decrypt_app_ipa",
+            @"re_decompile_function": @"decompile_function",
+            @"re_decompile_objc": @"decompile_objc_method",
+            @"re_find_xrefs": @"find_xrefs_to",
+            @"re_hw_breakpoint": @"hardware_breakpoint_hook",
+            @"re_dump_swift": @"dump_swift_metadata",
+            @"re_extract_dsc": @"extract_dyld_shared_cache",
+            @"re_inspect_hermes_flutter": @"inspect_hermes_flutter",
+            @"re_inspect_js_bundle": @"inspect_js_bundle",
+            @"re_decode_js_bundle": @"decode_js_bundle",
+            @"re_list_hermes_decoders": @"list_hermes_decoders",
+            // Stealth & Anti-Fraud
+            @"stealth_spoof_fingerprint": @"spoof_device_fingerprint",
+            @"stealth_kernel_proc": @"kernel_proc_cloak",
+            @"stealth_proxy_vpn": @"proxy_vpn_network_cloak",
+            @"stealth_canvas_gpu_audio": @"hardware_canvas_gpu_audio_randomizer",
+            @"stealth_biometrics_ghost": @"behavioral_biometrics_ghost_player",
+            @"stealth_bot_sdks": @"perimeterx_akamai_datadome_kasada_tap",
+            @"stealth_fraud_sdks": @"threatmetrix_sardine_forter_seon_neutralizer",
+            @"stealth_app_attest": @"apple_app_attest_devicecheck_bridge",
+            @"stealth_sync_persona": @"sync_fraud_persona",
+            @"stealth_objc_dladdr": @"objc_swizzle_and_dladdr_integrity_cloak",
+            @"stealth_thread_stack": @"thread_mach_port_and_stack_cloaker",
+            @"stealth_wipe_canaries": @"wipe_fraud_canaries",
+            @"stealth_apply_persona": @"apply_fraud_persona",
+            @"stealth_audit_surface": @"audit_fraud_surface",
+            // Simulation & Hardware Buses
+            @"sim_camera_mic": @"virtual_camera_and_mic_feed",
+            @"sim_sms_otp": @"telephony_sms_otp_controller",
+            @"sim_biometric_vault": @"biometric_passkey_se_vault",
+            @"sim_webkit_bridge": @"webkit_cdp_dom_bridge",
+            @"sim_gps_motion": @"gps_motion_sensor_teleporter",
+            @"sim_xpc_fuzzer": @"xpc_mach_ipc_sniffer_fuzzer",
+            @"sim_apns_deeplink": @"apns_notification_deeplink_bus",
+            @"sim_wireless_recon": @"wireless_radio_recon_suite",
+            @"sim_fs_iokit_tracer": @"fs_io_and_iokit_tracer",
+            // Tweak & Photos
+            @"tweak_self_update": @"self_update",
+            @"photos_media_upload": @"media_upload"
+        };
+    });
+    return aliases;
+}
+
+static NSString *MCPCanonicalToolName(NSString *toolName) {
+    if (![toolName isKindOfClass:[NSString class]] || toolName.length == 0) return @"";
+    NSString *mapped = MCPToolAliasMap()[toolName];
+    return mapped ?: toolName;
+}
+
+static NSString *MCPTierForToolName(NSString *toolName) {
+    NSString *canonical = MCPCanonicalToolName(toolName);
+    if ([canonical hasPrefix:@"engine_"] ||
+        [canonical hasPrefix:@"frida_"] ||
+        [canonical isEqualToString:@"inject_frida_gadget"] ||
+        [canonical isEqualToString:@"remove_frida_gadget"] ||
+        [canonical isEqualToString:@"scrub_gadget_binary"] ||
+        [canonical isEqualToString:@"configure_frida_stealth"] ||
+        [canonical isEqualToString:@"get_frida_stealth_status"] ||
+        [canonical isEqualToString:@"tweak_build"] ||
+        [canonical isEqualToString:@"tweak_deploy"] ||
+        [canonical isEqualToString:@"tweak_rollback"] ||
+        [canonical isEqualToString:@"self_update"] ||
+        [canonical isEqualToString:@"diagnostics_collect"] ||
+        [canonical isEqualToString:@"diagnose_roots"] ||
+        [canonical isEqualToString:@"port_forward"] ||
+        [canonical isEqualToString:@"session_force_unlock"] ||
+        [canonical isEqualToString:@"session_respawn"]) {
+        return @"debug";
+    }
+    static NSSet<NSString *> *coreSet = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        coreSet = [NSSet setWithArray:@[
+            @"press_volume_up", @"press_volume_down", @"press_power", @"press_home",
+            @"wake_and_home", @"toggle_mute", @"tap_screen", @"tap_element",
+            @"wait_for_element", @"wait_for_disappear", @"wait_until_texts", @"swipe_screen",
+            @"get_screen_info", @"screenshot", @"get_clipboard", @"set_clipboard",
+            @"launch_app", @"kill_app", @"list_apps", @"list_running_apps",
+            @"get_frontmost_app", @"get_ui_elements", @"get_element_at_point",
+            @"ocr_screen", @"describe_screen", @"input_text", @"type_text",
+            @"press_key", @"long_press", @"double_tap", @"drag_and_drop",
+            @"open_url", @"get_device_info", @"run_command", @"get_brightness",
+            @"set_brightness", @"get_volume", @"set_volume", @"install_app",
+            @"uninstall_app", @"get_app_info", @"list_dir", @"read_file",
+            @"read_file_chunk", @"tail_file", @"write_file", @"hash_file",
+            @"zip_download", @"search_files", @"get_plist_value", @"set_plist_value",
+            @"query_sqlite", @"get_syslog", @"get_crash_logs", @"read_crash_log",
+            @"set_otp", @"human_pause", @"respring", @"device_reboot", @"probe_help"
+        ]];
+    });
+    if ([coreSet containsObject:canonical]) {
+        return @"core";
+    }
+    return @"advanced";
+}
+
 static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
     static NSArray<NSString *> *tools = nil;
     static dispatch_once_t onceToken;
@@ -557,6 +759,14 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"press_power",
             @"press_home",
             @"wake_and_home",
+            @"session_force_unlock",
+            @"session_respawn",
+            @"respring",
+            @"device_reboot",
+            @"probe_help",
+            @"diagnostics_collect",
+            @"diagnose_roots",
+            @"port_forward",
             @"get_screen_info",
             @"screenshot",
             @"get_frontmost_app",
@@ -566,6 +776,7 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"describe_screen",
             @"wait_for_element",
             @"wait_for_disappear",
+            @"wait_until_texts",
             @"list_apps",
             @"list_running_apps",
             @"get_device_info",
@@ -575,6 +786,11 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"get_app_info",
             @"list_dir",
             @"read_file",
+            @"read_file_chunk",
+            @"tail_file",
+            @"hash_file",
+            @"zip_download",
+            @"search_files",
             @"get_plist_value",
             @"read_memory",
             @"search_memory",
@@ -584,6 +800,11 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"dump_classes",
             @"symbolicate_crash",
             @"get_captured_requests",
+            @"net_status",
+            @"net_dump",
+            @"net_clear",
+            @"net_enable",
+            @"net_disable",
             @"dump_il2cpp",
             @"query_sqlite",
             @"get_frida_stealth_status",
@@ -602,7 +823,22 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"dump_swift_metadata",
             @"extract_dyld_shared_cache",
             @"inspect_hermes_flutter",
+            @"inspect_js_bundle",
+            @"decode_js_bundle",
+            @"list_hermes_decoders",
+            @"tweak_build",
+            @"tweak_deploy",
+            @"tweak_rollback",
+            @"self_update",
+            @"photos_list",
+            @"photos_ensure",
             @"engine_eval_js",
+            @"engine_trace_crypto",
+            @"engine_get_crypto_events",
+            @"engine_stop_crypto",
+            @"engine_hook_quic_http3",
+            @"engine_decode_protobuf",
+            @"engine_replay_request",
             @"trace_crypto_primitives",
             @"get_crypto_events",
             @"hook_quic_http3",
@@ -635,6 +871,7 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"wireless_radio_recon_suite",
             @"fs_io_and_iokit_tracer",
             @"human_touch_physics_and_stream",
+            @"human_pause",
             @"background_immortality_governor",
             @"appgroup_icloud_account_inspector"
         ];
@@ -643,8 +880,9 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
 }
 
 static BOOL MCPLockGuardToolAllowed(NSString *toolName) {
-    if (toolName.length == 0) return NO;
-    return [MCPLockGuardAllowedTools() containsObject:toolName];
+    NSString *canonical = MCPCanonicalToolName(toolName);
+    if (canonical.length == 0) return NO;
+    return [MCPLockGuardAllowedTools() containsObject:canonical];
 }
 
 static BOOL MCPStateBool(NSDictionary *state, NSString *key, BOOL *outValue) {
@@ -2200,7 +2438,7 @@ static NSString *MCPLogId(id reqId) {
     } else if ([method isEqualToString:@"ping"]) {
         return @{@"jsonrpc": @"2.0", @"id": reqId ?: [NSNull null], @"result": @{}};
     } else if ([method isEqualToString:@"tools/list"]) {
-        return [self handleToolsList:reqId];
+        return [self handleToolsList:reqId params:params];
     } else if ([method isEqualToString:@"tools/call"]) {
         return [self handleToolsCall:reqId params:params];
     } else {
@@ -2247,6 +2485,10 @@ static NSString *MCPLogId(id reqId) {
 #pragma mark - MCP: tools/list
 
 - (NSDictionary *)handleToolsList:(id)reqId {
+    return [self handleToolsList:reqId params:nil];
+}
+
+- (NSDictionary *)handleToolsList:(id)reqId params:(NSDictionary *)params {
     NSArray *tools = @[
         @{
             @"name": @"press_volume_up",
@@ -4041,8 +4283,595 @@ static NSString *MCPLogId(id reqId) {
                     @"bundle_id": @{@"type": @"string", @"description": @"Optional app bundle ID to inspect specific App Group and iCloud entitlements (if omitted, scans all shared AppGroup containers on disk)."}
                 }
             }
+        },
+        // Step 2: Missing engine_* schemas
+        @{
+            @"name": @"engine_trace_crypto",
+            @"description": @"Start in-process libmcpengine crypto primitive tracing (CCCrypt, CCHmac,CCKeyDerivationPBKDF, SecKeyRawSign/Verify) for a running app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"engine_get_crypto_events",
+            @"description": @"Fetch captured in-process libmcpengine crypto events (keys, IVs, plaintexts, HMAC inputs) for a running app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear buffered crypto events after reading (default false)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"engine_stop_crypto",
+            @"description": @"Stop in-process libmcpengine crypto primitive tracing for a running app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"engine_hook_quic_http3",
+            @"description": @"Configure in-process libmcpengine QUIC / HTTP/3 UDP 443 control or nw_parameters_set_quic_enabled hook for a running app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"disable_quic": @{@"type": @"boolean", @"description": @"Force HTTP/2 fallback by blocking UDP/443 QUIC handshakes (default true)."},
+                    @"enable": @{@"type": @"boolean", @"description": @"Enable or disable the QUIC hook (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"engine_decode_protobuf",
+            @"description": @"Decode raw Protobuf wire-format payload (hex or base64) inside libmcpengine into recursive field trees.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"hex": @{@"type": @"string", @"description": @"Hex-encoded protobuf payload."},
+                    @"base64": @{@"type": @"string", @"description": @"Base64-encoded protobuf payload."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"engine_replay_request",
+            @"description": @"Replay an HTTP/HTTPS request from inside the target app's own NSURLSession / BoringSSL TLS stack via libmcpengine.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"url": @{@"type": @"string", @"description": @"Request URL."},
+                    @"method": @{@"type": @"string", @"description": @"HTTP method (default GET)."},
+                    @"headers": @{@"type": @"object", @"description": @"Optional HTTP header dictionary."},
+                    @"body": @{@"type": @"string", @"description": @"Optional UTF-8 request body."},
+                    @"body_base64": @{@"type": @"string", @"description": @"Optional base64 request body."}
+                },
+                @"required": @[@"bundle_id", @"url"]
+            }
+        },
+        // Step 3: Safety & Ergonomics tools
+        @{
+            @"name": @"wait_until_texts",
+            @"description": @"Poll accessibility UI elements (and optionally OCR) until any or all specified text strings appear on screen.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"texts": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Array of target strings to wait for."},
+                    @"mode": @{@"type": @"string", @"description": @"Match mode: 'any' (default) or 'all'."},
+                    @"exact": @{@"type": @"boolean", @"description": @"Require exact string equality instead of case-insensitive substring (default false)."},
+                    @"include_ocr": @{@"type": @"boolean", @"description": @"Also run OCR on each poll if accessibility elements do not match (default false)."},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"Maximum wait time in milliseconds (default 8000, max 30000)."},
+                    @"interval_ms": @{@"type": @"number", @"description": @"Polling interval in milliseconds (default 500)."}
+                },
+                @"required": @[@"texts"]
+            }
+        },
+        @{
+            @"name": @"respring",
+            @"description": @"Restart SpringBoard cleanly (via sbreload or killall -9 SpringBoard) after returning the MCP response.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"mode": @{@"type": @"string", @"description": @"Respring method: 'killall' (default) or 'sbreload'."},
+                    @"delay_ms": @{@"type": @"number", @"description": @"Delay in milliseconds before restarting SpringBoard so the HTTP response flushes cleanly (default 400)."}
+                }
+            }
+        },
+        @{
+            @"name": @"device_reboot",
+            @"description": @"Reboot or userspace-reboot the device. Requires confirm=true to prevent accidental reboots.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"confirm": @{@"type": @"boolean", @"description": @"Must be true to execute the reboot."},
+                    @"mode": @{@"type": @"string", @"description": @"Reboot mode: 'userspace' (default, launchctl reboot userspace) or 'full' (kernel reboot)."},
+                    @"delay_ms": @{@"type": @"number", @"description": @"Delay in milliseconds before executing reboot (default 500)."}
+                },
+                @"required": @[@"confirm"]
+            }
+        },
+        // Step 4: File, JS/Hermes, Tweak lifecycle & Diagnostics tools
+        @{
+            @"name": @"read_file_chunk",
+            @"description": @"Read a byte range from a file at a specific offset and length without transferring the entire file.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute file path on device."},
+                    @"offset": @{@"type": @"number", @"description": @"Byte offset to start reading from (default 0)."},
+                    @"length": @{@"type": @"number", @"description": @"Number of bytes to read (default 65536, max 4194304)."},
+                    @"binary": @{@"type": @"boolean", @"description": @"Force base64 binary output (default false)."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"tail_file",
+            @"description": @"Return the last N lines of a log or text file on the device.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute file path on device."},
+                    @"lines": @{@"type": @"number", @"description": @"Number of trailing lines to return (default 100, max 5000)."},
+                    @"max_bytes": @{@"type": @"number", @"description": @"Maximum trailing bytes to scan (default 262144)."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"hash_file",
+            @"description": @"Compute cryptographic and checksum digests (sha256, sha1, md5, crc32) for a file on the device.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Absolute file path on device."},
+                    @"algorithms": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Digest algorithms to compute (default: ['sha256', 'md5', 'sha1', 'crc32'])."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"zip_download",
+            @"description": @"Package a file or directory on the device into a .zip archive and return its download path.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Source file or directory path on device."},
+                    @"output_path": @{@"type": @"string", @"description": @"Optional destination .zip path on device."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"search_files",
+            @"description": @"Recursively search a directory for filenames matching a substring/regex and optionally grep file contents.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Root directory path on device."},
+                    @"pattern": @{@"type": @"string", @"description": @"Filename substring or regex pattern."},
+                    @"content_pattern": @{@"type": @"string", @"description": @"Optional text/regex pattern to search inside matching files."},
+                    @"max_depth": @{@"type": @"number", @"description": @"Maximum directory recursion depth (default 6)."},
+                    @"max_results": @{@"type": @"number", @"description": @"Maximum results to return (default 200)."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"inspect_js_bundle",
+            @"description": @"Locate and classify React Native / Hermes / Expo JS bundles (.jsbundle, .hbc) inside an app bundle, parsing Hermes HBC header version, function count, and string kinds.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Optional direct path to a JS bundle file or .app directory."}
+                }
+            }
+        },
+        @{
+            @"name": @"decode_js_bundle",
+            @"description": @"Extract string tables, API URLs, endpoints, and function descriptors from a Hermes bytecode (.hbc) or plain/minified React Native JS bundle.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"path": @{@"type": @"string", @"description": @"Optional direct path to the .jsbundle / .hbc file."},
+                    @"filter": @{@"type": @"string", @"description": @"Optional case-insensitive substring filter for extracted strings."},
+                    @"max_strings": @{@"type": @"number", @"description": @"Maximum strings to return (default 500, max 5000)."}
+                }
+            }
+        },
+        @{
+            @"name": @"list_hermes_decoders",
+            @"description": @"List built-in and on-device Hermes bytecode / JS bundle decoders and supported HBC bytecode versions.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{}
+            }
+        },
+        @{
+            @"name": @"tweak_build",
+            @"description": @"Compile a dynamic library (.dylib) or Theos tweak on-device or stage an uploaded dylib into the managed tweak workspace.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"name": @{@"type": @"string", @"description": @"Tweak name (default 'custom_tweak')."},
+                    @"source_code": @{@"type": @"string", @"description": @"Optional Objective-C/C source code to compile if clang is available on-device."},
+                    @"source_path": @{@"type": @"string", @"description": @"Optional path to source directory or prebuilt .dylib on device."},
+                    @"dylib_base64": @{@"type": @"string", @"description": @"Optional base64-encoded prebuilt .dylib to stage and codesign."},
+                    @"filter_bundles": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Target bundle IDs for MobileSubstrate filter plist."}
+                }
+            }
+        },
+        @{
+            @"name": @"tweak_deploy",
+            @"description": @"Deploy a built or staged .dylib and its filter .plist into MobileSubstrate/DynamicLibraries (with automatic backup for rollback).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"name": @{@"type": @"string", @"description": @"Tweak name."},
+                    @"dylib_path": @{@"type": @"string", @"description": @"Optional path to the .dylib to deploy."},
+                    @"filter_bundles": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Bundle IDs for the MobileSubstrate Filter plist."},
+                    @"respring": @{@"type": @"boolean", @"description": @"Restart SpringBoard after deploying (default false)."}
+                },
+                @"required": @[@"name"]
+            }
+        },
+        @{
+            @"name": @"tweak_rollback",
+            @"description": @"Roll back a deployed tweak from MobileSubstrate/DynamicLibraries and restore its previous backup if one existed.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"name": @{@"type": @"string", @"description": @"Tweak name to roll back."},
+                    @"respring": @{@"type": @"boolean", @"description": @"Restart SpringBoard after rollback (default false)."}
+                },
+                @"required": @[@"name"]
+            }
+        },
+        @{
+            @"name": @"self_update",
+            @"description": @"Install or upgrade the com.witchan.ios-mcp .deb package on-device via dpkg without killing the active dpkg session.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"deb_path": @{@"type": @"string", @"description": @"Absolute path on device to the .deb package (if omitted, uses the newest .deb in /var/mobile/Library/Caches/ios-mcp-uploads)."},
+                    @"respring": @{@"type": @"boolean", @"description": @"Restart SpringBoard 1s after dpkg completes (default true)."}
+                }
+            }
+        },
+        @{
+            @"name": @"diagnose_roots",
+            @"description": @"Inspect RootHide jbroot, Rootless /var/jb, dpkg status, LaunchDaemons, helper binary permissions, and companion payload dylibs.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{}
+            }
+        },
+        @{
+            @"name": @"diagnostics_collect",
+            @"description": @"Collect a comprehensive diagnostic bundle (root layout, helper statuses, recent ios-mcp logs, and crash summaries) into JSON and optionally a .zip archive.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"zip": @{@"type": @"boolean", @"description": @"Also write a .zip archive of the diagnostics report (default true)."}
+                }
+            }
+        },
+        @{
+            @"name": @"port_forward",
+            @"description": @"Inspect listening TCP ports on the device and generate ready-to-run host iproxy / ssh port-forwarding commands.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Action: 'status' (default), 'Add'/'create', or 'remove'."},
+                    @"device_port": @{@"type": @"number", @"description": @"Device TCP port (default 8080)."},
+                    @"host_port": @{@"type": @"number", @"description": @"Host TCP port (default 18080)."}
+                }
+            }
+        },
+        @{
+            @"name": @"session_force_unlock",
+            @"description": @"Force-wake the backlight and dismiss the SpringBoard lock screen via SBLockScreenManager / SBBacklightController + HID wake fallback.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"passcode": @{@"type": @"string", @"description": @"Optional device passcode if required by SBLockScreenManager."}
+                }
+            }
+        },
+        @{
+            @"name": @"session_respawn",
+            @"description": @"Respawn mcp-helperd, target app engine session, or SpringBoard session state.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"target": @{@"type": @"string", @"description": @"Target to respawn: 'helperd' (default), 'app', or 'springboard'."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"App bundle ID when target='app'."}
+                }
+            }
+        },
+        // Step 5: Donor stealth, OTP, TikTok social, Photos & Network tools
+        @{
+            @"name": @"set_otp",
+            @"description": @"Fill multi-cell PIN/OTP verification fields via in-process responder injection, sorted single-digit cell discovery, or paced HID keystrokes.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"code": @{@"type": @"string", @"description": @"OTP/PIN verification code string."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional target app bundle ID (defaults to frontmost app)."},
+                    @"submit": @{@"type": @"boolean", @"description": @"Send Return/Enter after filling the code (default false)."}
+                },
+                @"required": @[@"code"]
+            }
+        },
+        @{
+            @"name": @"human_pause",
+            @"description": @"Sleep for a log-normal / Box-Muller Gaussian human think-time pause between automation actions.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"mean_ms": @{@"type": @"number", @"description": @"Mean pause duration in milliseconds (default 650)."},
+                    @"stddev_ms": @{@"type": @"number", @"description": @"Standard deviation in milliseconds (default 25% of mean_ms)."},
+                    @"min_ms": @{@"type": @"number", @"description": @"Minimum clamp in milliseconds (default 80)."},
+                    @"max_ms": @{@"type": @"number", @"description": @"Maximum clamp in milliseconds (default 15000)."}
+                }
+            }
+        },
+        @{
+            @"name": @"tiktok_open_search",
+            @"description": @"Open TikTok directly to a search query or deeplink via snssdk1233:// / snssdk1180:// URL schemes.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"keyword": @{@"type": @"string", @"description": @"Search query keyword."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional TikTok bundle ID (default com.zhiliaoapp.musically)."}
+                },
+                @"required": @[@"keyword"]
+            }
+        },
+        @{
+            @"name": @"tiktok_inbox",
+            @"description": @"Fetch TikTok inbox notices / notifications via in-process TTNetworkManagerChromium or authenticated session cookies.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional TikTok bundle ID."},
+                    @"count": @{@"type": @"number", @"description": @"Number of notices to fetch (default 20)."},
+                    @"group": @{@"type": @"number", @"description": @"Notice group ID (default 0)."}
+                }
+            }
+        },
+        @{
+            @"name": @"tiktok_reply",
+            @"description": @"Publish a TikTok comment or reply via in-process TTNetworkManagerChromium.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"aweme_id": @{@"type": @"string", @"description": @"Target video aweme_id."},
+                    @"text": @{@"type": @"string", @"description": @"Comment text."},
+                    @"reply_id": @{@"type": @"string", @"description": @"Optional comment cid to reply to."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional TikTok bundle ID."}
+                },
+                @"required": @[@"aweme_id", @"text"]
+            }
+        },
+        @{
+            @"name": @"tiktok_im",
+            @"description": @"Inspect or send TikTok direct messages via in-process TIMOConversation / HTCServiceManager.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"sub_action": @{@"type": @"string", @"description": @"Sub-action: 'status' (default) or 'send'."},
+                    @"conversation_id": @{@"type": @"string", @"description": @"Conversation ID when sub_action='send'."},
+                    @"text": @{@"type": @"string", @"description": @"Message text when sub_action='send'."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional TikTok bundle ID."}
+                }
+            }
+        },
+        @{
+            @"name": @"tiktok_posts",
+            @"description": @"Fetch TikTok feed or user post list via in-process TTNetworkManagerChromium.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"sec_user_id": @{@"type": @"string", @"description": @"Optional sec_user_id to query a specific user's posts."},
+                    @"count": @{@"type": @"number", @"description": @"Number of posts to fetch (default 20)."},
+                    @"max_cursor": @{@"type": @"number", @"description": @"Pagination cursor (default 0)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional TikTok bundle ID."}
+                }
+            }
+        },
+        @{
+            @"name": @"tiktok_sign",
+            @"description": @"Invoke TikTok's in-process anti-fraud request signer / TTNetworkManagerChromium to sign or execute an API request with X-Gorgon / X-Argus / X-Ladon / X-Khronos headers.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"url": @{@"type": @"string", @"description": @"Target TikTok API URL."},
+                    @"method": @{@"type": @"string", @"description": @"HTTP method (default GET)."},
+                    @"params": @{@"type": @"object", @"description": @"Optional query/form parameters."},
+                    @"headers": @{@"type": @"object", @"description": @"Optional extra headers."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional TikTok bundle ID."}
+                },
+                @"required": @[@"url"]
+            }
+        },
+        @{
+            @"name": @"photos_ensure",
+            @"description": @"Check Photos library authorization status and asset count.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Optional app bundle ID."}
+                }
+            }
+        },
+        @{
+            @"name": @"media_upload",
+            @"description": @"Import an image or video (from device path or base64) into the iOS Photos library via PHPhotoLibrary.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Device path to image or video file."},
+                    @"base64": @{@"type": @"string", @"description": @"Optional base64-encoded media payload."},
+                    @"ext": @{@"type": @"string", @"description": @"File extension when using base64 (default 'jpg')."},
+                    @"media_type": @{@"type": @"string", @"description": @"Media type: 'image' (default) or 'video'."}
+                }
+            }
+        },
+        @{
+            @"name": @"photos_import",
+            @"description": @"Import an image or video into the iOS Photos library (alias of media_upload).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Device path to image or video file."},
+                    @"base64": @{@"type": @"string", @"description": @"Optional base64-encoded media payload."},
+                    @"ext": @{@"type": @"string", @"description": @"File extension when using base64 (default 'jpg')."},
+                    @"media_type": @{@"type": @"string", @"description": @"Media type: 'image' (default) or 'video'."}
+                }
+            }
+        },
+        @{
+            @"name": @"photos_import_file",
+            @"description": @"Import an on-device image or video file into the iOS Photos library.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"path": @{@"type": @"string", @"description": @"Device path to image or video file."},
+                    @"media_type": @{@"type": @"string", @"description": @"Media type: 'image' (default) or 'video'."}
+                },
+                @"required": @[@"path"]
+            }
+        },
+        @{
+            @"name": @"photos_list",
+            @"description": @"List recent PHAssets in the iOS Photos library with localIdentifier, dimensions, mediaType, and creationDate.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"limit": @{@"type": @"number", @"description": @"Maximum number of assets to return (default 50)."}
+                }
+            }
+        },
+        @{
+            @"name": @"photos_clear",
+            @"description": @"Delete specified PHAssets (by local_identifiers) or recent assets from the iOS Photos library.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"local_identifiers": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Optional list of PHAsset localIdentifiers to delete."},
+                    @"limit": @{@"type": @"number", @"description": @"Maximum assets to delete when local_identifiers is omitted (default 20)."}
+                }
+            }
+        },
+        @{
+            @"name": @"net_enable",
+            @"description": @"Enable in-process network request capture for a target app (alias of start_capture).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"clear_existing": @{@"type": @"boolean", @"description": @"Clear existing capture log first (default true)."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch target app if needed (default true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"net_disable",
+            @"description": @"Disable network request capture for a target app (alias of stop_capture).",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"clear_logs": @{@"type": @"boolean", @"description": @"Delete captured log file (default false)."},
+                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch target app (default false)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"net_clear",
+            @"description": @"Truncate and clear captured network requests for a target app without detaching the capture dylib.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"net_status",
+            @"description": @"Return network capture injection status, log path, byte size, and entry count for a target app.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        @{
+            @"name": @"net_dump",
+            @"description": @"Retrieve captured HTTP/HTTPS requests for a target app with automatic sensitive header/token redaction and inline body folding.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
+                    @"limit": @{@"type": @"number", @"description": @"Maximum requests to return (default 100)."},
+                    @"url_filter": @{@"type": @"string", @"description": @"Optional URL substring filter."},
+                    @"clear": @{@"type": @"boolean", @"description": @"Clear log after reading (default false)."},
+                    @"redact": @{@"type": @"boolean", @"description": @"Redact sensitive Authorization/Cookie/token values (default follows Preferences, true)."}
+                },
+                @"required": @[@"bundle_id"]
+            }
+        },
+        // Step 6: Tool Tiering & Catalog Discovery
+        @{
+            @"name": @"probe_help",
+            @"description": @"Discover all ios-mcp tools grouped by tier ('core', 'advanced', 'debug'), view normalized <subsystem>_<verb> aliases, or search tools by keyword.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"tier": @{@"type": @"string", @"description": @"Optional tier filter: 'core', 'advanced', 'debug', or 'all' (default 'all')."},
+                    @"query": @{@"type": @"string", @"description": @"Optional keyword filter across tool names, aliases, and descriptions."},
+                    @"include_schemas": @{@"type": @"boolean", @"description": @"Include full inputSchema for matching tools (default false)."}
+                }
+            }
         }
     ];
+
+    NSString *requestedTier = [params[@"tier"] isKindOfClass:[NSString class]] ? [params[@"tier"] lowercaseString] : IOSMCPConfiguredToolsTier();
+    if ([requestedTier isEqualToString:@"core"] ||
+        [requestedTier isEqualToString:@"advanced"] ||
+        [requestedTier isEqualToString:@"debug"]) {
+        NSMutableArray *filtered = [NSMutableArray array];
+        for (NSDictionary *tool in tools) {
+            NSString *name = tool[@"name"];
+            NSString *tTier = MCPTierForToolName(name);
+            if ([name isEqualToString:@"probe_help"] || [tTier isEqualToString:requestedTier]) {
+                [filtered addObject:tool];
+            } else if ([requestedTier isEqualToString:@"advanced"] && [tTier isEqualToString:@"core"]) {
+                [filtered addObject:tool];
+            }
+        }
+        tools = filtered;
+    }
 
     return @{
         @"jsonrpc": @"2.0",
@@ -4080,6 +4909,8 @@ static NSString *MCPLogId(id reqId) {
         return lockGuardResponse;
     }
 
+    toolName = MCPCanonicalToolName(toolName);
+
     // Button tools
     if ([toolName isEqualToString:@"press_volume_up"]) {
         return [self executeButtonPress:reqId button:HIDButtonVolumeUp args:args label:@"Volume Up"];
@@ -4103,6 +4934,8 @@ static NSString *MCPLogId(id reqId) {
         return [self executeWaitForElement:reqId args:args waitForAppear:YES];
     } else if ([toolName isEqualToString:@"wait_for_disappear"]) {
         return [self executeWaitForElement:reqId args:args waitForAppear:NO];
+    } else if ([toolName isEqualToString:@"wait_until_texts"]) {
+        return [self executeWaitUntilTexts:reqId args:args];
     } else if ([toolName isEqualToString:@"swipe_screen"]) {
         return [self executeSwipe:reqId args:args];
     }
@@ -4193,6 +5026,16 @@ static NSString *MCPLogId(id reqId) {
         return [self executeListDir:reqId args:args];
     } else if ([toolName isEqualToString:@"read_file"]) {
         return [self executeReadFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"read_file_chunk"]) {
+        return [self executeReadFileChunk:reqId args:args];
+    } else if ([toolName isEqualToString:@"tail_file"]) {
+        return [self executeTailFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"hash_file"]) {
+        return [self executeHashFile:reqId args:args];
+    } else if ([toolName isEqualToString:@"zip_download"]) {
+        return [self executeZipDownload:reqId args:args];
+    } else if ([toolName isEqualToString:@"search_files"]) {
+        return [self executeSearchFiles:reqId args:args];
     } else if ([toolName isEqualToString:@"get_plist_value"]) {
         return [self executePlistValue:reqId args:args write:NO];
     } else if ([toolName isEqualToString:@"set_plist_value"]) {
@@ -4226,12 +5069,16 @@ static NSString *MCPLogId(id reqId) {
         return [self executeSSLKillSwitch:reqId args:args enable:NO];
     } else if ([toolName isEqualToString:@"symbolicate_crash"]) {
         return [self executeSymbolicateCrash:reqId args:args];
-    } else if ([toolName isEqualToString:@"start_capture"]) {
+    } else if ([toolName isEqualToString:@"start_capture"] || [toolName isEqualToString:@"net_enable"]) {
         return [self executeStartCapture:reqId args:args];
-    } else if ([toolName isEqualToString:@"stop_capture"]) {
+    } else if ([toolName isEqualToString:@"stop_capture"] || [toolName isEqualToString:@"net_disable"]) {
         return [self executeStopCapture:reqId args:args];
-    } else if ([toolName isEqualToString:@"get_captured_requests"]) {
+    } else if ([toolName isEqualToString:@"get_captured_requests"] || [toolName isEqualToString:@"net_dump"]) {
         return [self executeGetCapturedRequests:reqId args:args];
+    } else if ([toolName isEqualToString:@"net_clear"]) {
+        return [self executeNetClear:reqId args:args];
+    } else if ([toolName isEqualToString:@"net_status"]) {
+        return [self executeNetStatus:reqId args:args];
     } else if ([toolName isEqualToString:@"dump_il2cpp"]) {
         return [self executeDumpIL2CPP:reqId args:args];
     } else if ([toolName isEqualToString:@"query_sqlite"]) {
@@ -4290,6 +5137,12 @@ static NSString *MCPLogId(id reqId) {
         return [self executeExtractDyldSharedCache:reqId args:args];
     } else if ([toolName isEqualToString:@"inspect_hermes_flutter"]) {
         return [self executeInspectHermesFlutter:reqId args:args];
+    } else if ([toolName isEqualToString:@"inspect_js_bundle"]) {
+        return [self executeInspectJsBundle:reqId args:args];
+    } else if ([toolName isEqualToString:@"decode_js_bundle"]) {
+        return [self executeDecodeJsBundle:reqId args:args];
+    } else if ([toolName isEqualToString:@"list_hermes_decoders"]) {
+        return [self executeListHermesDecoders:reqId args:args];
     } else if ([toolName isEqualToString:@"trace_crypto_primitives"]) {
         return [self executeTraceCryptoPrimitives:reqId args:args];
     } else if ([toolName isEqualToString:@"get_crypto_events"]) {
@@ -4357,6 +5210,35 @@ static NSString *MCPLogId(id reqId) {
         return [self executeBackgroundImmortalityGovernor:reqId args:args];
     } else if ([toolName isEqualToString:@"appgroup_icloud_account_inspector"]) {
         return [self executeAppgroupIcloudAccountInspector:reqId args:args];
+    } else if ([toolName isEqualToString:@"set_otp"]) {
+        return [self executeSetOtp:reqId args:args];
+    } else if ([toolName isEqualToString:@"human_pause"]) {
+        return [self executeHumanPause:reqId args:args];
+    } else if ([toolName hasPrefix:@"tiktok_"]) {
+        return [self executeTiktokTool:toolName reqId:reqId args:args];
+    } else if ([toolName hasPrefix:@"photos_"] || [toolName isEqualToString:@"media_upload"]) {
+        return [self executePhotosTool:toolName reqId:reqId args:args];
+    } else if ([toolName isEqualToString:@"tweak_build"] ||
+               [toolName isEqualToString:@"tweak_deploy"] ||
+               [toolName isEqualToString:@"tweak_rollback"] ||
+               [toolName isEqualToString:@"self_update"]) {
+        return [self executeTweakLifecycleTool:toolName reqId:reqId args:args];
+    } else if ([toolName isEqualToString:@"diagnose_roots"]) {
+        return [self executeDiagnoseRoots:reqId args:args];
+    } else if ([toolName isEqualToString:@"diagnostics_collect"]) {
+        return [self executeDiagnosticsCollect:reqId args:args];
+    } else if ([toolName isEqualToString:@"port_forward"]) {
+        return [self executePortForward:reqId args:args];
+    } else if ([toolName isEqualToString:@"session_force_unlock"]) {
+        return [self executeSessionForceUnlock:reqId args:args];
+    } else if ([toolName isEqualToString:@"session_respawn"]) {
+        return [self executeSessionRespawn:reqId args:args];
+    } else if ([toolName isEqualToString:@"respring"]) {
+        return [self executeRespring:reqId args:args];
+    } else if ([toolName isEqualToString:@"device_reboot"]) {
+        return [self executeDeviceReboot:reqId args:args];
+    } else if ([toolName isEqualToString:@"probe_help"]) {
+        return [self executeProbeHelp:reqId args:args];
     }
     return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown tool: %@", toolName]];
 }
@@ -6365,10 +7247,12 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *bundleId = nil, *urlFilter = nil, *paramError = nil;
     double limit = 100;
     BOOL clear = NO;
+    BOOL redact = IOSMCPRedactSensitiveEnabled();
     if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError) ||
         !MCPStringFromArgs(args, @"url_filter", NO, &urlFilter, &paramError) ||
         !MCPNumberFromArgs(args, @"limit", 100, NO, &limit, &paramError) ||
-        !MCPBoolFromArgs(args, @"clear", NO, &clear, &paramError)) {
+        !MCPBoolFromArgs(args, @"clear", NO, &clear, &paramError) ||
+        !MCPBoolFromArgs(args, @"redact", redact, &redact, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
     if (limit < 1) limit = 1;
@@ -6378,8 +7262,31 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
                                                                                             limit:(NSUInteger)limit
                                                                                         urlFilter:urlFilter
                                                                                             clear:clear
+                                                                                           redact:redact
                                                                                             error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"Failed to read captured requests") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeNetClear:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] clearCaptureForBundleId:bundleId error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"net_clear failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeNetStatus:(id)reqId args:(NSDictionary *)args {
+    NSString *bundleId = nil, *paramError = nil;
+    if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[NetworkCaptureManager sharedInstance] netStatusForBundleId:bundleId error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"net_status failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 
@@ -6695,8 +7602,11 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     }
     if (write && !args[@"value"]) return [self mcpError:reqId code:-32602 message:@"Missing value"];
     NSString *err = nil;
-    NSDictionary *result = write ? [[PlistPatchManager sharedInstance] setValue:args[@"value"] atPath:path keypath:keypath error:&err] : [[PlistPatchManager sharedInstance] valueAtPath:path keypath:(keypath ?: @"") error:&err];
+    NSDictionary *result = write ? [[PlistPatchManager sharedInstance] setValue:args[@"value"] atPath:path keypath:keypath options:args error:&err] : [[PlistPatchManager sharedInstance] valueAtPath:path keypath:(keypath ?: @"") error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"Property list operation failed") isError:YES];
+    if ([result[@"approval_required"] respondsToSelector:@selector(boolValue)] && [result[@"approval_required"] boolValue]) {
+        return [self mcpSuccess:reqId structuredContent:result isError:YES];
+    }
     return [self mcpSuccess:reqId structuredContent:result];
 }
 
@@ -6748,16 +7658,105 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         !MCPStringFromArgs(args, @"encoding", NO, &encoding, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
-    if (encoding.length == 0) encoding = @"utf8";
 
     NSString *err = nil;
-    NSDictionary *result = [[FileSystemManager sharedInstance] writeFileAtPath:path
-                                                                       content:content
-                                                                      encoding:encoding
-                                                                         error:&err];
+    NSDictionary *result = [[FileSystemManager sharedInstance] writeFileWithArgs:args error:&err];
     if (!result) {
         return [self mcpSuccess:reqId text:(err ?: @"Failed to write file") isError:YES];
     }
+    if ([result[@"approval_required"] respondsToSelector:@selector(boolValue)] && [result[@"approval_required"] boolValue]) {
+        return [self mcpSuccess:reqId structuredContent:result isError:YES];
+    }
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeReadFileChunk:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *path = nil;
+    double offset = 0, length = 65536;
+    BOOL binary = NO;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPNumberFromArgs(args, @"offset", 0, NO, &offset, &paramError) ||
+        !MCPNumberFromArgs(args, @"length", 65536, NO, &length, &paramError) ||
+        !MCPBoolFromArgs(args, @"binary", NO, &binary, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (offset < 0) offset = 0;
+    if (length < 0) length = 65536;
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] readFileChunkAtPath:path
+                                                                            offset:(unsigned long long)offset
+                                                                            length:(NSUInteger)length
+                                                                       forceBinary:binary
+                                                                             error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"read_file_chunk failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeTailFile:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *path = nil;
+    double lines = 100, maxBytes = 262144;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPNumberFromArgs(args, @"lines", 100, NO, &lines, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_bytes", 262144, NO, &maxBytes, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    if (lines < 1) lines = 100;
+    if (maxBytes < 0) maxBytes = 262144;
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] tailFileAtPath:path
+                                                                        lines:(NSUInteger)lines
+                                                                     maxBytes:(NSUInteger)maxBytes
+                                                                        error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"tail_file failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeHashFile:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *path = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSArray<NSString *> *algorithms = [args[@"algorithms"] isKindOfClass:[NSArray class]] ? args[@"algorithms"] : nil;
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] hashFileAtPath:path
+                                                                   algorithms:algorithms
+                                                                        error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"hash_file failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeZipDownload:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *path = nil, *outputPath = nil;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"output_path", NO, &outputPath, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] zipDirectoryAtPath:path
+                                                                       outputPath:outputPath
+                                                                            error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"zip_download failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSearchFiles:(id)reqId args:(NSDictionary *)args {
+    NSString *paramError = nil, *path = nil, *pattern = nil, *contentPattern = nil;
+    double maxDepth = 6, maxResults = 200;
+    if (!MCPStringFromArgs(args, @"path", YES, &path, &paramError) ||
+        !MCPStringFromArgs(args, @"pattern", NO, &pattern, &paramError) ||
+        !MCPStringFromArgs(args, @"content_pattern", NO, &contentPattern, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_depth", 6, NO, &maxDepth, &paramError) ||
+        !MCPNumberFromArgs(args, @"max_results", 200, NO, &maxResults, &paramError)) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    NSString *err = nil;
+    NSDictionary *result = [[FileSystemManager sharedInstance] searchFilesAtPath:path
+                                                                         pattern:pattern
+                                                                  contentPattern:contentPattern
+                                                                        maxDepth:(NSUInteger)MAX(1.0, maxDepth)
+                                                                      maxResults:(NSUInteger)MAX(1.0, maxResults)
+                                                                           error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"search_files failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 
@@ -6911,6 +7910,27 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *err = nil;
     NSDictionary *result = [[BinaryInspector sharedInstance] inspectHermesFlutterForArgs:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"inspect_hermes_flutter failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeInspectJsBundle:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] inspectJsBundleForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"inspect_js_bundle failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDecodeJsBundle:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] decodeJsBundleForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"decode_js_bundle failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeListHermesDecoders:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[BinaryInspector sharedInstance] listHermesDecodersForArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"list_hermes_decoders failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 
@@ -7260,6 +8280,300 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] appgroupIcloudAccountInspectorWithArgs:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"appgroup_icloud_account_inspector failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
+}
+
+#pragma mark - Phase 6: Donor Stealth, Social, Photos, Tweak Lifecycle, Diagnostics & Discovery
+
+- (NSDictionary *)executeWaitUntilTexts:(id)reqId args:(NSDictionary *)args {
+    NSMutableArray<NSString *> *targets = [NSMutableArray array];
+    if ([args[@"texts"] isKindOfClass:[NSArray class]]) {
+        for (id item in args[@"texts"]) {
+            if ([item isKindOfClass:[NSString class]] && [(NSString *)item length] > 0) {
+                [targets addObject:item];
+            }
+        }
+    } else if ([args[@"text"] isKindOfClass:[NSString class]] && [args[@"text"] length] > 0) {
+        [targets addObject:args[@"text"]];
+    }
+    if (targets.count == 0) {
+        return [self mcpError:reqId code:-32602 message:@"wait_until_texts requires non-empty 'texts' array"];
+    }
+
+    NSString *mode = [args[@"mode"] isKindOfClass:[NSString class]] ? [args[@"mode"] lowercaseString] : @"any";
+    BOOL requireAll = [mode isEqualToString:@"all"];
+    BOOL exact = [args[@"exact"] respondsToSelector:@selector(boolValue)] ? [args[@"exact"] boolValue] : NO;
+    BOOL includeOCR = [args[@"include_ocr"] respondsToSelector:@selector(boolValue)] ? [args[@"include_ocr"] boolValue] : NO;
+    double timeoutMs = [args[@"timeout_ms"] respondsToSelector:@selector(doubleValue)] ? [args[@"timeout_ms"] doubleValue] : 8000.0;
+    double intervalMs = [args[@"interval_ms"] respondsToSelector:@selector(doubleValue)] ? [args[@"interval_ms"] doubleValue] : 500.0;
+    if (timeoutMs <= 0) timeoutMs = 8000.0;
+    if (timeoutMs > 30000.0) timeoutMs = 30000.0;
+    if (intervalMs < 100.0) intervalMs = 100.0;
+
+    NSDate *start = [NSDate date];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutMs / 1000.0];
+    NSMutableArray<NSString *> *lastMatchedTexts = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *lastMatchedElements = [NSMutableArray array];
+
+    while (1) {
+        [lastMatchedTexts removeAllObjects];
+        [lastMatchedElements removeAllObjects];
+        NSDictionary *payload = [self fetchCompactElementsClickableOnly:NO];
+        NSArray *ocrTexts = nil;
+
+        for (NSString *needle in targets) {
+            NSArray<NSDictionary *> *matches = MCPMatchingElements(payload, needle, exact, nil, NO, YES);
+            if (matches.count > 0) {
+                [lastMatchedTexts addObject:needle];
+                [lastMatchedElements addObject:MCPElementSummary(matches.firstObject)];
+                continue;
+            }
+            if (includeOCR) {
+                if (!ocrTexts) {
+                    NSDictionary *ocr = [[OCRManager sharedInstance] recognizeTextWithLanguages:nil
+                                                                                  minConfidence:0.3
+                                                                                         region:nil
+                                                                                           fast:YES
+                                                                                         engine:args[@"engine"]
+                                                                                          error:nil];
+                    ocrTexts = [ocr[@"texts"] isKindOfClass:[NSArray class]] ? ocr[@"texts"] : @[];
+                }
+                for (NSDictionary *item in ocrTexts) {
+                    NSString *t = [item[@"text"] isKindOfClass:[NSString class]] ? item[@"text"] : @"";
+                    BOOL hit = exact ? ([t caseInsensitiveCompare:needle] == NSOrderedSame)
+                                     : ([t rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound);
+                    if (hit) {
+                        [lastMatchedTexts addObject:needle];
+                        [lastMatchedElements addObject:item];
+                        break;
+                    }
+                }
+            }
+        }
+
+        BOOL satisfied = requireAll ? (lastMatchedTexts.count == targets.count) : (lastMatchedTexts.count > 0);
+        if (satisfied) {
+            NSInteger waited = (NSInteger)([[NSDate date] timeIntervalSinceDate:start] * 1000.0);
+            return [self mcpSuccess:reqId structuredContent:@{
+                @"found": @YES,
+                @"mode": requireAll ? @"all" : @"any",
+                @"matched_texts": lastMatchedTexts,
+                @"matches": lastMatchedElements,
+                @"waited_ms": @(waited)
+            }];
+        }
+
+        if ([[NSDate date] compare:deadline] != NSOrderedAscending) break;
+        usleep((useconds_t)(intervalMs * 1000.0));
+    }
+
+    NSInteger waited = (NSInteger)([[NSDate date] timeIntervalSinceDate:start] * 1000.0);
+    return [self mcpSuccess:reqId structuredContent:@{
+        @"found": @NO,
+        @"mode": requireAll ? @"all" : @"any",
+        @"matched_texts": lastMatchedTexts,
+        @"waited_ms": @(waited)
+    } isError:YES];
+}
+
+- (NSDictionary *)executeRespring:(id)reqId args:(NSDictionary *)args {
+    NSString *mode = [args[@"mode"] isKindOfClass:[NSString class]] ? [args[@"mode"] lowercaseString] : @"killall";
+    double delayMs = [args[@"delay_ms"] respondsToSelector:@selector(doubleValue)] ? [args[@"delay_ms"] doubleValue] : 400.0;
+    if (delayMs < 100.0) delayMs = 100.0;
+    if (delayMs > 5000.0) delayMs = 5000.0;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *sh = MCPResolvedJailbreakPath(@"/bin/sh");
+        NSString *cmd = [mode isEqualToString:@"sbreload"] ? @"(sbreload || killall -9 SpringBoard) >/dev/null 2>&1" : @"killall -9 SpringBoard >/dev/null 2>&1";
+        NSString *out = nil, *err = nil;
+        int rc = -1;
+        MCPRunProcess(sh, @[@"-c", cmd], MCPJailbreakEnvironment(), 5, 4096, &out, &rc, &err);
+    });
+
+    return [self mcpSuccess:reqId structuredContent:@{
+        @"ok": @YES,
+        @"action": @"respring",
+        @"mode": mode,
+        @"scheduled_in_ms": @((NSInteger)delayMs)
+    }];
+}
+
+- (NSDictionary *)executeDeviceReboot:(id)reqId args:(NSDictionary *)args {
+    BOOL confirm = [args[@"confirm"] respondsToSelector:@selector(boolValue)] ? [args[@"confirm"] boolValue] : NO;
+    if (!confirm) {
+        return [self mcpSuccess:reqId structuredContent:@{
+            @"ok": @NO,
+            @"error": @"device_reboot requires confirm=true to prevent accidental reboots."
+        } isError:YES];
+    }
+    NSString *mode = [args[@"mode"] isKindOfClass:[NSString class]] ? [args[@"mode"] lowercaseString] : @"userspace";
+    double delayMs = [args[@"delay_ms"] respondsToSelector:@selector(doubleValue)] ? [args[@"delay_ms"] doubleValue] : 500.0;
+    if (delayMs < 100.0) delayMs = 100.0;
+    if (delayMs > 5000.0) delayMs = 5000.0;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *mcpRoot = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
+        NSString *sh = MCPResolvedJailbreakPath(@"/bin/sh");
+        NSString *cmd = [mode isEqualToString:@"full"]
+            ? @"reboot || /sbin/reboot"
+            : @"(launchctl reboot userspace || ldrestart || sbreload)";
+        NSString *out = nil, *err = nil;
+        int rc = -1;
+        if ([[NSFileManager defaultManager] isExecutableFileAtPath:mcpRoot]) {
+            MCPRunProcess(mcpRoot, @[sh, @"-c", cmd], MCPJailbreakEnvironment(), 10, 4096, &out, &rc, &err);
+        } else {
+            MCPRunProcess(sh, @[@"-c", cmd], MCPJailbreakEnvironment(), 10, 4096, &out, &rc, &err);
+        }
+    });
+
+    return [self mcpSuccess:reqId structuredContent:@{
+        @"ok": @YES,
+        @"action": @"device_reboot",
+        @"mode": mode,
+        @"scheduled_in_ms": @((NSInteger)delayMs)
+    }];
+}
+
+- (NSDictionary *)executeSetOtp:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] setOtpWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"set_otp failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeHumanPause:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] humanPauseWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"human_pause failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeTiktokTool:(NSString *)toolName reqId:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] tiktokSocialControllerWithAction:toolName args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: [toolName stringByAppendingString:@" failed"]) isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executePhotosTool:(NSString *)toolName reqId:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] photosLibraryControllerWithAction:toolName args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: [toolName stringByAppendingString:@" failed"]) isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeTweakLifecycleTool:(NSString *)toolName reqId:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] tweakLifecycleWithAction:toolName args:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: [toolName stringByAppendingString:@" failed"]) isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDiagnoseRoots:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] diagnoseRootsWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"diagnose_roots failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeDiagnosticsCollect:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] diagnosticsCollectWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"diagnostics_collect failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executePortForward:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] portForwardWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"port_forward failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSessionForceUnlock:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] sessionForceUnlockWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"session_force_unlock failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeSessionRespawn:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] sessionRespawnWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"session_respawn failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeProbeHelp:(id)reqId args:(NSDictionary *)args {
+    NSString *tierFilter = [args[@"tier"] isKindOfClass:[NSString class]] ? [args[@"tier"] lowercaseString] : @"all";
+    NSString *query = [args[@"query"] isKindOfClass:[NSString class]] ? [args[@"query"] lowercaseString] : nil;
+    BOOL includeSchemas = [args[@"include_schemas"] respondsToSelector:@selector(boolValue)] ? [args[@"include_schemas"] boolValue] : NO;
+
+    NSDictionary *allResp = [self handleToolsList:reqId params:@{@"tier": @"all"}];
+    NSArray *allTools = [allResp[@"result"][@"tools"] isKindOfClass:[NSArray class]] ? allResp[@"result"][@"tools"] : @[];
+
+    NSDictionary<NSString *, NSString *> *aliasMap = MCPToolAliasMap();
+    NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *reverseAliases = [NSMutableDictionary dictionary];
+    for (NSString *alias in aliasMap) {
+        NSString *canonical = aliasMap[alias];
+        if (!reverseAliases[canonical]) reverseAliases[canonical] = [NSMutableArray array];
+        [reverseAliases[canonical] addObject:alias];
+    }
+
+    NSUInteger coreCount = 0, advancedCount = 0, debugCount = 0;
+    NSMutableArray *matched = [NSMutableArray array];
+
+    for (NSDictionary *tool in allTools) {
+        NSString *name = tool[@"name"] ?: @"";
+        NSString *desc = tool[@"description"] ?: @"";
+        NSString *tier = MCPTierForToolName(name);
+        if ([tier isEqualToString:@"core"]) coreCount++;
+        else if ([tier isEqualToString:@"advanced"]) advancedCount++;
+        else if ([tier isEqualToString:@"debug"]) debugCount++;
+
+        if (tierFilter.length > 0 && ![tierFilter isEqualToString:@"all"] && ![tier isEqualToString:tierFilter]) {
+            continue;
+        }
+        NSArray<NSString *> *aliases = [reverseAliases[name] sortedArrayUsingSelector:@selector(compare:)] ?: @[];
+        if (query.length > 0) {
+            BOOL hit = ([name.lowercaseString rangeOfString:query].location != NSNotFound) ||
+                       ([desc.lowercaseString rangeOfString:query].location != NSNotFound);
+            if (!hit) {
+                for (NSString *al in aliases) {
+                    if ([al.lowercaseString rangeOfString:query].location != NSNotFound) {
+                        hit = YES;
+                        break;
+                    }
+                }
+            }
+            if (!hit) continue;
+        }
+
+        NSMutableDictionary *entry = [@{
+            @"name": name,
+            @"tier": tier,
+            @"aliases": aliases,
+            @"description": desc
+        } mutableCopy];
+        if (includeSchemas && tool[@"inputSchema"]) {
+            entry[@"inputSchema"] = tool[@"inputSchema"];
+        }
+        [matched addObject:entry];
+    }
+
+    return [self mcpSuccess:reqId structuredContent:@{
+        @"ok": @YES,
+        @"configured_tier": IOSMCPConfiguredToolsTier(),
+        @"filter_tier": tierFilter,
+        @"query": query ?: @"",
+        @"counts": @{
+            @"total": @(allTools.count),
+            @"core": @(coreCount),
+            @"advanced": @(advancedCount),
+            @"debug": @(debugCount),
+            @"matched": @(matched.count)
+        },
+        @"tools": matched
+    }];
 }
 
 #pragma mark - Response Builders

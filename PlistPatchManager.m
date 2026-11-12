@@ -1,4 +1,5 @@
 #import "PlistPatchManager.h"
+#import "FileSystemManager.h"
 #import <sys/stat.h>
 #if defined(MCP_ROOTHIDE) || defined(MCP_ROOTLESS)
 #import "MCPProcessUtil.h"
@@ -357,6 +358,18 @@ static BOOL MCPParseArrayIndex(NSString *segment, NSUInteger *outIndex) {
 }
 
 - (NSDictionary *)setValue:(id)value atPath:(NSString *)path keypath:(NSString *)keypath error:(NSString **)error {
+    return [self setValue:value atPath:path keypath:keypath options:@{} error:error];
+}
+
+- (NSDictionary *)setValue:(id)value atPath:(NSString *)path keypath:(NSString *)keypath options:(NSDictionary *)options error:(NSString **)error {
+    NSDictionary *approval = nil;
+    if (![[FileSystemManager sharedInstance] validateWritePath:path options:options ?: @{} approvalOut:&approval error:error]) {
+        if (approval) {
+            if (error) *error = nil;
+            return approval;
+        }
+        return nil;
+    }
     return [self performAtPath:path keypath:keypath value:value write:YES error:error];
 }
 

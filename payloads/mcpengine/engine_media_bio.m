@@ -602,13 +602,17 @@ NSDictionary *MEMediaBio(NSString *op, NSDictionary *a) {
 
     if ([op isEqualToString:@"engine.gps_teleporter"]) {
         NSString *action = [a[@"action"] isKindOfClass:NSString.class] ? [a[@"action"] lowercaseString] : @"teleport";
-        if ([action isEqualToString:@"stop"]) {
+        BOOL explicitDisable = (a[@"enable"] != nil && ![a[@"enable"] boolValue]);
+        if ([action isEqualToString:@"stop"] || explicitDisable) {
             g_gps_spoof_active = NO;
-            return @{@"active": @NO};
+            return @{@"active": @NO, @"latitude": @(g_gps_lat), @"longitude": @(g_gps_lon)};
         }
-        if (a[@"latitude"]) g_gps_lat = [a[@"latitude"] doubleValue];
-        if (a[@"longitude"]) g_gps_lon = [a[@"longitude"] doubleValue];
-        if (a[@"altitude"]) g_gps_alt = [a[@"altitude"] doubleValue];
+        id latVal = a[@"latitude"] ?: a[@"lat"];
+        id lonVal = a[@"longitude"] ?: a[@"lon"];
+        id altVal = a[@"altitude"] ?: a[@"alt"];
+        if (latVal) g_gps_lat = [latVal doubleValue];
+        if (lonVal) g_gps_lon = [lonVal doubleValue];
+        if (altVal) g_gps_alt = [altVal doubleValue];
         if (a[@"speed"]) g_gps_speed = [a[@"speed"] doubleValue];
         if (a[@"course"]) g_gps_course = [a[@"course"] doubleValue];
         if (a[@"accuracy"]) g_gps_accuracy = [a[@"accuracy"] doubleValue];
@@ -633,6 +637,111 @@ NSDictionary *MEMediaBio(NSString *op, NSDictionary *a) {
             @"speed": @(g_gps_speed),
             @"course": @(g_gps_course),
             @"accuracy": @(g_gps_accuracy)
+        };
+    }
+
+    if ([op isEqualToString:@"engine.forge_push"]) {
+        dlopen("/System/Library/Frameworks/UserNotifications.framework/UserNotifications", RTLD_LAZY);
+        NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+        if ([a[@"payload"] isKindOfClass:NSDictionary.class]) {
+            [payload addEntriesFromDictionary:a[@"payload"]];
+        }
+        NSString *title = [a[@"title"] isKindOfClass:NSString.class] ? a[@"title"] : nil;
+        NSString *body = [a[@"body"] isKindOfClass:NSString.class] ? a[@"body"] : nil;
+        NSMutableDictionary *aps = [payload[@"aps"] isKindOfClass:NSDictionary.class]
+            ? [payload[@"aps"] mutableCopy]
+            : [NSMutableDictionary dictionary];
+        if (title.length || body.length) {
+            NSMutableDictionary *alert = [aps[@"alert"] isKindOfClass:NSDictionary.class]
+                ? [aps[@"alert"] mutableCopy]
+                : [NSMutableDictionary dictionary];
+            if (title.length) alert[@"title"] = title;
+            if (body.length) alert[@"body"] = body;
+            aps[@"alert"] = alert;
+        } else if (!aps[@"alert"]) {
+            aps[@"alert"] = @{@"title": @"Notification", @"body": @"Test Notification"};
+        }
+        if (!aps[@"content-available"]) aps[@"content-available"] = @1;
+        payload[@"aps"] = aps;
+
+        __block BOOL deliveredAppDelegate = NO;
+        __block BOOL deliveredUNDelegate = NO;
+        __block NSUInteger fetchResult = 0;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id app = [UIApplication sharedApplication];
+            id appDel = [app respondsToSelector:@selector(delegate)] ? [app delegate] : nil;
+            SEL fetchSel = @selector(application:didReceiveRemoteNotification:fetchCompletionHandler:);
+            SEL legacySel = @selector(application:didReceiveRemoteNotification:);
+            if (appDel && [appDel respondsToSelector:fetchSel]) {
+                deliveredAppDelegate = YES;
+                void (^handler)(UIBackgroundFetchResult) = ^(UIBackgroundFetchResult res) {
+                    fetchResult = (NSUInteger)res;
+                };
+                ((void (*)(id, SEL, id, id, id))objc_msgSend)(appDel, fetchSel, app, payload, handler);
+            } else if (appDel && [appDel respondsToSelector:legacySel]) {
+                deliveredAppDelegate = YES;
+                ((void (*)(id, SEL, id, id))objc_msgSend)(appDel, legacySel, app, payload);
+            }
+
+            Class unCenterCls = objc_getClass("UNUserNotificationCenter");
+            if (unCenterCls && [unCenterCls respondsToSelector:@selector(currentNotificationCenter)]) {
+                id center = ((id (*)(id, SEL))objc_msgSend)(unCenterCls, @selector(currentNotificationCenter));
+                id unDel = [center respondsToSelector:@selector(delegate)] ? [center valueForKey:@"delegate"] : nil;
+                if (unDel) {
+                    deliveredUNDelegate = YES;
+                }
+                if ([a[@"schedule_local"] boolValue] || (!deliveredAppDelegate && !deliveredUNDelegate)) {
+                    Class contentCls = objc_getClass("UNMutableNotificationContent");
+                    Class reqCls = objc_getClass("UNNotificationRequest");
+                    if (contentCls && reqCls) {
+                        id content = [[contentCls alloc] init];
+                        NSDictionary *alertDict = [aps[@"alert"] isKindOfClass:NSDictionary.class] ? aps[@"alert"] : nil;
+                        NSString *tStr = title ?: (alertDict[@"title"] ?: @"Notification");
+                        NSString *bStr = body ?: (alertDict[@"body"] ?: ([aps[@"alert"] isKindOfClass:NSString.class] ? aps[@"alert"] : @""));
+                        if ([content respondsToSelector:@selector(setTitle:)]) [content setValue:tStr forKey:@"title"];
+                        if ([content respondsToSelector:@selector(setBody:)]) [content setValue:bStr forKey:@"body"];
+                        if ([content respondsToSelector:@selector(setUserInfo:)]) [content setValue:payload forKey:@"userInfo"];
+                        SEL reqSel = NSSelectorFromString(@"requestWithIdentifier:content:trigger:");
+                        if ([reqCls respondsToSelector:reqSel]) {
+                            NSString *ident = [NSString stringWithFormat:@"mcp.push.%llu", (unsigned long long)([[NSDate date] timeIntervalSince1970] * 1000)];
+                            id req = ((id (*)(id, SEL, id, id, id))objc_msgSend)(reqCls, reqSel, ident, content, nil);
+                            SEL addSel = NSSelectorFromString(@"addNotificationRequest:withCompletionHandler:");
+                            if (req && [center respondsToSelector:addSel]) {
+                                ((void (*)(id, SEL, id, id))objc_msgSend)(center, addSel, req, nil);
+                            }
+                        }
+                    }
+                }
+            }
+            dispatch_semaphore_signal(sem);
+        });
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+
+        return @{
+            @"action": @"forge_push",
+            @"forged_payload": payload,
+            @"delivered_to_delegate": @(deliveredAppDelegate || deliveredUNDelegate),
+            @"delivered_to_app_delegate": @(deliveredAppDelegate),
+            @"delivered_to_un_delegate": @(deliveredUNDelegate),
+            @"fetch_result": @(fetchResult)
+        };
+    }
+
+    if ([op isEqualToString:@"engine.nfc_hook"]) {
+        dlopen("/System/Library/Frameworks/CoreNFC.framework/CoreNFC", RTLD_LAZY);
+        Class ndefCls = objc_getClass("NFCNDEFReaderSession");
+        Class tagCls = objc_getClass("NFCTagReaderSession");
+        BOOL readingAvail = NO;
+        if (ndefCls && [ndefCls respondsToSelector:@selector(readingAvailable)]) {
+            readingAvail = ((BOOL (*)(id, SEL))objc_msgSend)(ndefCls, @selector(readingAvailable));
+        }
+        return @{
+            @"action": @"nfc_hook",
+            @"corenfc_loaded": @(ndefCls != nil || tagCls != nil),
+            @"ndef_session_class": ndefCls ? NSStringFromClass(ndefCls) : [NSNull null],
+            @"tag_session_class": tagCls ? NSStringFromClass(tagCls) : [NSNull null],
+            @"reading_available": @(readingAvail)
         };
     }
 

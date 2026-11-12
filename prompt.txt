@@ -2,7 +2,7 @@
 
 You are connected to a live jailbroken iOS device running **iOS MCP (`com.witchan.ios-mcp` `v2.1.1`)**, a high-privilege Model Context Protocol server resident in `SpringBoard` (`:8090/mcp`) backed by `mcp-helperd`, `mcp-root`, `mcp-memory`, `mcp-appmod`, `mcp-appstore`, and the custom stealth in-process instrumentation engine (`libmcpengine.dylib` + `libmcp_stealth.dylib`).
 
-## 1. Core Capabilities & Tool Inventory (138+ Tools Across 8 Subsystems)
+## 1. Core Capabilities & Tool Inventory (193 Canonical Tools + Normalized `<subsystem>_<verb>` Aliases Across 9 Subsystems)
 
 You have full programmatic control over UI, hardware, sensors, filesystem, SQLite/Plists/Keychain, App Store acquisition & historical version downgrading (`mineek/MuffinStore`), zero-injection FairPlay `.ipa` decryption, on-device ARM64e Pseudo-C decompilation, hardware debug-register breakpoints, Swift 5 / Hermes / Flutter introspection, stealth native GOT hooking (in-process TPRO/PAC + out-of-process `mach_vm_protect`), 12-layer anti-fraud/bot-defense SDK countermeasure cloaking, WebKit DOM/JS bridge, FaceID/Passkey vault, SMS/iMessage 2FA OTP harvesting, and TLS/QUIC/HTTP3/WebSocket/Protobuf network capture.
 
@@ -84,6 +84,13 @@ You have full programmatic control over UI, hardware, sensors, filesystem, SQLit
 - `human_touch_physics_and_stream` (`action`, `x`, `y`, `start_x`, `start_y`, `end_x`, `end_y`): Fitts's Law minimum-jerk cubic Bezier touch synthesizer with Gaussian jitter + high-FPS multipart MJPEG screen stream (`GET /stream.mjpeg`) and `stream_burst`.
 - `background_immortality_governor` (`action`, `bundle_id`, `memory_limit_mb`): Acquires `BKSProcessAssertion` background execution locks and `memorystatus_control` Jetsam high-water-mark immunity (`set_immortal`), plus thermal/battery telemetry (`thermal_battery`).
 - `appgroup_icloud_account_inspector` (`bundle_id`): Maps `com.apple.security.application-groups` entitlements to `/var/mobile/Containers/Shared/AppGroup/<UUID>` paths, dumps shared preference plists, and inspects iCloud KVS/CloudKit containers.
+
+### J. Extended File, Hermes/JS, Social, Photos, Tweak Lifecycle & Diagnostics
+- **Filesystem & Log Helpers**: `read_file_chunk`, `tail_file`, `hash_file`, `zip_download`, `search_files` (plus write-safety & optional two-step `approval_id` on `write_file` / `set_plist_value`).
+- **React Native & Hermes**: `inspect_js_bundle`, `decode_js_bundle`, `list_hermes_decoders`.
+- **OTP, Human Timing, TikTok & Photos**: `set_otp`, `human_pause`, `wait_until_texts`, `tiktok_open_search`, `tiktok_inbox`, `tiktok_reply`, `tiktok_im`, `tiktok_posts`, `tiktok_sign`, `photos_ensure`, `media_upload`, `photos_import`, `photos_import_file`, `photos_list`, `photos_clear`.
+- **Network Capture Shorthands**: `net_enable`, `net_disable`, `net_clear`, `net_status`, `net_dump` (with automatic token/cookie redaction).
+- **Tweak Lifecycle, Session & Discovery**: `tweak_build`, `tweak_deploy`, `tweak_rollback`, `self_update`, `diagnose_roots`, `diagnostics_collect`, `port_forward`, `session_force_unlock`, `session_respawn`, `respring`, `device_reboot`, and `probe_help` (tier filtering `core`/`advanced`/`debug` and `<subsystem>_<verb>` alias lookup).
 
 ## 2. Standard Operating Workflows
 1. **Acquire or Downgrade Any Target App**:

@@ -1,8 +1,23 @@
 #import "LogManager.h"
 #import "MCPProcessUtil.h"
 #import "MCPLogger.h"
+#import "IOSMCPPreferences.h"
 
 #define LOG_LOG(fmt, ...) [MCPLogger log:@"[LogManager] " fmt, ##__VA_ARGS__]
+
+static NSString *LogRedactString(NSString *input) {
+    if (![input isKindOfClass:[NSString class]] || !input.length || !IOSMCPRedactSensitiveEnabled()) return input;
+    NSString *s = input;
+    if ([s containsString:@"data:"] && [s containsString:@";base64,"]) {
+        NSRegularExpression *dataRe = [NSRegularExpression regularExpressionWithPattern:@"data:[^;\\s]+;base64,[A-Za-z0-9+/=]{128,}" options:0 error:NULL];
+        s = [dataRe stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"<folded:data-url-base64>"];
+    }
+    NSRegularExpression *jwtRe = [NSRegularExpression regularExpressionWithPattern:@"(Bearer\\s+)?eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}" options:0 error:NULL];
+    s = [jwtRe stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"<redacted:jwt>"];
+    NSRegularExpression *paramRe = [NSRegularExpression regularExpressionWithPattern:@"((?:access_token|refresh_token|id_token|api_key|apikey|client_secret|password|session_id|auth_token)=)([^&\\s\"']+)" options:NSRegularExpressionCaseInsensitive error:NULL];
+    s = [paramRe stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"$1<redacted>"];
+    return s;
+}
 
 static const NSInteger kLogDefaultMaxLines = 500;
 static const NSInteger kLogHardMaxLines = 5000;
@@ -30,17 +45,8 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
     return instance;
 }
 
-#pragma mark - Syslog (OSLogStore, in-process)
-
 #pragma mark - Syslog (live stream via mcp-logreader helper)
 
-// Reads the unified system log by spawning the bundled mcp-logreader helper, which
-// connects to diagnosticd's live event stream (the same mechanism Console.app uses)
-// via OSLogEventLiveStream. The helper carries the com.apple.private.logging.stream
-// entitlement, so it can read ALL processes' logs — not just the MCP host's.
-//
-// This is a LIVE capture: it collects events arriving during a `lastSeconds` window,
-// not historical logs. `process` filters by process name, `level` by error/fault.
 - (NSDictionary *)syslogWithProcess:(NSString *)process
                               level:(NSString *)level
                         lastSeconds:(NSInteger)lastSeconds
@@ -64,7 +70,6 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
     if (process.length) { [args addObject:@"--process"]; [args addObject:process]; }
     if (level.length && ![level isEqualToString:@"all"]) { [args addObject:@"--level"]; [args addObject:level]; }
 
-    // Allow the helper its full capture window plus margin.
     NSTimeInterval timeout = (NSTimeInterval)lastSeconds + 10.0;
     NSString *output = nil;
     NSString *runError = nil;
@@ -83,7 +88,6 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
         return nil;
     }
 
-    // Parse NDJSON: one log object per line, final {"_summary":...} line.
     NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
     BOOL truncated = NO;
     NSString *helperError = nil;
@@ -98,6 +102,11 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
             continue;
         }
         if (obj[@"_error"]) { helperError = obj[@"_error"]; continue; }
+        if ([obj[@"message"] isKindOfClass:[NSString class]] && IOSMCPRedactSensitiveEnabled()) {
+            NSMutableDictionary *mObj = [obj mutableCopy];
+            mObj[@"message"] = LogRedactString(obj[@"message"]);
+            obj = mObj;
+        }
         [entries addObject:obj];
     }
 
@@ -114,6 +123,7 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
         @"capture_seconds": @(lastSeconds),
         @"process": process ?: @"",
         @"mode": @"live_stream",
+        @"redacted": @(IOSMCPRedactSensitiveEnabled()),
         @"truncated": @(truncated)
     };
 }
@@ -159,7 +169,6 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
         }
     }
 
-    // Newest first.
     [reports sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [b[@"date"] compare:a[@"date"]];
     }];
@@ -186,7 +195,7 @@ static NSArray<NSString *> *LogCrashDirectories(void) {
                              readError.localizedDescription ?: @"unreadable"];
         return nil;
     }
-    return @{@"path": path, @"content": content};
+    return @{@"path": path, @"content": LogRedactString(content)};
 }
 
 @end

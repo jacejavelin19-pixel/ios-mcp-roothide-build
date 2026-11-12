@@ -50,4 +50,37 @@
 - (NSDictionary *)appgroupIcloudAccountInspectorWithArgs:(NSDictionary *)args
                                                    error:(NSString **)error;
 
+- (NSDictionary *)setOtpWithArgs:(NSDictionary *)args
+                           error:(NSString **)error;
+
+- (NSDictionary *)humanPauseWithArgs:(NSDictionary *)args
+                               error:(NSString **)error;
+
+- (NSDictionary *)tiktokSocialControllerWithAction:(NSString *)action
+                                              args:(NSDictionary *)args
+                                             error:(NSString **)error;
+
+- (NSDictionary *)photosLibraryControllerWithAction:(NSString *)action
+                                               args:(NSDictionary *)args
+                                              error:(NSString **)error;
+
+- (NSDictionary *)tweakLifecycleWithAction:(NSString *)action
+                                      args:(NSDictionary *)args
+                                     error:(NSString **)error;
+
+- (NSDictionary *)diagnosticsCollectWithArgs:(NSDictionary *)args
+                                       error:(NSString **)error;
+
+- (NSDictionary *)diagnoseRootsWithArgs:(NSDictionary *)args
+                                  error:(NSString **)error;
+
+- (NSDictionary *)portForwardWithArgs:(NSDictionary *)args
+                                error:(NSString **)error;
+
+- (NSDictionary *)sessionForceUnlockWithArgs:(NSDictionary *)args
+                                       error:(NSString **)error;
+
+- (NSDictionary *)sessionRespawnWithArgs:(NSDictionary *)args
+                                   error:(NSString **)error;
+
 @end

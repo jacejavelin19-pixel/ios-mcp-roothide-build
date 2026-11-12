@@ -3,8 +3,60 @@
 #import "DylibInjectManager.h"
 #import "MCPEngineManager.h"
 #import "MCPProcessUtil.h"
+#import "IOSMCPPreferences.h"
 #include <libkern/OSByteOrder.h>
 #include <math.h>
+
+static NSString *MCPRedactAndFoldString(NSString *input, BOOL foldLarge) {
+    if (![input isKindOfClass:[NSString class]] || !input.length) return input;
+    NSString *s = input;
+    // Fold inline data:...;base64,... payloads
+    if ([s containsString:@"data:"] && [s containsString:@";base64,"]) {
+        NSRegularExpression *dataRe = [NSRegularExpression regularExpressionWithPattern:@"data:[^;\\s]+;base64,[A-Za-z0-9+/=]{128,}" options:0 error:NULL];
+        s = [dataRe stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"<folded:data-url-base64>"];
+    }
+    // Redact Bearer / JWT tokens
+    NSRegularExpression *jwtRe = [NSRegularExpression regularExpressionWithPattern:@"(Bearer\\s+)?eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}" options:0 error:NULL];
+    s = [jwtRe stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"<redacted:jwt>"];
+    // Redact sensitive query/body parameters
+    NSRegularExpression *paramRe = [NSRegularExpression regularExpressionWithPattern:@"((?:access_token|refresh_token|id_token|api_key|apikey|client_secret|password|passwd|session_id|sessionid|auth_token)=)([^&\\s\"']+)" options:NSRegularExpressionCaseInsensitive error:NULL];
+    s = [paramRe stringByReplacingMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"$1<redacted>"];
+    if (foldLarge && s.length > 4096) {
+        return [NSString stringWithFormat:@"%@ ... <folded:total_chars=%lu>", [s substringToIndex:2048], (unsigned long)s.length];
+    }
+    return s;
+}
+
+static NSDictionary *MCPRedactRequestEntry(NSDictionary *entry) {
+    if (![entry isKindOfClass:[NSDictionary class]]) return entry;
+    NSMutableDictionary *out = [entry mutableCopy];
+    if ([out[@"url"] isKindOfClass:[NSString class]]) {
+        out[@"url"] = MCPRedactAndFoldString(out[@"url"], NO);
+    }
+    NSSet<NSString *> *sensitiveHeaders = [NSSet setWithObjects:
+        @"authorization", @"proxy-authorization", @"cookie", @"set-cookie",
+        @"x-api-key", @"x-auth-token", @"x-access-token", @"x-csrf-token", @"x-session-token", nil];
+    for (NSString *hdrField in @[@"headers", @"request_headers", @"response_headers"]) {
+        if ([out[hdrField] isKindOfClass:[NSDictionary class]]) {
+            NSMutableDictionary *hdrs = [out[hdrField] mutableCopy];
+            for (NSString *k in [hdrs allKeys]) {
+                NSString *lower = [k lowercaseString];
+                if ([sensitiveHeaders containsObject:lower] || [lower containsString:@"token"] || [lower containsString:@"secret"] || [lower containsString:@"cookie"]) {
+                    hdrs[k] = @"<redacted>";
+                } else if ([hdrs[k] isKindOfClass:[NSString class]]) {
+                    hdrs[k] = MCPRedactAndFoldString(hdrs[k], NO);
+                }
+            }
+            out[hdrField] = hdrs;
+        }
+    }
+    for (NSString *bodyField in @[@"body", @"request_body", @"response_body", @"body_preview"]) {
+        if ([out[bodyField] isKindOfClass:[NSString class]]) {
+            out[bodyField] = MCPRedactAndFoldString(out[bodyField], YES);
+        }
+    }
+    return out;
+}
 
 static BOOL MCPHostReadVarint(const uint8_t *bytes, size_t len, size_t *offset, uint64_t *outVal) {
     if (!bytes || !offset || !outVal || *offset >= len) return NO;
@@ -239,6 +291,41 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
     return res;
 }
 
+- (NSDictionary *)clearCaptureForBundleId:(NSString *)bundleId
+                                    error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *primaryLogPath = [self primaryCaptureLogPathForBundleId:bundleId error:error];
+    if (!primaryLogPath) return nil;
+    NSString *legacyLogPath = [self captureLogPathForBundleId:bundleId error:nil];
+    [self deleteCaptureLogAtPath:primaryLogPath];
+    if (legacyLogPath.length) [self deleteCaptureLogAtPath:legacyLogPath];
+    [[MCPEngineManager sharedInstance] getCapturedRequestsForBundleId:bundleId args:@{@"limit": @1, @"clear": @YES} error:nil];
+    return @{
+        @"ok": @YES,
+        @"bundle_id": bundleId,
+        @"cleared": @YES,
+        @"capture_log_path": primaryLogPath
+    };
+}
+
+- (NSDictionary *)netStatusForBundleId:(NSString *)bundleId
+                                 error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *primaryLogPath = [self primaryCaptureLogPathForBundleId:bundleId error:error];
+    if (!primaryLogPath) return nil;
+    NSDictionary *ping = [[MCPEngineManager sharedInstance] pingForBundleId:bundleId error:nil];
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:primaryLogPath error:NULL];
+    return @{
+        @"ok": @YES,
+        @"bundle_id": bundleId,
+        @"engine_active": @(ping != nil),
+        @"capture_log_path": primaryLogPath,
+        @"log_exists": @(attrs != nil),
+        @"log_size_bytes": attrs[NSFileSize] ?: @0,
+        @"redaction_enabled_default": @(IOSMCPRedactSensitiveEnabled())
+    };
+}
+
 - (NSData *)readCaptureFileDataAtPath:(NSString *)path {
     if (!path.length) return nil;
     NSData *rawData = [NSData dataWithContentsOfFile:path];
@@ -265,6 +352,20 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
                                            limit:(NSUInteger)limit
                                        urlFilter:(NSString *)urlFilter
                                            clear:(BOOL)clear
+                                           error:(NSString **)error {
+    return [self getCapturedRequestsForBundleId:bundleId
+                                          limit:limit
+                                      urlFilter:urlFilter
+                                          clear:clear
+                                         redact:IOSMCPRedactSensitiveEnabled()
+                                          error:error];
+}
+
+- (NSDictionary *)getCapturedRequestsForBundleId:(NSString *)bundleId
+                                           limit:(NSUInteger)limit
+                                       urlFilter:(NSString *)urlFilter
+                                           clear:(BOOL)clear
+                                          redact:(BOOL)redact
                                            error:(NSString **)error {
     if (error) *error = nil;
     NSString *primaryLogPath = [self primaryCaptureLogPathForBundleId:bundleId error:error];
@@ -331,7 +432,7 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
                 continue;
             }
         }
-        [matched addObject:entry];
+        [matched addObject:redact ? MCPRedactRequestEntry(entry) : entry];
     }
 
     NSArray<NSDictionary *> *returned = matched;
@@ -355,6 +456,7 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
         @"returned_count": @(returned.count),
         @"truncated": @(truncatedCount),
         @"cleared": @(clear),
+        @"redacted": @(redact),
         @"requests": returned
     };
 }

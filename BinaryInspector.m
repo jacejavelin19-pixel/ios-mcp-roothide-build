@@ -2262,4 +2262,169 @@ static NSArray<NSString *> *MCPExtractPrintableStrings(const uint8_t *bytes, siz
     return report;
 }
 
+- (NSDictionary *)inspectJsBundleForArgs:(NSDictionary *)args error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *explicitPath = [args[@"path"] isKindOfClass:[NSString class]] ? args[@"path"] : nil;
+    if (explicitPath.length) {
+        NSString *resolved = MCPResolvedJailbreakPath(explicitPath);
+        NSData *bData = [NSData dataWithContentsOfFile:resolved options:NSDataReadingMappedIfSafe error:nil];
+        if (!bData.length) {
+            if (error) *error = [NSString stringWithFormat:@"Cannot read JS bundle at %@", explicitPath];
+            return nil;
+        }
+        const uint8_t *b = (const uint8_t *)bData.bytes;
+        const uint64_t kHermesMagic = 0x1F1903C103BC1FC6ULL;
+        BOOL isHermes = (bData.length >= 128 && *(const uint64_t *)b == kHermesMagic);
+        NSArray<NSString *> *urls = nil;
+        NSArray<NSString *> *strings = MCPExtractPrintableStrings(b, bData.length, 250, &urls);
+        if (isHermes) {
+            uint32_t version = *(const uint32_t *)(b + 8);
+            uint32_t fnCount = *(const uint32_t *)(b + 40);
+            uint32_t strCount = *(const uint32_t *)(b + 52);
+            return @{
+                @"path": explicitPath,
+                @"resolved_path": resolved,
+                @"format": @"hermes_bytecode_hbc",
+                @"hbc_version": @(version),
+                @"function_count": @(fnCount),
+                @"string_count": @(strCount),
+                @"size_bytes": @(bData.length),
+                @"extracted_urls": urls ?: @[],
+                @"sample_strings": strings ?: @[]
+            };
+        }
+        return @{
+            @"path": explicitPath,
+            @"resolved_path": resolved,
+            @"format": @"javascript_source_bundle",
+            @"size_bytes": @(bData.length),
+            @"extracted_urls": urls ?: @[],
+            @"sample_strings": strings ?: @[]
+        };
+    }
+    return [self inspectHermesFlutterForArgs:args error:error];
+}
+
+- (NSDictionary *)decodeJsBundleForArgs:(NSDictionary *)args error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *explicitPath = [args[@"path"] isKindOfClass:[NSString class]] ? args[@"path"] : nil;
+    NSUInteger maxFunctions = args[@"max_functions"] ? [args[@"max_functions"] unsignedIntegerValue] : 256;
+    if (maxFunctions == 0 || maxFunctions > 2000) maxFunctions = 256;
+    NSUInteger maxStrings = args[@"max_strings"] ? [args[@"max_strings"] unsignedIntegerValue] : 500;
+    if (maxStrings == 0 || maxStrings > 5000) maxStrings = 500;
+
+    if (!explicitPath.length) {
+        NSDictionary *inspected = [self inspectHermesFlutterForArgs:args error:error];
+        if (!inspected) return nil;
+        NSArray *bundles = inspected[@"react_native_hermes"][@"bundles"];
+        if ([bundles isKindOfClass:[NSArray class]] && bundles.count > 0) {
+            explicitPath = bundles.firstObject[@"path"];
+        }
+    }
+    if (!explicitPath.length) {
+        if (error) *error = @"No React Native / Hermes JS bundle found (specify 'path' or 'bundle_id')";
+        return nil;
+    }
+
+    NSString *resolved = MCPResolvedJailbreakPath(explicitPath);
+    NSData *bData = [NSData dataWithContentsOfFile:resolved options:NSDataReadingMappedIfSafe error:nil];
+    if (bData.length < 128) {
+        if (error) *error = [NSString stringWithFormat:@"Bundle too small or unreadable: %@", explicitPath];
+        return nil;
+    }
+
+    const uint8_t *b = (const uint8_t *)bData.bytes;
+    const uint64_t kHermesMagic = 0x1F1903C103BC1FC6ULL;
+    if (*(const uint64_t *)b != kHermesMagic) {
+        NSArray<NSString *> *urls = nil;
+        NSArray<NSString *> *strings = MCPExtractPrintableStrings(b, bData.length, maxStrings, &urls);
+        return @{
+            @"path": explicitPath,
+            @"format": @"javascript_source_bundle",
+            @"decoded_with": @"builtin_utf8_scanner",
+            @"size_bytes": @(bData.length),
+            @"extracted_urls": urls ?: @[],
+            @"strings": strings ?: @[]
+        };
+    }
+
+    uint32_t version = *(const uint32_t *)(b + 8);
+    uint32_t functionCount = *(const uint32_t *)(b + 40);
+    uint32_t stringCount = *(const uint32_t *)(b + 52);
+    uint32_t stringStorageSize = *(const uint32_t *)(b + 60);
+
+    NSMutableArray<NSDictionary *> *functions = [NSMutableArray array];
+    size_t fnTableOff = 128;
+    uint32_t fnLimit = (uint32_t)MIN((NSUInteger)functionCount, maxFunctions);
+    for (uint32_t f = 0; f < fnLimit && fnTableOff + 16 <= bData.length; f++, fnTableOff += 16) {
+        uint32_t w0 = *(const uint32_t *)(b + fnTableOff);
+        uint32_t w1 = *(const uint32_t *)(b + fnTableOff + 4);
+        uint32_t w2 = *(const uint32_t *)(b + fnTableOff + 8);
+        uint32_t bcOffset = w0 & 0x01FFFFFFU;
+        uint32_t paramCount = (w0 >> 25) & 0x7FU;
+        uint32_t bcSize = w1 & 0x7FFFU;
+        uint32_t fnNameIdx = (w1 >> 15) & 0x1FFFFU;
+        uint32_t frameSize = w2 & 0xFFU;
+        NSMutableString *opHex = [NSMutableString string];
+        if (bcOffset < bData.length) {
+            size_t dumpLen = MIN((size_t)bcSize, MIN((size_t)32, (size_t)(bData.length - bcOffset)));
+            for (size_t k = 0; k < dumpLen; k++) {
+                [opHex appendFormat:@"%02x", b[bcOffset + k]];
+            }
+        }
+        [functions addObject:@{
+            @"index": @(f),
+            @"bytecode_offset": @(bcOffset),
+            @"bytecode_size": @(bcSize),
+            @"param_count": @(paramCount),
+            @"frame_size": @(frameSize),
+            @"name_string_id": @(fnNameIdx),
+            @"bytecode_prefix_hex": opHex
+        }];
+    }
+
+    NSArray<NSString *> *urls = nil;
+    NSArray<NSString *> *strings = MCPExtractPrintableStrings(b, bData.length, maxStrings, &urls);
+
+    return @{
+        @"path": explicitPath,
+        @"resolved_path": resolved,
+        @"format": @"hermes_bytecode_hbc",
+        @"decoded_with": @"builtin_hbc_parser",
+        @"hbc_version": @(version),
+        @"function_count": @(functionCount),
+        @"returned_functions": @(functions.count),
+        @"string_count": @(stringCount),
+        @"string_storage_size": @(stringStorageSize),
+        @"functions": functions,
+        @"extracted_urls": urls ?: @[],
+        @"strings": strings ?: @[]
+    };
+}
+
+- (NSDictionary *)listHermesDecodersForArgs:(NSDictionary *)args error:(NSString **)error {
+    if (error) *error = nil;
+    NSMutableArray<NSDictionary *> *decoders = [NSMutableArray array];
+    [decoders addObject:@{
+        @"name": @"builtin_hbc_parser",
+        @"available": @YES,
+        @"type": @"in_process_native",
+        @"supported_hbc_versions": @"74-96+",
+        @"capabilities": @[@"header_parse", @"small_function_headers", @"bytecode_prefix_dump", @"string_and_url_extraction"]
+    }];
+    for (NSString *tool in @[@"hbctool", @"hermes-dec", @"hbc-decompiler"]) {
+        NSString *path = MCPFindExecutable(tool);
+        [decoders addObject:@{
+            @"name": tool,
+            @"available": @(path.length > 0),
+            @"path": path ?: [NSNull null],
+            @"type": @"external_cli"
+        }];
+    }
+    return @{
+        @"ok": @YES,
+        @"decoders": decoders
+    };
+}
+
 @end

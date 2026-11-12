@@ -10,8 +10,49 @@
 #define IOS_MCP_ENABLED_PREFERENCE_KEY @"enabled"
 #define IOS_MCP_PORT_PREFERENCE_KEY @"port"
 #define IOS_MCP_DEBUG_LOGGING_PREFERENCE_KEY @"debugLoggingEnabled"
+#define IOS_MCP_PATH_SAFETY_PREFERENCE_KEY @"pathSafetyEnabled"
+#define IOS_MCP_REQUIRE_WRITE_APPROVAL_KEY @"requireWriteApproval"
+#define IOS_MCP_REDACT_SENSITIVE_KEY @"redactSensitiveEnabled"
+#define IOS_MCP_TOOLS_TIER_KEY @"toolsTier"
 #define IOS_MCP_DARWIN_NOTIFICATION_START CFSTR("com.witchan.ios-mcp.control/start")
 #define IOS_MCP_DARWIN_NOTIFICATION_STOP CFSTR("com.witchan.ios-mcp.control/stop")
+
+static inline BOOL IOSMCPBoolPreference(NSString *key, BOOL defaultValue) {
+    CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    Boolean exists = false;
+    Boolean val = CFPreferencesGetAppBooleanValue((__bridge CFStringRef)key,
+                                                  (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN,
+                                                  &exists);
+    return exists ? (val ? YES : NO) : defaultValue;
+}
+
+static inline BOOL IOSMCPPathSafetyEnabled(void) {
+    return IOSMCPBoolPreference(IOS_MCP_PATH_SAFETY_PREFERENCE_KEY, YES);
+}
+
+static inline BOOL IOSMCPRequireWriteApproval(void) {
+    return IOSMCPBoolPreference(IOS_MCP_REQUIRE_WRITE_APPROVAL_KEY, NO);
+}
+
+static inline BOOL IOSMCPRedactSensitiveEnabled(void) {
+    return IOSMCPBoolPreference(IOS_MCP_REDACT_SENSITIVE_KEY, YES);
+}
+
+static inline NSString *IOSMCPConfiguredToolsTier(void) {
+    const char *envTier = getenv("IOS_MCP_TOOLS");
+    if (envTier && envTier[0]) {
+        return [[NSString stringWithUTF8String:envTier] lowercaseString];
+    }
+    CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)IOS_MCP_TOOLS_TIER_KEY,
+                                                        (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    if (value) {
+        NSString *str = [(__bridge id)value isKindOfClass:[NSString class]] ? [(NSString *)(__bridge id)value lowercaseString] : nil;
+        CFRelease(value);
+        if (str.length > 0) return str;
+    }
+    return @"all";
+}
 
 static inline BOOL IOSMCPParsePortValue(id value, uint16_t *outPort) {
     long long parsed = 0;

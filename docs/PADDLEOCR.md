@@ -16,18 +16,18 @@ The latest acceptance uses third-party apps, not system apps. Engine routing,
 CPU inference, fault isolation, and portrait OCR-to-tap checks passed on all three;
 real-page text recognition is not error-free, and a narrow Telegram ROI triggered
 the Paddle recognition-width limit. See the
-[three-device report](PADDLEOCR_THREE_DEVICE_TEST_RESULTS.md) for exact coverage
+[three-device report](PADDLEOCR_TEST_RESULTS.md) for exact coverage
 and limitations. A subsequent fresh rootful release-mode build was also installed
 and exercised on iPhone 7 Plus / iOS 13.5.1 at 192.168.1.17: Vision revision 1
 English recognition, explicit Chinese rejection, and Paddle CPU bilingual
-inference passed. See the [iOS 13.5.1 device report](PADDLEOCR_IOS13_TEST_RESULTS.md),
+inference passed. See the [iOS 13.5.1 device report](PADDLEOCR_TEST_RESULTS.md),
 including a very narrow Paddle ROI that missed small text. Exact iOS 13.0 and
 other iOS 13 devices remain untested. Historical results remain in
 [the original report](PADDLEOCR_TEST_RESULTS.md) and
-[the iOS 14 compatibility regression](PADDLEOCR_ROOTFUL_COMPATIBILITY.md).
+[the iOS 14 compatibility regression](PADDLEOCR_TEST_RESULTS.md).
 Those reports were recorded before changing the default from Vision to PaddleOCR;
 their original defaults and measurements are intentionally preserved. The latest
-default-routing verification is recorded in [the default-change report](PADDLEOCR_DEFAULT_ENGINE_TEST_RESULTS.md).
+default-routing verification is recorded in [the default-change report](PADDLEOCR_TEST_RESULTS.md).
 
 ## Calls
 

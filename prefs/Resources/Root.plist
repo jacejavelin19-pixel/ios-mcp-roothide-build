@@ -96,6 +96,52 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>id</key>
+			<string>safetyGuardGroup</string>
+			<key>label</key>
+			<string>安全与脱敏 (Safety &amp; Redaction)</string>
+			<key>footerText</key>
+			<string>路径保护阻止写入系统只读目录与越界路径；写入审批开启后需二次确认 approval_id；日志/抓包脱敏自动隐藏敏感 Token。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.witchan.ios-mcp.preferences</string>
+			<key>key</key>
+			<string>pathSafetyEnabled</string>
+			<key>label</key>
+			<string>写入路径保护 (Path Safety)</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.witchan.ios-mcp.preferences</string>
+			<key>key</key>
+			<string>requireWriteApproval</string>
+			<key>label</key>
+			<string>文件写入需二次审批 (Write Approval)</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.witchan.ios-mcp.preferences</string>
+			<key>key</key>
+			<string>redactSensitiveEnabled</string>
+			<key>label</key>
+			<string>抓包与日志敏感信息脱敏</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>id</key>
 			<string>codexPromptGroup</string>
 			<key>label</key>
 			<string>MCP 提示词片段</string>

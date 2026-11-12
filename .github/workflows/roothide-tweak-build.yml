@@ -41,7 +41,7 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
             -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUILD_TOOLS=OFF \
@@ -102,10 +102,11 @@ jobs:
           PY
           rm -rf "$TMP_DEB_DIR"
 
-      - name: Build all helpers, companion payload dylibs, tweak, preferences, and Rootless (arm64) + RootHide (arm64e) .deb packages
+      - name: Build all helpers, companion payload dylibs, tweak, preferences, and Rootful (arm) + Rootless (arm64) + RootHide (arm64e) .deb packages
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/generate_tool_docs.py
           make clean
 
           for payload in payloads/sslkillswitch payloads/netcapture payloads/fridastealth payloads/mcpengine; do
@@ -116,6 +117,21 @@ jobs:
 
           python3 -c "from pathlib import Path; [p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n')) for p in Path('layout/DEBIAN').iterdir() if p.is_file()]"
           chmod 0755 layout/DEBIAN/postinst layout/DEBIAN/prerm layout/DEBIAN/postrm
+
+          # 0. Build Rootful (iphoneos-arm) v2.1.1 .deb
+          for sub in AppSync AppSync/appinst mcp-roothelper mcp-ldid mcp-memory mcp-keychain mcp-appmod mcp-appstore mcp-helperd mcp-root mcp-logreader; do
+            echo "==> Building subproject (rootful): $sub"
+            env -u THEOS_PACKAGE_SCHEME make -C "$sub" clean
+            env -u THEOS_PACKAGE_SCHEME make -C "$sub" FINALPACKAGE=1 DEBUG=0 STRIP=1
+          done
+          env -u THEOS_PACKAGE_SCHEME make clean
+          env -u THEOS_PACKAGE_SCHEME make FINALPACKAGE=1 DEBUG=0 STRIP=1 package
+          BUILT_ROOTFUL_DEB="$(find packages -maxdepth 1 -type f -name 'com.witchan.ios-mcp_2.1.1*_iphoneos-arm.deb' | sort | tail -n 1)"
+          test -n "$BUILT_ROOTFUL_DEB"
+          TARGET_ROOTFUL_DEB="packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm.deb"
+          if [[ "$BUILT_ROOTFUL_DEB" != "$TARGET_ROOTFUL_DEB" ]]; then
+            cp "$BUILT_ROOTFUL_DEB" "$TARGET_ROOTFUL_DEB"
+          fi
 
           # 1. Build Rootless (iphoneos-arm64) v2.1.1 .deb
           for sub in AppSync AppSync/appinst mcp-roothelper mcp-ldid mcp-memory mcp-keychain mcp-appmod mcp-appstore mcp-helperd mcp-root mcp-logreader; do
@@ -150,7 +166,7 @@ jobs:
           fi
 
           # Normalize numeric tar uid/gid to 0:0 (root:wheel), postinst 0755, and mcp-root setuid 04755
-          for DEB_FILE in "$TARGET_ROOTLESS_DEB" "$TARGET_DEB"; do
+          for DEB_FILE in "$TARGET_ROOTFUL_DEB" "$TARGET_ROOTLESS_DEB" "$TARGET_DEB"; do
           python3 - "$DEB_FILE" <<'PY'
           import gzip, io, lzma, sys, tarfile
           from pathlib import Path
@@ -220,15 +236,16 @@ jobs:
           PY
           done
 
-      - name: Audit Rootless & RootHide .deb contents, PaddleOCR package test, Mach-O slices, links, and entitlements
+      - name: Audit Rootful, Rootless & RootHide .deb contents, PaddleOCR package test, Mach-O slices, links, and entitlements
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ci-output
+          ROOTFUL_DEB="packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm.deb"
           ROOTLESS_DEB="packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm64.deb"
           DEB="packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm64e.deb"
-          cp "$ROOTLESS_DEB" "$DEB" ci-output/
-          python3 tests/paddle_package_test.py --version 2.1.1 --arch arm64 --arch arm64e --out ci-output/paddle-package-audit.json
+          cp "$ROOTFUL_DEB" "$ROOTLESS_DEB" "$DEB" ci-output/
+          python3 tests/paddle_package_test.py --version 2.1.1 --arch arm --arch arm64 --arch arm64e --out ci-output/paddle-package-audit.json
 
           python3 - "$DEB" ci-output/macho-package-audit.json <<'PY'
           import io, json, os, subprocess, sys, tarfile, tempfile

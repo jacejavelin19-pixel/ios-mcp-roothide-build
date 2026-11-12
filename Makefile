@@ -17,8 +17,8 @@ ios-mcp_FILES = Tweak.x MCPServer.m MCPLogger.m HIDManager.m ScreenManager.m Cli
 ios-mcp_FILES += VisionOCREngine.m PaddleOCRManager.m MCPOCRRequestContext.m PlistPatchManager.m MemoryManager.m
 ios-mcp_FILES += MCPMachOUtil.m EntitlementManager.m DylibInjectManager.m ClassDumpManager.m KeychainManager.m SSLKillSwitchManager.m NetworkCaptureManager.m CrashSymbolicateManager.m SQLiteQueryManager.m IL2CPPManager.m FridaManager.m MCPEngineManager.m AppStoreManager.m BinaryInspector.m PersonaManager.m ScreenStreamer.m SystemCapabilitiesManager.m
 ios-mcp_CFLAGS = -fobjc-arc -Wno-unused-function -Wno-unused-variable -Wno-deprecated-declarations -Wno-trigraphs -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
-ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Vision
-ios-mcp_LIBRARIES = sqlite3
+ios-mcp_FRAMEWORKS = IOKit UIKit CoreGraphics QuartzCore MobileCoreServices AVFoundation Security Vision SystemConfiguration CoreBluetooth
+ios-mcp_LIBRARIES = sqlite3 z
 
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
     ios-mcp_LIBRARIES += roothide
