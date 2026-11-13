@@ -3,6 +3,7 @@
 #import "AccessibilityManager.h"
 #import "OCRManager.h"
 #import "HIDManager.h"
+#import "TextInputManager.h"
 #import "ClassDumpManager.h"
 #import "EntitlementManager.h"
 #import "MCPMachOUtil.h"
@@ -12,7 +13,46 @@
 #import <stdatomic.h>
 #import <sys/stat.h>
 
-static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
+static void MCPTouchAppStoreAuthFlag(void) {
+    NSString *stamp = [NSString stringWithFormat:@"%.0f\n", [[NSDate date] timeIntervalSince1970]];
+    NSData *data = [stamp dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *jbWorkDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
+    [[NSFileManager defaultManager] createDirectoryAtPath:jbWorkDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *jbFlag = [jbWorkDir stringByAppendingPathComponent:@"appstore-auth-active.flag"];
+    [data writeToFile:jbFlag atomically:YES];
+    chmod(jbFlag.UTF8String, 0666);
+
+    NSString *rawWorkDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    [[NSFileManager defaultManager] createDirectoryAtPath:rawWorkDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *rawFlag = [rawWorkDir stringByAppendingPathComponent:@"appstore-auth-active.flag"];
+    if (![rawFlag isEqualToString:jbFlag]) {
+        [data writeToFile:rawFlag atomically:YES];
+        chmod(rawFlag.UTF8String, 0666);
+    }
+}
+
+static NSString *MCPResolveConfiguredAppleIDPassword(NSString *explicitPassword) {
+    if ([explicitPassword isKindOfClass:[NSString class]] && explicitPassword.length > 0) {
+        return explicitPassword;
+    }
+    NSArray<NSString *> *candidates = @[
+        MCPResolvedJailbreakPath(@"/var/mobile/Library/ios-mcp/apple_id_password.txt"),
+        MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work/apple_id_password.txt"),
+        @"/var/mobile/Library/ios-mcp/apple_id_password.txt"
+    ];
+    for (NSString *path in candidates) {
+        if (path.length && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            NSString *raw = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (trimmed.length > 0) return trimmed;
+        }
+    }
+    return nil;
+}
+
+static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(NSString *explicitPassword) {
+    static NSTimeInterval sLastPasswordTypedAt = 0;
+    NSString *password = MCPResolveConfiguredAppleIDPassword(explicitPassword);
     // 1. Check Accessibility compact UI elements for an App Store / StoreKit confirmation button
     __block NSDictionary *axPayload = nil;
     dispatch_semaphore_t axSem = dispatch_semaphore_create(0);
@@ -27,11 +67,21 @@ static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
 
     NSArray *elements = [axPayload[@"elements"] isKindOfClass:[NSArray class]] ? axPayload[@"elements"] : @[];
     BOOL axHasDialogContext = NO;
+    BOOL axHasPasswordPrompt = NO;
     for (NSDictionary *el in elements) {
         if (![el isKindOfClass:[NSDictionary class]]) continue;
+        NSString *type = [el[@"type"] isKindOfClass:[NSString class]] ? [el[@"type"] lowercaseString] : @"";
+        if ([type containsString:@"securetextfield"]) {
+            axHasPasswordPrompt = YES;
+            axHasDialogContext = YES;
+        }
         for (NSString *k in @[@"text", @"label", @"value", @"identifier"]) {
             NSString *val = [el[k] isKindOfClass:[NSString class]] ? [el[k] lowercaseString] : nil;
             if (!val.length) continue;
+            if ([val containsString:@"password"] || [val containsString:@"enter the password"]) {
+                axHasPasswordPrompt = YES;
+                axHasDialogContext = YES;
+            }
             if ([val containsString:@"app store"] ||
                 [val isEqualToString:@"cancel"] ||
                 [val containsString:@"apple id"] ||
@@ -41,10 +91,37 @@ static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
                 [val containsString:@"confirm"] ||
                 [val containsString:@"redownload"]) {
                 axHasDialogContext = YES;
-                break;
             }
         }
-        if (axHasDialogContext) break;
+    }
+
+    if (axHasDialogContext || axHasPasswordPrompt) {
+        MCPTouchAppStoreAuthFlag();
+    }
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (axHasPasswordPrompt) {
+        if (password.length > 0 && (now - sLastPasswordTypedAt) >= 14.0) {
+            sLastPasswordTypedAt = now;
+            dispatch_semaphore_t typeSem = dispatch_semaphore_create(0);
+            [[TextInputManager sharedInstance] inputText:password completion:^(__unused BOOL ok, __unused NSString *err) {
+                dispatch_semaphore_signal(typeSem);
+            }];
+            dispatch_semaphore_wait(typeSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)));
+            usleep(250 * 1000);
+            dispatch_semaphore_t retSem = dispatch_semaphore_create(0);
+            [[TextInputManager sharedInstance] pressKey:@"enter" completion:^(__unused BOOL ok, __unused NSString *err) {
+                dispatch_semaphore_signal(retSem);
+            }];
+            dispatch_semaphore_wait(retSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+            return @{
+                @"source": @"accessibility_password_entry",
+                @"button": @"Return (Password Submitted)",
+                @"x": @(0),
+                @"y": @(0),
+                @"timestamp": @(now)
+            };
+        }
+        return nil;
     }
 
     for (NSDictionary *el in elements) {
@@ -115,24 +192,54 @@ static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
     if (!texts.count) return nil;
 
     BOOL ocrHasSheetContext = NO;
+    BOOL ocrHasPasswordPrompt = NO;
     for (NSDictionary *item in texts) {
         if (![item isKindOfClass:[NSDictionary class]]) continue;
         NSString *t = [item[@"text"] isKindOfClass:[NSString class]] ? [item[@"text"] lowercaseString] : @"";
+        if ([t containsString:@"password"] || [t containsString:@"enter the password"]) {
+            ocrHasPasswordPrompt = YES;
+            ocrHasSheetContext = YES;
+        }
         if ([t containsString:@"app store"] ||
             [t isEqualToString:@"cancel"] ||
             [t containsString:@"account"] ||
             [t containsString:@"apple id"] ||
-            [t containsString:@"free"] ||
+            [t containsString:@"apple account"] ||
+            [t isEqualToString:@"free"] ||
             [t containsString:@"price"] ||
             [t containsString:@"age"] ||
             [t containsString:@"confirm"] ||
             [t containsString:@"sign in"] ||
             [t containsString:@"password"]) {
             ocrHasSheetContext = YES;
-            break;
         }
     }
     if (!ocrHasSheetContext) return nil;
+    MCPTouchAppStoreAuthFlag();
+    if (ocrHasPasswordPrompt) {
+        if (password.length > 0 && (now - sLastPasswordTypedAt) >= 14.0) {
+            sLastPasswordTypedAt = now;
+            dispatch_semaphore_t typeSem = dispatch_semaphore_create(0);
+            [[TextInputManager sharedInstance] inputText:password completion:^(__unused BOOL ok, __unused NSString *err) {
+                dispatch_semaphore_signal(typeSem);
+            }];
+            dispatch_semaphore_wait(typeSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)));
+            usleep(250 * 1000);
+            dispatch_semaphore_t retSem = dispatch_semaphore_create(0);
+            [[TextInputManager sharedInstance] pressKey:@"enter" completion:^(__unused BOOL ok, __unused NSString *err) {
+                dispatch_semaphore_signal(retSem);
+            }];
+            dispatch_semaphore_wait(retSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)));
+            return @{
+                @"source": @"vision_ocr_password_entry",
+                @"button": @"Return (Password Submitted)",
+                @"x": @(0),
+                @"y": @(0),
+                @"timestamp": @(now)
+            };
+        }
+        return nil;
+    }
 
     for (NSDictionary *item in texts) {
         if (![item isKindOfClass:[NSDictionary class]]) continue;
@@ -195,33 +302,25 @@ static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
                               timeout:(NSTimeInterval)timeout
                                 error:(NSString **)error {
     if (error) *error = nil;
-    NSMutableDictionary *req = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
-    req[@"op"] = op;
-    req[@"action"] = op;
-
     NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workDir
                               withIntermediateDirectories:YES
-                                               attributes:nil
+                                               attributes:@{NSFilePosixPermissions: @0777}
                                                     error:nil];
     chmod(workDir.UTF8String, 0777);
-    NSString *reqFile = [workDir stringByAppendingPathComponent:
-                         [NSString stringWithFormat:@"appstore-req-%@.json", [NSUUID UUID].UUIDString]];
+
+    NSString *uuid = [[NSUUID UUID] UUIDString];
+    NSString *reqFile = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"appstore-req-%@.json", uuid]];
+
+    NSMutableDictionary *payload = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
+    payload[@"op"] = op ?: @"";
+    payload[@"timeout"] = @(timeout > 0 ? timeout : 90.0);
 
     NSError *jsonErr = nil;
-    NSData *reqData = [NSJSONSerialization dataWithJSONObject:req options:0 error:&jsonErr];
-    if (!reqData) {
-        if (error) *error = jsonErr.localizedDescription ?: @"Failed to serialize mcp-appstore request";
+    NSData *reqData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonErr];
+    if (!reqData || ![reqData writeToFile:reqFile atomically:YES]) {
+        if (error) *error = [NSString stringWithFormat:@"Failed to write AppStore request payload: %@", jsonErr.localizedDescription ?: @"io error"];
         return nil;
-    }
-    if (![reqData writeToFile:reqFile options:NSDataWritingAtomic error:&jsonErr]) {
-        NSString *fallbackDir = NSTemporaryDirectory();
-        reqFile = [fallbackDir stringByAppendingPathComponent:
-                   [NSString stringWithFormat:@"appstore-req-%@.json", [NSUUID UUID].UUIDString]];
-        if (![reqData writeToFile:reqFile options:NSDataWritingAtomic error:&jsonErr]) {
-            if (error) *error = jsonErr.localizedDescription ?: @"Failed to write mcp-appstore request file";
-            return nil;
-        }
     }
     chmod(reqFile.UTF8String, 0666);
 
@@ -230,13 +329,14 @@ static NSDictionary *MCPTryAutoConfirmAppStorePromptOnce(void) {
     __block atomic_bool watcherStop = ATOMIC_VAR_INIT(false);
     NSMutableArray<NSDictionary *> *confirmedPrompts = [NSMutableArray array];
     NSLock *promptsLock = [[NSLock alloc] init];
+    NSString *explicitPassword = [args[@"password"] isKindOfClass:[NSString class]] ? args[@"password"] : ([args[@"apple_id_password"] isKindOfClass:[NSString class]] ? args[@"apple_id_password"] : nil);
 
     if (watchPrompts) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             usleep(1200 * 1000);
             while (!atomic_load(&watcherStop)) {
                 @autoreleasepool {
-                    NSDictionary *hit = MCPTryAutoConfirmAppStorePromptOnce();
+                    NSDictionary *hit = MCPTryAutoConfirmAppStorePromptOnce(explicitPassword);
                     if (hit) {
                         [promptsLock lock];
                         [confirmedPrompts addObject:hit];
@@ -508,21 +608,25 @@ static NSArray<NSString *> *MCPArraySetDifference(NSArray<NSString *> *minuend, 
     NSDictionary *baselineProfile = [self profileInstalledVersionForBundleId:bundleId];
     if (!baselineProfile) {
         NSString *instErr = nil;
-        NSDictionary *instRes = [self installAppWithArgs:@{
-            @"bundle_id": bundleId ?: @"",
-            @"adam_id": @(adamId),
-            @"wait_for_install": @YES
-        } error:&instErr];
-        if (!instRes) {
-            if (error) *error = instErr ?: @"Target app is not installed and headless install failed";
-            return nil;
-        }
+        NSMutableDictionary *instArgs = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
+        if (bundleId.length) instArgs[@"bundle_id"] = bundleId;
+        if (adamId > 0) instArgs[@"adam_id"] = @(adamId);
+        instArgs[@"wait_for_install"] = @YES;
+        NSDictionary *instRes = [self installAppWithArgs:instArgs error:&instErr];
         baselineProfile = [self profileInstalledVersionForBundleId:bundleId];
-    }
-
-    if (!baselineProfile) {
-        if (error) *error = [NSString stringWithFormat:@"Could not profile installed app %@", bundleId ?: @""];
-        return nil;
+        if (!baselineProfile) {
+            NSArray *versions = [history[@"versions"] isKindOfClass:[NSArray class]] ? history[@"versions"] : @[];
+            return @{
+                @"ok": @YES,
+                @"status": @"awaiting_install_or_auth",
+                @"bundle_id": bundleId ?: @"",
+                @"adam_id": @(adamId),
+                @"version_history_count": @(versions.count),
+                @"versions": [versions subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)25, versions.count))],
+                @"install_result": instRes ?: @{},
+                @"install_attempt_error": instErr ?: @"App not installed yet; complete Apple Account sign-in or install first to diff two installed versions"
+            };
+        }
     }
 
     // Step 3: Determine target historical version to rollback & diff against

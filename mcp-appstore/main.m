@@ -1044,8 +1044,11 @@ static NSDictionary *MCPDispatchPurchaseTransactionEx(uint64_t adamId,
                 MCPMsgSendVoid1(asdPurchase, NSSelectorFromString(@"setAccountIdentifier:"), accountDSID);
             }
             MCPMsgSendVoidBool(asdPurchase, NSSelectorFromString(@"setCreatesJobs:"), YES);
-            MCPMsgSendVoidBool(asdPurchase, NSSelectorFromString(@"setIsRedownload:"), [pricingParams isEqualToString:@"STDRDL"]);
-            MCPMsgSendVoidBool(asdPurchase, NSSelectorFromString(@"setIgnoresForcedPasswordRestriction:"), YES);
+            BOOL isRedownload = [pricingParams isEqualToString:@"STDRDL"];
+            MCPMsgSendVoidBool(asdPurchase, NSSelectorFromString(@"setIsRedownload:"), isRedownload);
+            if (isRedownload) {
+                MCPMsgSendVoidBool(asdPurchase, NSSelectorFromString(@"setIgnoresForcedPasswordRestriction:"), YES);
+            }
 
             id mgr = MCPMsgSend0(ASDPurchaseManagerCls, NSSelectorFromString(@"sharedManager"));
             SEL procSel = NSSelectorFromString(@"processPurchase:withResponseHandler:");
@@ -1062,10 +1065,16 @@ static NSDictionary *MCPDispatchPurchaseTransactionEx(uint64_t adamId,
                     dispatch_semaphore_signal(sem);
                 };
                 ((void (*)(id, SEL, id, id))objc_msgSend)(mgr, procSel, asdPurchase, handler);
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
-                if (!asdErr) {
+                long waitRc = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
+                if (waitRc == 0 && !asdErr) {
                     dispatchedOK = YES;
                     engineUsed = @"ASDPurchaseManager";
+                    lastError = nil;
+                } else if (waitRc != 0) {
+                    // Completion handler has not fired yet because StoreKit/AuthKit is awaiting user sign-in or dialog confirmation.
+                    // Do not spawn a duplicate SSPurchaseRequest while the ASD transaction is in flight.
+                    dispatchedOK = YES;
+                    engineUsed = @"ASDPurchaseManager(awaiting_auth)";
                     lastError = nil;
                 } else {
                     lastError = asdErr.localizedDescription;
@@ -1085,7 +1094,9 @@ static NSDictionary *MCPDispatchPurchaseTransactionEx(uint64_t adamId,
             if (accountDSID) {
                 MCPMsgSendVoid1(purchase, NSSelectorFromString(@"setAccountIdentifier:"), accountDSID);
             }
-            MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setIgnoresForcedPasswordRestriction:"), YES);
+            if ([pricingParams isEqualToString:@"STDRDL"]) {
+                MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setIgnoresForcedPasswordRestriction:"), YES);
+            }
             MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setCreatesDownloads:"), YES);
             MCPMsgSendVoidBool(purchase, NSSelectorFromString(@"setBackgroundPurchase:"), YES);
 
@@ -1122,10 +1133,14 @@ static NSDictionary *MCPDispatchPurchaseTransactionEx(uint64_t adamId,
                     dispatch_semaphore_signal(sem);
                 };
                 ((void (*)(id, SEL, id, id))objc_msgSend)(req, startRespSel, respBlock, compBlock);
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
-                if (!ssErr) {
+                long waitRc = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
+                if (waitRc == 0 && !ssErr) {
                     dispatchedOK = YES;
                     engineUsed = @"SSPurchaseRequest";
+                    lastError = nil;
+                } else if (waitRc != 0) {
+                    dispatchedOK = YES;
+                    engineUsed = @"SSPurchaseRequest(awaiting_auth)";
                     lastError = nil;
                 } else {
                     lastError = ssErr.localizedDescription;
@@ -1139,10 +1154,14 @@ static NSDictionary *MCPDispatchPurchaseTransactionEx(uint64_t adamId,
                     dispatch_semaphore_signal(sem);
                 };
                 ((void (*)(id, SEL, id, id))objc_msgSend)(req, startBlkSel, pBlock, compBlock);
-                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
-                if (!ssErr) {
+                long waitRc = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25.0 * NSEC_PER_SEC)));
+                if (waitRc == 0 && !ssErr) {
                     dispatchedOK = YES;
                     engineUsed = @"SSPurchaseRequest";
+                    lastError = nil;
+                } else if (waitRc != 0) {
+                    dispatchedOK = YES;
+                    engineUsed = @"SSPurchaseRequest(awaiting_auth)";
                     lastError = nil;
                 } else {
                     lastError = ssErr.localizedDescription;
@@ -1173,7 +1192,23 @@ static NSDictionary *MCPDispatchPurchaseTransaction(uint64_t adamId,
                                                     uint64_t extVersionId,
                                                     NSString *pricingParams,
                                                     NSNumber *accountDSID) {
-    return MCPDispatchPurchaseTransactionEx(adamId, bundleId, extVersionId, pricingParams, accountDSID, NO);
+    return MCPDispatchPurchaseTransactionEx(adamId, bundleId, extVersionId, pricingParams, accountDSID, YES);
+}
+
+static BOOL MCPAppStoreIsAuthPromptActiveOnScreen(void) {
+    struct stat st;
+    time_t now = time(NULL);
+    const char *rawFlag = "/var/mobile/Library/Caches/ios-mcp-work/appstore-auth-active.flag";
+    if (stat(rawFlag, &st) == 0 && (now - st.st_mtime) < 15) {
+        return YES;
+    }
+#ifdef MCP_ROOTHIDE
+    NSString *jbFlag = jbroot(@"/var/mobile/Library/Caches/ios-mcp-work/appstore-auth-active.flag");
+    if (jbFlag.length && stat(jbFlag.fileSystemRepresentation, &st) == 0 && (now - st.st_mtime) < 15) {
+        return YES;
+    }
+#endif
+    return NO;
 }
 
 static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDowngradeOp, NSString **outError) {
@@ -1309,10 +1344,11 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
         ? @[explicitPricing]
         : ((wasInstalled || isDowngradeOp) ? @[@"STDRDL", @"STDQ"] : @[@"STDQ", @"STDRDL"]);
 
-    // Clear any pre-existing stalled 0% download jobs for this bundleId before starting a fresh purchase
+    // Clear any pre-existing stalled 0% download jobs for this bundleId before starting a fresh purchase,
+    // unless an Apple Account authentication prompt is currently active on screen.
     NSMutableArray<NSDictionary *> *recoveryEvents = [NSMutableArray array];
     NSDictionary *initialDlState = MCPQueryActiveStoreDownloads();
-    if ([initialDlState[@"active_count"] integerValue] > 0) {
+    if (!MCPAppStoreIsAuthPromptActiveOnScreen() && [initialDlState[@"active_count"] integerValue] > 0) {
         BOOL hasStuckZeroForBundle = NO;
         for (NSDictionary *j in initialDlState[@"asd_jobs"]) {
             NSString *jBid = [j[@"bundle_id"] isKindOfClass:[NSString class]] ? j[@"bundle_id"] : nil;
@@ -1342,7 +1378,7 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
 
     NSDictionary *purchaseDispatch = nil;
     for (NSString *pricing in pricingOrder) {
-        purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, NO);
+        purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, YES);
         if ([purchaseDispatch[@"dispatched"] boolValue]) break;
     }
 
@@ -1350,14 +1386,16 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
     BOOL sandboxRestored = NO;
     int stallRecoveryCount = 0;
     NSDictionary *afterInstallInfo = beforeInstallInfo;
+    BOOL completed = NO;
 
     if (waitForInstall && [purchaseDispatch[@"dispatched"] boolValue]) {
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSec];
         NSDate *halfwayCheck = [NSDate dateWithTimeIntervalSinceNow:MIN(25.0, timeoutSec * 0.45)];
         NSDate *lastProgressChangeTime = [NSDate date];
         double bestProgress = -1.0;
+        double maxObservedProgress = 0.0;
+        BOOL sawActiveDownload = NO;
         BOOL triedResumeInCurrentWindow = NO;
-        BOOL completed = NO;
 
         while ([deadline timeIntervalSinceNow] > 0) {
             [NSThread sleepForTimeInterval:1.2];
@@ -1370,7 +1408,7 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
 
             if (targetExtId > 0) {
                 if (nowInstalled && (nowExtId == targetExtId ||
-                    (resolvedTargetVersionString.length > 0 && [nowVer isEqualToString:resolvedTargetVersionString] && ![nowVer isEqualToString:beforeVersion]))) {
+                    (resolvedTargetVersionString.length > 0 && [nowVer isEqualToString:resolvedTargetVersionString] && (!isDowngradeOp || ![nowVer isEqualToString:beforeVersion])))) {
                     completed = YES;
                     break;
                 }
@@ -1398,14 +1436,28 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
                 }
             }
 
+            if (activeJobs > 0) {
+                sawActiveDownload = YES;
+            }
+            if (currentMaxPct > maxObservedProgress) {
+                maxObservedProgress = currentMaxPct;
+            }
+
             if (currentMaxPct > bestProgress + 0.0005) {
                 bestProgress = currentMaxPct;
                 lastProgressChangeTime = [NSDate date];
                 triedResumeInCurrentWindow = NO;
             }
 
+            // While an Apple Account password/confirmation prompt is visible on screen, never cancel or reset the transaction!
+            BOOL authPromptActive = MCPAppStoreIsAuthPromptActiveOnScreen();
+            if (authPromptActive) {
+                lastProgressChangeTime = [NSDate date];
+                continue;
+            }
+
             NSTimeInterval stalledSec = [[NSDate date] timeIntervalSinceDate:lastProgressChangeTime];
-            if (activeJobs > 0 && !triedResumeInCurrentWindow && stalledSec >= 4.5 && stalledSec < 9.5) {
+            if (activeJobs > 0 && !triedResumeInCurrentWindow && stalledSec >= 8.0 && stalledSec < 25.0) {
                 triedResumeInCurrentWindow = YES;
                 NSDictionary *resumed = MCPResumeStoreDownloadsForApp(bundleId);
                 [recoveryEvents addObject:@{
@@ -1414,11 +1466,11 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
                     @"progress": @(bestProgress < 0 ? 0.0 : bestProgress),
                     @"detail": resumed ?: @{}
                 }];
-            } else if (stalledSec >= 9.5 && stallRecoveryCount < 4 && (bestProgress < 0.85)) {
+            } else if (activeJobs > 0 && stalledSec >= 25.0 && stallRecoveryCount < 2 && (bestProgress < 0.85)) {
                 stallRecoveryCount++;
                 NSDictionary *canceled = MCPCancelStoreDownloadsForApp(bundleId);
                 [NSThread sleepForTimeInterval:1.0];
-                BOOL preferASD = (stallRecoveryCount % 2 == 1);
+                BOOL preferASD = YES;
                 NSArray<NSString *> *retryPricing = (stallRecoveryCount % 2 == 1) ? @[@"STDRDL", @"STDQ"] : pricingOrder;
                 for (NSString *pricing in retryPricing) {
                     purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, preferASD);
@@ -1439,14 +1491,16 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
                 triedResumeInCurrentWindow = NO;
             }
 
-            // If downgrading over a newer installed version and installd blocked in-place downgrade (kMIEDowngradeError),
-            // unregister the old app bundle while preserving our sandbox snapshot, then re-dispatch the legacy appExtVrsId install!
-            if (wasInstalled && targetExtId > 0 && !usedCleanReinstallFallback && [halfwayCheck timeIntervalSinceNow] <= 0) {
+            // If downgrading over a newer installed version and installd blocked in-place downgrade (kMIEDowngradeError)
+            // AFTER the download actually progressed >= 80%, unregister the old app bundle while preserving our sandbox snapshot,
+            // then re-dispatch the legacy appExtVrsId install.
+            if (isDowngradeOp && wasInstalled && targetExtId > 0 && !usedCleanReinstallFallback &&
+                sawActiveDownload && maxObservedProgress >= 0.80 && [halfwayCheck timeIntervalSinceNow] <= 0) {
                 if (activeJobs == 0 && nowExtId == beforeExtId) {
                     usedCleanReinstallFallback = YES;
                     MCPUninstallAppBundleOnly(bundleId);
                     for (NSString *pricing in @[@"STDRDL", @"STDQ"]) {
-                        purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, NO);
+                        purchaseDispatch = MCPDispatchPurchaseTransactionEx(adamId, bundleId, targetExtId, pricing, accountDSID, YES);
                         if ([purchaseDispatch[@"dispatched"] boolValue]) break;
                     }
                     lastProgressChangeTime = [NSDate date];
@@ -1468,7 +1522,6 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
                 [[NSFileManager defaultManager] removeItemAtPath:sandboxBackupPath error:nil];
             });
         }
-        (void)completed;
     }
 
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
@@ -1485,6 +1538,7 @@ static NSDictionary *MCPPerformInstallOrDowngrade(NSDictionary *req, BOOL isDown
     result[@"purchase_dispatch"] = purchaseDispatch ?: @{};
     result[@"before_install"] = beforeInstallInfo ?: @{};
     result[@"after_install"] = afterInstallInfo ?: @{};
+    result[@"completed"] = @(completed);
     result[@"clean_reinstall_fallback_used"] = @(usedCleanReinstallFallback);
     result[@"sandbox_data_preserved"] = @(preserveData && (sandboxRestored || !usedCleanReinstallFallback));
     result[@"stall_recovery_attempts"] = @(stallRecoveryCount);

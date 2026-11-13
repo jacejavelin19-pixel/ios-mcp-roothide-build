@@ -588,10 +588,25 @@ static NSString *const kMCPNetCapDestName = @"libmcp_netcap.dylib";
         }
     }
     NSData *raw = nil;
-    if ([args[@"data_base64"] isKindOfClass:[NSString class]]) {
-        raw = [[NSData alloc] initWithBase64EncodedString:args[@"data_base64"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
-    } else if ([args[@"data_hex"] isKindOfClass:[NSString class]]) {
-        NSString *hex = [[args[@"data_hex"] stringByReplacingOccurrencesOfString:@" " withString:@""]
+    NSString *b64Str = [args[@"data_base64"] isKindOfClass:[NSString class]] ? args[@"data_base64"]
+        : ([args[@"base64"] isKindOfClass:[NSString class]] ? args[@"base64"]
+        : ([args[@"payload_base64"] isKindOfClass:[NSString class]] ? args[@"payload_base64"] : nil));
+    NSString *hexStr = [args[@"data_hex"] isKindOfClass:[NSString class]] ? args[@"data_hex"]
+        : ([args[@"hex"] isKindOfClass:[NSString class]] ? args[@"hex"]
+        : ([args[@"payload_hex"] isKindOfClass:[NSString class]] ? args[@"payload_hex"] : nil));
+    if (!b64Str && !hexStr && [args[@"data"] isKindOfClass:[NSString class]]) {
+        NSString *cand = args[@"data"];
+        NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF xX"] invertedSet];
+        if (cand.length >= 2 && [cand rangeOfCharacterFromSet:nonHex].location == NSNotFound) {
+            hexStr = cand;
+        } else {
+            b64Str = cand;
+        }
+    }
+    if (b64Str.length > 0) {
+        raw = [[NSData alloc] initWithBase64EncodedString:b64Str options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    } else if (hexStr.length > 0) {
+        NSString *hex = [[hexStr stringByReplacingOccurrencesOfString:@" " withString:@""]
                          stringByReplacingOccurrencesOfString:@"0x" withString:@""];
         NSMutableData *m = [NSMutableData dataWithCapacity:hex.length / 2];
         for (NSUInteger i = 0; i + 1 < hex.length; i += 2) {

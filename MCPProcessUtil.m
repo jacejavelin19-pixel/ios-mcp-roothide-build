@@ -118,20 +118,7 @@ static BOOL MCPRunProcessViaHelperDaemon(NSString *launchPath,
                                          BOOL *truncatedOut,
                                          int *exitCode,
                                          NSString **errorMessage) {
-    int sock = MCPConnectHelperDaemon();
-    if (sock < 0) {
-        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn denied in SpringBoard and mcp-helperd is unreachable for %@", launchPath];
-        return NO;
-    }
-
     NSTimeInterval effectiveTimeout = MAX(timeout, 1.0);
-    int rcvSec = (int)ceil(effectiveTimeout) + 5;
-    if (rcvSec < 5) rcvSec = 5;
-    struct timeval rcvTv = {.tv_sec = rcvSec, .tv_usec = 0};
-    struct timeval sndTv = {.tv_sec = 5, .tv_usec = 0};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvTv, sizeof(rcvTv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
-
     NSMutableDictionary *req = [NSMutableDictionary dictionary];
     req[@"launch_path"] = launchPath ?: @"";
     req[@"arguments"] = arguments ?: @[];
@@ -143,40 +130,70 @@ static BOOL MCPRunProcessViaHelperDaemon(NSString *launchPath,
 
     NSData *reqData = [NSJSONSerialization dataWithJSONObject:req options:0 error:nil];
     if (!reqData || reqData.length == 0 || reqData.length > 4 * 1024 * 1024) {
-        close(sock);
         if (errorMessage) *errorMessage = @"Failed to serialize helperd spawn request";
         return NO;
     }
 
-    uint32_t netReqLen = htonl((uint32_t)reqData.length);
-    if (!MCPWriteAllSocket(sock, &netReqLen, sizeof(netReqLen)) ||
-        !MCPWriteAllSocket(sock, reqData.bytes, reqData.length)) {
-        close(sock);
-        if (errorMessage) *errorMessage = @"Failed to send spawn request to mcp-helperd";
-        return NO;
-    }
+    NSMutableData *respBytes = nil;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int sock = MCPConnectHelperDaemon();
+        for (int retry = 0; sock < 0 && retry < 15; retry++) {
+            usleep(200 * 1000);
+            sock = MCPConnectHelperDaemon();
+        }
+        if (sock < 0) {
+            if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn denied in SpringBoard and mcp-helperd is unreachable for %@", launchPath];
+            return NO;
+        }
 
-    uint32_t netRespLen = 0;
-    if (!MCPReadExactSocket(sock, &netRespLen, sizeof(netRespLen))) {
-        close(sock);
-        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Command timed out after %.0fs", effectiveTimeout];
-        return NO;
-    }
+        int rcvSec = (int)ceil(effectiveTimeout) + 5;
+        if (rcvSec < 5) rcvSec = 5;
+        struct timeval rcvTv = {.tv_sec = rcvSec, .tv_usec = 0};
+        struct timeval sndTv = {.tv_sec = 5, .tv_usec = 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcvTv, sizeof(rcvTv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sndTv, sizeof(sndTv));
 
-    uint32_t respLen = ntohl(netRespLen);
-    if (respLen == 0 || respLen > 32 * 1024 * 1024) {
-        close(sock);
-        if (errorMessage) *errorMessage = @"Invalid response length from mcp-helperd";
-        return NO;
-    }
+        CFAbsoluteTime sendStart = CFAbsoluteTimeGetCurrent();
+        uint32_t netReqLen = htonl((uint32_t)reqData.length);
+        if (!MCPWriteAllSocket(sock, &netReqLen, sizeof(netReqLen)) ||
+            !MCPWriteAllSocket(sock, reqData.bytes, reqData.length)) {
+            close(sock);
+            if (attempt == 0) {
+                usleep(250 * 1000);
+                continue;
+            }
+            if (errorMessage) *errorMessage = @"Failed to send spawn request to mcp-helperd";
+            return NO;
+        }
 
-    NSMutableData *respBytes = [NSMutableData dataWithLength:respLen];
-    if (!respBytes || !MCPReadExactSocket(sock, respBytes.mutableBytes, respLen)) {
+        uint32_t netRespLen = 0;
+        if (!MCPReadExactSocket(sock, &netRespLen, sizeof(netRespLen))) {
+            close(sock);
+            CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - sendStart;
+            if (attempt == 0 && elapsed < 2.5) {
+                usleep(250 * 1000);
+                continue;
+            }
+            if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Command timed out after %.0fs", effectiveTimeout];
+            return NO;
+        }
+
+        uint32_t respLen = ntohl(netRespLen);
+        if (respLen == 0 || respLen > 32 * 1024 * 1024) {
+            close(sock);
+            if (errorMessage) *errorMessage = @"Invalid response length from mcp-helperd";
+            return NO;
+        }
+
+        respBytes = [NSMutableData dataWithLength:respLen];
+        if (!respBytes || !MCPReadExactSocket(sock, respBytes.mutableBytes, respLen)) {
+            close(sock);
+            if (errorMessage) *errorMessage = @"Failed to read response payload from mcp-helperd";
+            return NO;
+        }
         close(sock);
-        if (errorMessage) *errorMessage = @"Failed to read response payload from mcp-helperd";
-        return NO;
+        break;
     }
-    close(sock);
 
     NSDictionary *resp = [NSJSONSerialization JSONObjectWithData:respBytes options:0 error:nil];
     if (![resp isKindOfClass:[NSDictionary class]]) {
@@ -297,8 +314,6 @@ NSString *MCPResolvedJailbreakPath(NSString *path) {
         [path hasPrefix:@"/var/mobile/"] || [path isEqualToString:@"/var/mobile"] ||
         [path hasPrefix:@"/private/var/mobile/"] || [path isEqualToString:@"/private/var/mobile"] ||
         [path hasPrefix:@"/var/containers/"] || [path hasPrefix:@"/private/var/containers/"] ||
-        [path hasPrefix:@"/var/tmp/"] || [path isEqualToString:@"/var/tmp"] ||
-        [path hasPrefix:@"/private/var/tmp/"] || [path hasPrefix:@"/tmp/"] || [path isEqualToString:@"/tmp"] ||
         [path hasPrefix:@"/System/"] || [path hasPrefix:@"/Developer/"];
 
     if (preferRealRootFS) {
@@ -852,8 +867,17 @@ NSString *MCPReadCommandOutput(NSArray<NSString *> *cmdAndArgs,
     NSString *errMsg = nil;
     int code = -1;
     BOOL ok = MCPRunRootProcess(launchPath, args, timeout > 0 ? timeout : 15.0, 512 * 1024, &output, &code, &errMsg);
-    if (!ok) {
-        ok = MCPRunProcess(launchPath, args, MCPJailbreakEnvironment(), timeout > 0 ? timeout : 15.0, 512 * 1024, &output, &code, &errMsg);
+    if (!ok || code == 126) {
+        NSString *fallbackOutput = nil;
+        NSString *fallbackErr = nil;
+        int fallbackCode = -1;
+        BOOL fallbackOk = MCPRunProcess(launchPath, args, MCPJailbreakEnvironment(), timeout > 0 ? timeout : 15.0, 512 * 1024, &fallbackOutput, &fallbackCode, &fallbackErr);
+        if (fallbackOk || fallbackCode != -1) {
+            ok = fallbackOk;
+            code = fallbackCode;
+            output = fallbackOutput;
+            errMsg = fallbackErr;
+        }
     }
     if (exitCodeOut) *exitCodeOut = code;
     if (output.length) return output;

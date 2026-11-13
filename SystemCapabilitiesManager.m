@@ -8,6 +8,8 @@
 #import "TextInputManager.h"
 #import "ScreenStreamer.h"
 #import "MCPProcessUtil.h"
+#import "IOSMCPPreferences.h"
+#import "MCPServer.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -15,6 +17,9 @@
 #include <ifaddrs.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1266,6 +1271,22 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
             ? ((id (*)(id, SEL))objc_msgSend)(phLibCls, @selector(sharedPhotoLibrary))
             : nil;
 
+        NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
+        [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *trackedFile = [workDir stringByAppendingPathComponent:@"imported_photos.json"];
+        NSMutableArray<NSString *> *trackedIds = [NSMutableArray array];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:trackedFile]) {
+            NSData *td = [NSData dataWithContentsOfFile:trackedFile];
+            NSArray *arr = td ? [NSJSONSerialization JSONObjectWithData:td options:0 error:nil] : nil;
+            if ([arr isKindOfClass:NSArray.class]) {
+                for (id item in arr) {
+                    if ([item isKindOfClass:NSString.class] && [item length] > 0 && ![trackedIds containsObject:item]) {
+                        [trackedIds addObject:item];
+                    }
+                }
+            }
+        }
+
         if (sharedLib && ([act isEqualToString:@"import"] || [act isEqualToString:@"import_file"])) {
             NSString *filePath = [args[@"path"] ?: args[@"file_path"] ?: @"" description];
             NSString *b64 = [args[@"data_base64"] ?: args[@"base64"] ?: @"" description];
@@ -1274,6 +1295,10 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
             NSURL *targetURL = nil;
             BOOL removeTemp = NO;
             if (filePath.length > 0) {
+                NSString *resolvedInput = MCPResolvedJailbreakPath(filePath);
+                if ([[NSFileManager defaultManager] fileExistsAtPath:resolvedInput]) {
+                    filePath = resolvedInput;
+                }
                 targetURL = [NSURL fileURLWithPath:filePath];
             } else if (b64.length > 0) {
                 NSData *raw = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
@@ -1316,23 +1341,79 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
                     if (error) *error = impErr.localizedDescription ?: @"Photo library import failed";
                     return nil;
                 }
+                if (createdId.length > 0) {
+                    if (![trackedIds containsObject:createdId]) {
+                        [trackedIds addObject:createdId];
+                    }
+                    NSData *outJson = [NSJSONSerialization dataWithJSONObject:trackedIds options:0 error:nil];
+                    [outJson writeToFile:trackedFile atomically:YES];
+                }
                 return @{
                     @"ok": @YES,
                     @"action": [NSString stringWithFormat:@"photos_%@", act],
                     @"local_identifier": createdId ?: [NSNull null],
-                    @"media_type": mediaType
+                    @"media_type": mediaType,
+                    @"tracked_for_safe_clear": @(createdId.length > 0)
                 };
             }
         }
 
         if (sharedLib && [act isEqualToString:@"clear"]) {
-            SEL fetchSel = NSSelectorFromString(@"fetchAssetsWithOptions:");
+            SEL fetchByIdSel = NSSelectorFromString(@"fetchAssetsWithLocalIdentifiers:options:");
+            SEL fetchAllSel = NSSelectorFromString(@"fetchAssetsWithOptions:");
             SEL delSel = NSSelectorFromString(@"deleteAssets:");
             SEL perfSel = NSSelectorFromString(@"performChangesAndWait:error:");
-            if ([phAssetCls respondsToSelector:fetchSel] && [phChangeReqCls respondsToSelector:delSel] && [sharedLib respondsToSelector:perfSel]) {
-                id fetchRes = ((id (*)(id, SEL, id))objc_msgSend)(phAssetCls, fetchSel, nil);
+            if ([phChangeReqCls respondsToSelector:delSel] && [sharedLib respondsToSelector:perfSel]) {
+                NSArray *explicitIds = [args[@"local_identifiers"] isKindOfClass:NSArray.class] ? args[@"local_identifiers"]
+                    : ([args[@"ids"] isKindOfClass:NSArray.class] ? args[@"ids"] : nil);
+                if (!explicitIds && [args[@"local_identifier"] isKindOfClass:NSString.class] && [args[@"local_identifier"] length] > 0) {
+                    explicitIds = @[args[@"local_identifier"]];
+                }
+                BOOL confirmAll = [args[@"confirm_all"] boolValue] || [args[@"all"] boolValue] || [args[@"confirm"] boolValue];
+                NSUInteger limit = [args[@"limit"] respondsToSelector:@selector(unsignedIntegerValue)] ? [args[@"limit"] unsignedIntegerValue] : 0;
+
+                NSArray<NSString *> *targetIds = nil;
+                NSString *scope = @"mcp_imported_only";
+                if (explicitIds.count > 0) {
+                    targetIds = explicitIds;
+                    scope = @"explicit_identifiers";
+                } else if (!confirmAll) {
+                    targetIds = [trackedIds copy];
+                    scope = @"mcp_imported_only";
+                    if (targetIds.count == 0) {
+                        return @{
+                            @"ok": @YES,
+                            @"action": @"photos_clear",
+                            @"deleted": @0,
+                            @"scope": scope,
+                            @"note": @"No MCP-imported photos to clear (pass local_identifiers=[...] for specific assets or confirm_all=true to clear entire photo library)"
+                        };
+                    }
+                } else {
+                    scope = @"entire_library";
+                }
+
+                if (limit > 0 && targetIds.count > limit) {
+                    targetIds = [targetIds subarrayWithRange:NSMakeRange(0, limit)];
+                }
+
+                id fetchRes = nil;
+                if (targetIds != nil && [phAssetCls respondsToSelector:fetchByIdSel]) {
+                    fetchRes = ((id (*)(id, SEL, id, id))objc_msgSend)(phAssetCls, fetchByIdSel, targetIds, nil);
+                } else if (confirmAll && [phAssetCls respondsToSelector:fetchAllSel]) {
+                    fetchRes = ((id (*)(id, SEL, id))objc_msgSend)(phAssetCls, fetchAllSel, nil);
+                }
+
                 NSUInteger total = [fetchRes respondsToSelector:@selector(count)] ? [fetchRes count] : 0;
-                if (total == 0) return @{@"ok": @YES, @"action": @"photos_clear", @"deleted": @0};
+                if (total == 0) {
+                    if (targetIds.count > 0 && [scope isEqualToString:@"mcp_imported_only"]) {
+                        [trackedIds removeObjectsInArray:targetIds];
+                        NSData *outJson = [NSJSONSerialization dataWithJSONObject:trackedIds options:0 error:nil];
+                        [outJson writeToFile:trackedFile atomically:YES];
+                    }
+                    return @{@"ok": @YES, @"action": @"photos_clear", @"deleted": @0, @"scope": scope};
+                }
+
                 NSError *delErr = nil;
                 void (^delBlk)(void) = ^{
                     ((void (*)(id, SEL, id))objc_msgSend)(phChangeReqCls, delSel, fetchRes);
@@ -1342,7 +1423,14 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
                     if (error) *error = delErr.localizedDescription ?: @"Photos clear failed";
                     return nil;
                 }
-                return @{@"ok": @YES, @"action": @"photos_clear", @"deleted": @(total)};
+                if (targetIds.count > 0) {
+                    [trackedIds removeObjectsInArray:targetIds];
+                } else if (confirmAll) {
+                    [trackedIds removeAllObjects];
+                }
+                NSData *outJson = [NSJSONSerialization dataWithJSONObject:trackedIds options:0 error:nil];
+                [outJson writeToFile:trackedFile atomically:YES];
+                return @{@"ok": @YES, @"action": @"photos_clear", @"deleted": @(total), @"scope": scope};
             }
         }
     }
@@ -1363,15 +1451,30 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     [fm createDirectoryAtPath:rollbackDir withIntermediateDirectories:YES attributes:nil error:NULL];
 
     if ([act isEqualToString:@"tweak_build"] || [act isEqualToString:@"build"]) {
-        NSString *projectDir = [args[@"project_dir"] ?: args[@"path"] ?: @"" description];
+        NSString *rawDir = [args[@"project_dir"] ?: args[@"path"] ?: args[@"directory"] ?: @"" description];
+        NSString *projectDir = rawDir.length > 0 ? MCPResolvedJailbreakPath(rawDir) : @"";
         if (!projectDir.length || ![fm fileExistsAtPath:projectDir]) {
-            if (error) *error = @"Provide a valid 'project_dir' on device with a Theos Makefile";
-            return nil;
+            if (rawDir.length > 0 && [fm fileExistsAtPath:rawDir]) {
+                projectDir = rawDir;
+            } else {
+                if (error) *error = @"Provide a valid 'project_dir' (or 'path') on device containing a Makefile";
+                return nil;
+            }
+        }
+        BOOL clean = [args[@"clean"] boolValue];
+        NSString *target = [args[@"target"] isKindOfClass:NSString.class] && [args[@"target"] length] > 0 ? args[@"target"] : @"package";
+        if (clean) {
+            int cleanStatus = -1;
+            MCPReadCommandOutput(@[@"make", @"-C", projectDir, @"clean"], 60.0, &cleanStatus);
         }
         int status = -1;
-        NSString *out = MCPReadCommandOutput(@[@"make", @"-C", projectDir, @"package", @"FINALPACKAGE=1"], 120.0, &status);
+        NSString *out = MCPReadCommandOutput(@[@"make", @"-C", projectDir, target, @"FINALPACKAGE=1"], 180.0, &status);
+        if (status != 0) {
+            if (error) *error = [NSString stringWithFormat:@"tweak_build failed (exit %d): %@", status, out ?: @""];
+            return nil;
+        }
         return @{
-            @"ok": @(status == 0),
+            @"ok": @YES,
             @"action": @"tweak_build",
             @"project_dir": projectDir,
             @"exit_code": @(status),
@@ -1381,8 +1484,12 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
 
     if ([act isEqualToString:@"tweak_deploy"] || [act isEqualToString:@"deploy"] ||
         [act isEqualToString:@"self_update"] || [act isEqualToString:@"update"]) {
-        NSString *debPath = [args[@"deb_path"] ?: args[@"path"] ?: @"" description];
-        NSString *b64 = [args[@"deb_base64"] ?: args[@"data_base64"] ?: @"" description];
+        NSString *rawDebPath = [args[@"deb_path"] ?: args[@"path"] ?: args[@"package_path"] ?: args[@"file"] ?: @"" description];
+        NSString *debPath = rawDebPath.length > 0 ? MCPResolvedJailbreakPath(rawDebPath) : @"";
+        if (rawDebPath.length > 0 && ![fm fileExistsAtPath:debPath] && [fm fileExistsAtPath:rawDebPath]) {
+            debPath = rawDebPath;
+        }
+        NSString *b64 = [args[@"deb_base64"] ?: args[@"data_base64"] ?: args[@"base64"] ?: @"" description];
         if (!debPath.length && b64.length) {
             NSData *raw = [[NSData alloc] initWithBase64EncodedString:b64 options:NSDataBase64DecodingIgnoreUnknownCharacters];
             if (raw.length) {
@@ -1391,32 +1498,47 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
             }
         }
         if (!debPath.length || ![fm fileExistsAtPath:debPath]) {
-            if (error) *error = @"Provide 'deb_path' or 'deb_base64' pointing to a valid .deb package";
+            if (error) *error = @"Provide 'deb_path' (or 'path'/'package_path') or 'deb_base64' pointing to a valid .deb package";
             return nil;
         }
 
         // Snapshot current installed tweak dylib into rollback directory before dpkg -i
-        NSString *curDylib = MCPSubPath(@"Library/MobileSubstrate/DynamicLibraries/iOSMCP.dylib");
+        NSString *curDylib = MCPSubPath(@"Library/MobileSubstrate/DynamicLibraries/ios-mcp.dylib");
+        if (![fm fileExistsAtPath:curDylib]) {
+            curDylib = MCPSubPath(@"Library/MobileSubstrate/DynamicLibraries/iOSMCP.dylib");
+        }
         if ([fm fileExistsAtPath:curDylib]) {
-            NSString *bakDylib = [rollbackDir stringByAppendingPathComponent:@"iOSMCP.dylib.bak"];
+            NSString *bakDylib = [rollbackDir stringByAppendingPathComponent:@"ios-mcp.dylib.bak"];
             [fm removeItemAtPath:bakDylib error:NULL];
             [fm copyItemAtPath:curDylib toPath:bakDylib error:NULL];
         }
         NSString *bakDeb = [rollbackDir stringByAppendingPathComponent:@"last_deployed.deb"];
+        NSString *prevDeb = [rollbackDir stringByAppendingPathComponent:@"previous.deb"];
+        if ([fm fileExistsAtPath:bakDeb] && ![debPath isEqualToString:prevDeb]) {
+            [fm removeItemAtPath:prevDeb error:NULL];
+            [fm copyItemAtPath:bakDeb toPath:prevDeb error:NULL];
+        }
         if (![debPath isEqualToString:bakDeb]) {
             [fm removeItemAtPath:bakDeb error:NULL];
             [fm copyItemAtPath:debPath toPath:bakDeb error:NULL];
         }
+        if (![fm fileExistsAtPath:prevDeb] && [fm fileExistsAtPath:bakDeb]) {
+            [fm copyItemAtPath:bakDeb toPath:prevDeb error:NULL];
+        }
 
         int status = -1;
-        NSString *dpkgOut = MCPReadCommandOutput(@[@"dpkg", @"-i", debPath], 60.0, &status);
-        if ([args[@"respring"] boolValue] && status == 0) {
+        NSString *dpkgOut = MCPReadCommandOutput(@[@"dpkg", @"-i", debPath], 90.0, &status);
+        if (status != 0) {
+            if (error) *error = [NSString stringWithFormat:@"%@ failed (exit %d): %@", act, status, dpkgOut ?: @""];
+            return nil;
+        }
+        if ([args[@"respring"] boolValue]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 MCPReadCommandOutput(@[@"killall", @"-9", @"SpringBoard"], 5.0, NULL);
             });
         }
         return @{
-            @"ok": @(status == 0),
+            @"ok": @YES,
             @"action": act,
             @"deb_path": debPath,
             @"rollback_backup_dir": rollbackDir,
@@ -1426,23 +1548,45 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     }
 
     if ([act isEqualToString:@"tweak_rollback"] || [act isEqualToString:@"rollback"]) {
-        NSString *bakDeb = [args[@"deb_path"] isKindOfClass:NSString.class]
-            ? args[@"deb_path"]
-            : [rollbackDir stringByAppendingPathComponent:@"previous.deb"];
-        NSString *bakDylib = [rollbackDir stringByAppendingPathComponent:@"iOSMCP.dylib.bak"];
-        NSString *curDylib = MCPSubPath(@"Library/MobileSubstrate/DynamicLibraries/iOSMCP.dylib");
+        NSString *explicitDeb = [args[@"deb_path"] ?: args[@"path"] isKindOfClass:NSString.class]
+            ? MCPResolvedJailbreakPath(args[@"deb_path"] ?: args[@"path"])
+            : nil;
+        NSString *prevDeb = [rollbackDir stringByAppendingPathComponent:@"previous.deb"];
+        NSString *lastDeb = [rollbackDir stringByAppendingPathComponent:@"last_deployed.deb"];
+        NSString *bakDeb = nil;
+        if (explicitDeb.length > 0 && [fm fileExistsAtPath:explicitDeb]) {
+            bakDeb = explicitDeb;
+        } else if ([fm fileExistsAtPath:prevDeb]) {
+            bakDeb = prevDeb;
+        } else if ([fm fileExistsAtPath:lastDeb]) {
+            bakDeb = lastDeb;
+        }
 
-        if ([fm fileExistsAtPath:bakDeb]) {
+        NSString *bakDylib = [rollbackDir stringByAppendingPathComponent:@"ios-mcp.dylib.bak"];
+        if (![fm fileExistsAtPath:bakDylib]) {
+            bakDylib = [rollbackDir stringByAppendingPathComponent:@"iOSMCP.dylib.bak"];
+        }
+        NSString *curDylib = MCPSubPath(@"Library/MobileSubstrate/DynamicLibraries/ios-mcp.dylib");
+
+        if (bakDeb.length > 0 && [fm fileExistsAtPath:bakDeb]) {
             int status = -1;
-            NSString *out = MCPReadCommandOutput(@[@"dpkg", @"-i", bakDeb], 60.0, &status);
-            return @{@"ok": @(status == 0), @"action": @"tweak_rollback", @"restored_from": bakDeb, @"output": out ?: @""};
+            NSString *out = MCPReadCommandOutput(@[@"dpkg", @"-i", bakDeb], 90.0, &status);
+            if (status != 0) {
+                if (error) *error = [NSString stringWithFormat:@"tweak_rollback dpkg failed (exit %d): %@", status, out ?: @""];
+                return nil;
+            }
+            return @{@"ok": @YES, @"action": @"tweak_rollback", @"restored_from": bakDeb, @"exit_code": @(status), @"output": out ?: @""};
         }
         if ([fm fileExistsAtPath:bakDylib]) {
             [fm removeItemAtPath:curDylib error:NULL];
             BOOL copied = [fm copyItemAtPath:bakDylib toPath:curDylib error:NULL];
-            return @{@"ok": @(copied), @"action": @"tweak_rollback", @"restored_from": bakDylib};
+            if (!copied) {
+                if (error) *error = [NSString stringWithFormat:@"Failed to restore backup dylib from %@", bakDylib];
+                return nil;
+            }
+            return @{@"ok": @YES, @"action": @"tweak_rollback", @"restored_from": bakDylib};
         }
-        if (error) *error = @"No rollback backup found in /var/mobile/Library/ios-mcp/rollback";
+        if (error) *error = [NSString stringWithFormat:@"No rollback backup found in %@ (deploy a package via tweak_deploy or pass deb_path)", rollbackDir];
         return nil;
     }
 
@@ -1455,17 +1599,21 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     if (error) *error = nil;
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *jbRoot = MCPJailbreakRoot();
-    NSArray<NSString *> *candidates = @[
+    NSString *mcpRuntimeDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/ios-mcp");
+    [fm createDirectoryAtPath:mcpRuntimeDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSMutableArray<NSString *> *candidates = [NSMutableArray arrayWithArray:@[
         @"/",
-        @"/var/jb",
         @"/private/preboot",
         @"/var/containers/Bundle/Application",
         @"/var/mobile",
-        @"/var/mobile/Library/ios-mcp",
+        mcpRuntimeDir,
         MCPSubPath(@"Library/MobileSubstrate/DynamicLibraries"),
-        MCPSubPath(@"usr/libexec/ios-mcp-helper"),
+        MCPSubPath(@"usr/libexec/ios-mcp/mcp-helperd"),
         MCPSubPath(@"usr/lib/ios-mcp/libmcpengine.dylib")
-    ];
+    ]];
+    if ([jbRoot isEqualToString:@"/var/jb"] || [fm fileExistsAtPath:@"/var/jb"]) {
+        [candidates insertObject:@"/var/jb" atIndex:1];
+    }
     NSMutableArray *probed = [NSMutableArray array];
     for (NSString *p in candidates) {
         BOOL isDir = NO;
@@ -1503,10 +1651,10 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     NSDictionary *frontmost = [[AppManager sharedInstance] getFrontmostApp] ?: @{};
 
     int dpkgStatus = -1;
-    NSString *dpkgInfo = MCPReadCommandOutput(@[@"dpkg", @"-l", @"com.witchan.ios-mcp"], 5.0, &dpkgStatus);
-    int psStatus = -1;
-    NSString *helperPs = MCPReadCommandOutput(@[@"ps", @"-ef"], 5.0, &psStatus);
-    BOOL helperRunning = [helperPs containsString:@"ios-mcp-helper"];
+    NSString *dpkgInfo = MCPReadCommandOutput(@[@"dpkg", @"-s", @"com.witchan.ios-mcp"], 5.0, &dpkgStatus);
+    int helperSock = MCPConnectHelperDaemon();
+    if (helperSock >= 0) close(helperSock);
+    BOOL helperRunning = (helperSock >= 0);
 
     return @{
         @"ok": @YES,
@@ -1523,7 +1671,24 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
 - (NSDictionary *)portForwardWithArgs:(NSDictionary *)args
                                 error:(NSString **)error {
     if (error) *error = nil;
-    NSString *action = [args[@"action"] isKindOfClass:NSString.class] ? [args[@"action"] lowercaseString] : @"start";
+    uint16_t listenPort = (uint16_t)[args[@"listen_port"] ?: args[@"local_port"] ?: args[@"device_port"] ?: args[@"port"] integerValue];
+    uint16_t targetPort = (uint16_t)[args[@"target_port"] ?: args[@"remote_port"] ?: args[@"host_port"] ?: args[@"to_port"] integerValue];
+    if (targetPort == 0 && listenPort > 0) {
+        targetPort = listenPort;
+    }
+
+    NSString *rawAction = [args[@"action"] isKindOfClass:NSString.class] ? [args[@"action"] lowercaseString] : nil;
+    NSString *action = rawAction;
+    if (!action.length) {
+        action = (listenPort == 0 && targetPort == 0) ? @"list" : @"start";
+    } else if ([action isEqualToString:@"status"] || [action isEqualToString:@"ls"]) {
+        action = @"list";
+    } else if ([action isEqualToString:@"remove"] || [action isEqualToString:@"delete"] || [action isEqualToString:@"close"]) {
+        action = @"stop";
+    } else if ([action isEqualToString:@"add"] || [action isEqualToString:@"create"] || [action isEqualToString:@"open"]) {
+        action = @"start";
+    }
+
     if ([action isEqualToString:@"list"]) {
         NSMutableArray *list = [NSMutableArray array];
         @synchronized (_portForwards) {
@@ -1540,8 +1705,22 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
         return @{@"ok": @YES, @"action": @"list", @"forwards": list};
     }
 
-    uint16_t listenPort = (uint16_t)[args[@"listen_port"] ?: args[@"local_port"] integerValue];
     if ([action isEqualToString:@"stop"]) {
+        if (listenPort == 0) {
+            NSMutableArray *stoppedPorts = [NSMutableArray array];
+            @synchronized (_portForwards) {
+                for (NSString *k in [_portForwards allKeys]) {
+                    NSMutableDictionary *entry = _portForwards[k];
+                    if (entry && entry[@"listen_fd"]) {
+                        entry[@"stopped"] = @YES;
+                        close([entry[@"listen_fd"] intValue]);
+                    }
+                    if (entry[@"listen_port"]) [stoppedPorts addObject:entry[@"listen_port"]];
+                }
+                [_portForwards removeAllObjects];
+            }
+            return @{@"ok": @YES, @"action": @"stop_all", @"stopped_ports": stoppedPorts};
+        }
         NSString *key = [NSString stringWithFormat:@"%u", listenPort];
         NSMutableDictionary *entry = nil;
         @synchronized (_portForwards) {
@@ -1555,10 +1734,9 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
         return @{@"ok": @YES, @"action": @"stop", @"listen_port": @(listenPort)};
     }
 
-    uint16_t targetPort = (uint16_t)[args[@"target_port"] ?: args[@"remote_port"] integerValue];
-    NSString *targetHost = [args[@"target_host"] ?: @"127.0.0.1" description];
+    NSString *targetHost = [args[@"target_host"] ?: args[@"host"] ?: @"127.0.0.1" description];
     if (listenPort == 0 || targetPort == 0) {
-        if (error) *error = @"Provide non-zero 'listen_port' and 'target_port'";
+        if (error) *error = @"Provide non-zero 'listen_port' (or 'local_port'/'port') and 'target_port' (or 'remote_port')";
         return nil;
     }
 
@@ -1648,9 +1826,10 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     if (error) *error = nil;
     NSString *passcode = [args[@"passcode"] ?: args[@"pin"] ?: @"" description];
     __block BOOL unlocked = NO;
+    __block BOOL wasLocked = NO;
 
     dispatch_sync(dispatch_get_main_queue(), ^{
-        // 1. Wake backlight and dismiss cover sheet via SBLockScreenManager
+        // 1. Wake backlight and dismiss cover sheet via SBLockScreenManager / SBCoverSheetPresentationManager
         Class blCls = objc_getClass("SBBacklightController");
         if (blCls && [blCls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) {
             id bl = ((id (*)(id, SEL))objc_msgSend)(blCls, NSSelectorFromString(@"sharedInstance"));
@@ -1660,12 +1839,30 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
             }
         }
         Class lsCls = objc_getClass("SBLockScreenManager");
+        id lsm = nil;
         if (lsCls && [lsCls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) {
-            id lsm = ((id (*)(id, SEL))objc_msgSend)(lsCls, NSSelectorFromString(@"sharedInstance"));
+            lsm = ((id (*)(id, SEL))objc_msgSend)(lsCls, NSSelectorFromString(@"sharedInstance"));
+            if ([lsm respondsToSelector:NSSelectorFromString(@"isUILocked")]) {
+                wasLocked = ((BOOL (*)(id, SEL))objc_msgSend)(lsm, NSSelectorFromString(@"isUILocked"));
+            }
             if (passcode.length > 0 && [lsm respondsToSelector:NSSelectorFromString(@"attemptUnlockWithPasscode:")]) {
                 unlocked = ((BOOL (*)(id, SEL, id))objc_msgSend)(lsm, NSSelectorFromString(@"attemptUnlockWithPasscode:"), passcode);
             } else if ([lsm respondsToSelector:NSSelectorFromString(@"unlockUIFromSource:withOptions:")]) {
-                unlocked = ((BOOL (*)(id, SEL, int, id))objc_msgSend)(lsm, NSSelectorFromString(@"unlockUIFromSource:withOptions:"), 1, @{});
+                unlocked = ((BOOL (*)(id, SEL, int, id))objc_msgSend)(lsm, NSSelectorFromString(@"unlockUIFromSource:withOptions:"), 1, @{@"SBUnlockOptionKeyBypassPasscode": @YES});
+            }
+        }
+        Class csCls = objc_getClass("SBCoverSheetPresentationManager");
+        if (csCls && [csCls respondsToSelector:NSSelectorFromString(@"sharedInstance")]) {
+            id csm = ((id (*)(id, SEL))objc_msgSend)(csCls, NSSelectorFromString(@"sharedInstance"));
+            SEL dismissSel = NSSelectorFromString(@"setCoverSheetPresented:animated:withCompletion:");
+            if ([csm respondsToSelector:dismissSel]) {
+                ((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(csm, dismissSel, NO, NO, nil);
+            }
+        }
+        if (lsm && [lsm respondsToSelector:NSSelectorFromString(@"isUILocked")]) {
+            BOOL stillLocked = ((BOOL (*)(id, SEL))objc_msgSend)(lsm, NSSelectorFromString(@"isUILocked"));
+            if (!stillLocked) {
+                unlocked = YES;
             }
         }
     });
@@ -1674,6 +1871,7 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
         @"ok": @YES,
         @"action": @"session_force_unlock",
         @"unlocked": @(unlocked),
+        @"was_locked": @(wasLocked),
         @"passcode_used": @(passcode.length > 0)
     };
 }
@@ -1681,7 +1879,31 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
 - (NSDictionary *)sessionRespawnWithArgs:(NSDictionary *)args
                                    error:(NSString **)error {
     if (error) *error = nil;
-    NSString *target = [args[@"target"] ?: @"helper" lowercaseString];
+    NSString *rawTarget = [args[@"target"] ?: @"" description];
+    NSString *target = [rawTarget.length > 0 ? rawTarget : @"helper" lowercaseString];
+    NSString *bundleId = [args[@"bundle_id"] ?: args[@"app"] ?: @"" description];
+    if (!bundleId.length && [rawTarget containsString:@"."] &&
+        ![target isEqualToString:@"springboard"] && ![target isEqualToString:@"respring"] &&
+        ![target isEqualToString:@"helper"] && ![target isEqualToString:@"mcp-helperd"]) {
+        bundleId = rawTarget;
+    }
+
+    if (bundleId.length > 0) {
+        [[AppManager sharedInstance] killApp:bundleId error:nil];
+        usleep(250 * 1000);
+        NSString *launchErr = nil;
+        BOOL launched = [[AppManager sharedInstance] launchApp:bundleId error:&launchErr];
+        usleep(350 * 1000);
+        pid_t pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
+        return @{
+            @"ok": @(launched || pid > 0),
+            @"action": @"session_respawn",
+            @"target": bundleId,
+            @"pid": @(pid),
+            @"error": launchErr ?: [NSNull null]
+        };
+    }
+
     if ([target isEqualToString:@"springboard"] || [target isEqualToString:@"respring"]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             MCPReadCommandOutput(@[@"killall", @"-9", @"SpringBoard"], 5.0, NULL);
@@ -1690,14 +1912,254 @@ static NSArray<NSString *> *MCPExtractOTPCodes(NSString *text) {
     }
 
     int status = -1;
-    NSString *out = MCPReadCommandOutput(@[@"killall", @"-9", @"ios-mcp-helper"], 5.0, &status);
+    NSString *helperBin = MCPSubPath(@"usr/libexec/ios-mcp/mcp-helperd");
+    NSString *out = MCPReadCommandOutput(@[helperBin, @"--daemon"], 5.0, &status);
+    usleep(350 * 1000);
+    int sock = MCPConnectHelperDaemon();
+    if (sock >= 0) close(sock);
     return @{
-        @"ok": @YES,
+        @"ok": @(sock >= 0 || status == 0),
         @"action": @"session_respawn",
-        @"target": @"ios-mcp-helper",
+        @"target": @"mcp-helperd",
+        @"respawned_and_listening": @(sock >= 0),
         @"exit_code": @(status),
         @"output": out ?: @""
     };
 }
 
+- (NSDictionary *)wanCellularControllerWithArgs:(NSDictionary *)args
+                                          error:(NSString **)error {
+    if (error) *error = nil;
+    NSString *action = [args[@"action"] isKindOfClass:NSString.class] ? [args[@"action"] lowercaseString] : @"status";
+    NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:NULL];
+    NSString *statusJsonPath = [workDir stringByAppendingPathComponent:@"wan_status.json"];
+    NSString *tunnelLogPath = [workDir stringByAppendingPathComponent:@"wan_tunnel.log"];
+
+    NSDictionary *(^loadTunnelStatus)(void) = ^NSDictionary *(void) {
+        NSData *data = [NSData dataWithContentsOfFile:statusJsonPath];
+        if (data.length > 0) {
+            NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+            if ([dict isKindOfClass:NSDictionary.class]) return dict;
+        }
+        return @{@"active": @NO};
+    };
+
+    if ([action isEqualToString:@"status"]) {
+        return @{
+            @"ok": @YES,
+            @"action": @"status",
+            @"network": IOSMCPNetworkInterfacesSummary(),
+            @"wan_bridge": [[MCPServer sharedInstance] wanBridgeStatusSummary],
+            @"public_tunnel": loadTunnelStatus()
+        };
+    }
+
+    if ([action isEqualToString:@"configure_bridge"] || [action isEqualToString:@"configure"]) {
+        NSString *prefsPath = @"/var/mobile/Library/Preferences/com.witchan.ios-mcp.preferences.plist";
+        CFStringRef prefsDomain = (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN;
+        NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:prefsPath] ?: [NSMutableDictionary dictionary];
+        if (args[@"enabled"] != nil) {
+            BOOL en = [args[@"enabled"] boolValue];
+            prefs[IOS_MCP_WAN_BRIDGE_ENABLED_KEY] = @(en);
+            CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_WAN_BRIDGE_ENABLED_KEY,
+                                     en ? kCFBooleanTrue : kCFBooleanFalse,
+                                     prefsDomain);
+        }
+        NSString *hostArg = [args[@"bridge_host"] ?: args[@"host"] description];
+        if (hostArg != nil && (args[@"bridge_host"] != nil || args[@"host"] != nil)) {
+            NSString *trimmed = [hostArg stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            prefs[IOS_MCP_WAN_BRIDGE_HOST_KEY] = trimmed;
+            CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_WAN_BRIDGE_HOST_KEY,
+                                     (__bridge CFStringRef)trimmed,
+                                     prefsDomain);
+        }
+        if (args[@"bridge_port"] != nil || args[@"port"] != nil) {
+            NSInteger portVal = [args[@"bridge_port"] ?: args[@"port"] integerValue];
+            if (portVal > 0 && portVal <= UINT16_MAX) {
+                prefs[IOS_MCP_WAN_BRIDGE_PORT_KEY] = @(portVal);
+                CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_WAN_BRIDGE_PORT_KEY,
+                                         (__bridge CFNumberRef)@(portVal),
+                                         prefsDomain);
+            }
+        }
+        if (args[@"prefer_cellular"] != nil) {
+            BOOL prefCell = [args[@"prefer_cellular"] boolValue];
+            prefs[IOS_MCP_PREFER_CELLULAR_KEY] = @(prefCell);
+            CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_PREFER_CELLULAR_KEY,
+                                     prefCell ? kCFBooleanTrue : kCFBooleanFalse,
+                                     prefsDomain);
+        }
+        [prefs writeToFile:prefsPath atomically:YES];
+        CFPreferencesAppSynchronize(prefsDomain);
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             IOS_MCP_DARWIN_NOTIFICATION_WAN_RELOAD,
+                                             NULL,
+                                             NULL,
+                                             true);
+        [[MCPServer sharedInstance] handleNetworkOrWanConfigurationChange];
+        return @{
+            @"ok": @YES,
+            @"action": @"configure_bridge",
+            @"network": IOSMCPNetworkInterfacesSummary(),
+            @"wan_bridge": [[MCPServer sharedInstance] wanBridgeStatusSummary]
+        };
+    }
+
+    if ([action isEqualToString:@"wake_cellular"] || [action isEqualToString:@"probe_cellular"]) {
+        NSDictionary *beforeSummary = IOSMCPNetworkInterfacesSummary();
+        NSString *cellIf = [beforeSummary[@"cellular_interface"] isKindOfClass:NSString.class] ? beforeSummary[@"cellular_interface"] : @"pdp_ip0";
+        unsigned int ifIdx = if_nametoindex(cellIf.UTF8String);
+        if (ifIdx == 0) {
+            for (NSString *cand in @[@"pdp_ip0", @"pdp_ip1", @"pdp_ip2", @"pdp_ip3"]) {
+                ifIdx = if_nametoindex(cand.UTF8String);
+                if (ifIdx != 0) {
+                    cellIf = cand;
+                    break;
+                }
+            }
+        }
+
+        NSString *externalIp = @"";
+        NSString *traceRaw = @"";
+        BOOL connectedOk = NO;
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            if (ifIdx != 0) {
+                setsockopt(sock, IPPROTO_IP, IP_BOUND_IF, &ifIdx, sizeof(ifIdx));
+            }
+            int fl = fcntl(sock, F_GETFL, 0);
+            if (fl >= 0) fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+
+            struct sockaddr_in dst = {0};
+            dst.sin_family = AF_INET;
+            dst.sin_port = htons(80);
+            inet_pton(AF_INET, "1.1.1.1", &dst.sin_addr);
+
+            int rc = connect(sock, (struct sockaddr *)&dst, sizeof(dst));
+            if (rc == 0 || errno == EINPROGRESS) {
+                struct pollfd pfd = { .fd = sock, .events = POLLOUT, .revents = 0 };
+                if (poll(&pfd, 1, 4500) > 0 && (pfd.revents & POLLOUT)) {
+                    int soErr = 0;
+                    socklen_t soLen = sizeof(soErr);
+                    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &soLen) == 0 && soErr == 0) {
+                        if (fl >= 0) fcntl(sock, F_SETFL, fl & ~O_NONBLOCK);
+                        struct timeval tv = { .tv_sec = 4, .tv_usec = 0 };
+                        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                        const char *req = "GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nUser-Agent: ios-mcp/2.1\r\nConnection: close\r\n\r\n";
+                        send(sock, req, strlen(req), 0);
+                        char buf[2048];
+                        ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+                        if (n > 0) {
+                            buf[n] = '\0';
+                            connectedOk = YES;
+                            traceRaw = [NSString stringWithUTF8String:buf] ?: @"";
+                            for (NSString *line in [traceRaw componentsSeparatedByString:@"\n"]) {
+                                if ([line hasPrefix:@"ip="]) {
+                                    externalIp = [[line substringFromIndex:3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            close(sock);
+        }
+
+        NSDictionary *afterSummary = IOSMCPNetworkInterfacesSummary();
+        [[MCPServer sharedInstance] handleNetworkOrWanConfigurationChange];
+        return @{
+            @"ok": @(connectedOk),
+            @"action": @"wake_cellular",
+            @"bound_interface": cellIf,
+            @"bound_interface_index": @(ifIdx),
+            @"external_cellular_ip": externalIp ?: @"",
+            @"network": afterSummary,
+            @"wan_bridge": [[MCPServer sharedInstance] wanBridgeStatusSummary]
+        };
+    }
+
+    if ([action isEqualToString:@"start_public_tunnel"]) {
+        uint16_t localPort = [[MCPServer sharedInstance] port] ?: IOSMCPConfiguredPort();
+        NSString *provider = [args[@"provider"] isKindOfClass:NSString.class] ? [args[@"provider"] lowercaseString] : @"auto";
+        NSString *cfBin = MCPSubPath(@"/usr/bin/cloudflared");
+        if (![[NSFileManager defaultManager] isExecutableFileAtPath:cfBin]) {
+            cfBin = MCPSubPath(@"/usr/local/bin/cloudflared");
+        }
+        BOOL hasCloudflared = [[NSFileManager defaultManager] isExecutableFileAtPath:cfBin];
+        NSString *usedProvider = (hasCloudflared && ![provider isEqualToString:@"ssh"]) ? @"cloudflared" : @"localhost.run";
+
+        // Stop any stale tunnel first
+        MCPReadCommandOutput(@[@"sh", @"-c", @"killall -9 cloudflared 2>/dev/null; pkill -f 'localhost.run' 2>/dev/null; true"], 3.0, NULL);
+        [[NSFileManager defaultManager] removeItemAtPath:tunnelLogPath error:NULL];
+
+        NSString *launchCmd = nil;
+        if ([usedProvider isEqualToString:@"cloudflared"]) {
+            launchCmd = [NSString stringWithFormat:@"nohup '%@' tunnel --no-autoupdate --url http://127.0.0.1:%u > '%@' 2>&1 & echo $!",
+                         cfBin, (unsigned int)localPort, tunnelLogPath];
+        } else {
+            launchCmd = [NSString stringWithFormat:@"nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes -R 80:127.0.0.1:%u nokey@localhost.run > '%@' 2>&1 & echo $!",
+                         (unsigned int)localPort, tunnelLogPath];
+        }
+
+        int exitCode = 0;
+        NSString *pidOut = [[MCPReadCommandOutput(@[@"sh", @"-c", launchCmd], 5.0, &exitCode) ?: @""
+                             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] copy];
+
+        NSString *publicUrl = @"";
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"https://[a-zA-Z0-9.-]+\\.(?:trycloudflare\\.com|lhr\\.life)"
+                                                                            options:0
+                                                                              error:NULL];
+        for (int attempt = 0; attempt < 16; attempt++) {
+            usleep(350 * 1000);
+            NSString *logText = [NSString stringWithContentsOfFile:tunnelLogPath encoding:NSUTF8StringEncoding error:NULL] ?: @"";
+            NSTextCheckingResult *match = [re firstMatchInString:logText options:0 range:NSMakeRange(0, logText.length)];
+            if (match && match.range.location != NSNotFound) {
+                publicUrl = [logText substringWithRange:match.range];
+                break;
+            }
+        }
+
+        NSDictionary *statusObj = @{
+            @"active": @(publicUrl.length > 0),
+            @"provider": usedProvider,
+            @"pid": pidOut ?: @"",
+            @"local_port": @(localPort),
+            @"public_url": publicUrl ?: @"",
+            @"mcp_endpoint": publicUrl.length > 0 ? [publicUrl stringByAppendingString:@"/mcp"] : @"",
+            @"updated_at": @([[NSDate date] timeIntervalSince1970])
+        };
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:statusObj options:NSJSONWritingPrettyPrinted error:NULL];
+        [jsonData writeToFile:statusJsonPath atomically:YES];
+
+        return @{
+            @"ok": @(publicUrl.length > 0),
+            @"action": @"start_public_tunnel",
+            @"tunnel": statusObj,
+            @"network": IOSMCPNetworkInterfacesSummary()
+        };
+    }
+
+    if ([action isEqualToString:@"stop_public_tunnel"]) {
+        MCPReadCommandOutput(@[@"sh", @"-c", @"killall -9 cloudflared 2>/dev/null; pkill -f 'localhost.run' 2>/dev/null; true"], 3.0, NULL);
+        NSDictionary *statusObj = @{
+            @"active": @NO,
+            @"updated_at": @([[NSDate date] timeIntervalSince1970])
+        };
+        NSData *jsonData = [NSJSONSerialization dataWithJSONObject:statusObj options:NSJSONWritingPrettyPrinted error:NULL];
+        [jsonData writeToFile:statusJsonPath atomically:YES];
+        return @{
+            @"ok": @YES,
+            @"action": @"stop_public_tunnel",
+            @"tunnel": statusObj
+        };
+    }
+
+    if (error) *error = [NSString stringWithFormat:@"Unsupported wan_cellular_controller action '%@' (expected: status, configure_bridge, wake_cellular, start_public_tunnel, stop_public_tunnel)", action];
+    return nil;
+}
+
 @end
+

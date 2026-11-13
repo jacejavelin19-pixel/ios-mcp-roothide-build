@@ -45,7 +45,7 @@
         }
     }
 
-    NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *reqFile = [workDir stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"kc-req-%@.json", [NSUUID UUID].UUIDString]];

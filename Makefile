@@ -28,7 +28,7 @@ else ifeq ($(THEOS_PACKAGE_SCHEME),rootless)
     ios-mcp_CFLAGS += -DMCP_ROOTLESS=1
 endif
 
-iosmcpprefs_FILES = prefs/IOSMCPRootListController.m prefs/IOSMCPQRCodeCell.m prefs/IOSMCPLocalization.m MCPLogger.m
+iosmcpprefs_FILES = prefs/IOSMCPRootListController.m prefs/IOSMCPLocalization.m MCPLogger.m
 iosmcpprefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -Wno-unknown-warning-option -Wno-cast-function-type-mismatch
 iosmcpprefs_FRAMEWORKS = UIKit CoreGraphics
 iosmcpprefs_PRIVATE_FRAMEWORKS = Preferences

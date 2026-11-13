@@ -2700,6 +2700,9 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
         return [self uninstallDebPackage:bundleId error:error];
     }
 
+    // Ensure target app is not running before uninstalling
+    [self killApp:bundleId error:nil];
+
     __block BOOL ok = NO;
     __block NSString *errMsg = nil;
 
@@ -2730,7 +2733,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
             }
 
             if (result) {
-                APP_LOG(@"Uninstalled app: %@", bundleId);
+                APP_LOG(@"Uninstalled app via LSApplicationWorkspace: %@", bundleId);
                 ok = YES;
                 return;
             }
@@ -2747,18 +2750,67 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
         dispatch_sync(dispatch_get_main_queue(), block);
     }
 
-    if (!ok) {
-        if (error) *error = errMsg;
-        return NO;
+    if (ok) {
+        NSDate *quickDeadline = [NSDate dateWithTimeIntervalSinceNow:2.5];
+        while ([quickDeadline timeIntervalSinceNow] > 0) {
+            if (![self isAppInstalled:bundleId]) {
+                if (error) *error = nil;
+                return YES;
+            }
+            [NSThread sleepForTimeInterval:0.2];
+        }
     }
 
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+    // Fallback to root helper mcp-appinst --uninstall which holds installd / LaunchServices entitlements
+    NSString *appinstOut = nil;
+    NSString *appinstErr = nil;
+    int appinstCode = -1;
+    BOOL ranHelper = MCPRunRootProcess(@"/usr/bin/mcp-appinst",
+                                       @[@"--uninstall", bundleId],
+                                       45.0,
+                                       256 * 1024,
+                                       &appinstOut,
+                                       &appinstCode,
+                                       &appinstErr);
+    if (!ranHelper) {
+        NSString *resolvedBin = MCPResolvedJailbreakPath(@"/usr/bin/mcp-appinst");
+        ranHelper = MCPRunProcess(resolvedBin,
+                                  @[@"--uninstall", bundleId],
+                                  MCPJailbreakEnvironment(),
+                                  45.0,
+                                  256 * 1024,
+                                  &appinstOut,
+                                  &appinstCode,
+                                  &appinstErr);
+    }
+    if (ranHelper && appinstCode == 0) {
+        ok = YES;
+    }
+
+    // Also run uicache -u if bundle container was removed on disk
+    NSDictionary *appInfo = [self appInfoForBundleId:bundleId error:nil];
+    NSString *bundlePath = [appInfo[@"bundle_path"] isKindOfClass:[NSString class]] ? appInfo[@"bundle_path"] : nil;
+    if (bundlePath.length > 0) {
+        NSString *uicacheBin = MCPResolvedJailbreakPath(@"/usr/bin/uicache");
+        if ([[NSFileManager defaultManager] isExecutableFileAtPath:uicacheBin]) {
+            NSString *uiOut = nil;
+            int uiCode = -1;
+            MCPRunProcess(uicacheBin, @[@"-u", bundlePath], MCPJailbreakEnvironment(), 15.0, 64 * 1024, &uiOut, &uiCode, nil);
+        }
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
     while ([deadline timeIntervalSinceNow] > 0) {
         if (![self isAppInstalled:bundleId]) {
             if (error) *error = nil;
             return YES;
         }
         [NSThread sleepForTimeInterval:0.25];
+    }
+
+    if (!ok) {
+        if (error) *error = appinstErr ?: (errMsg ?: @"Uninstall failed");
+        return NO;
     }
 
     if (error) {

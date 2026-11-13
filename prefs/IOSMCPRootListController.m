@@ -141,8 +141,7 @@ static BOOL IOSMCPEnabledPreference(void) {
     if (tintColor) {
         [respringButton setTitleColor:tintColor forState:UIControlStateNormal];
     }
-    [respringButton setTitle:IOSMCPLocalizedString(@"重启") forState:UIControlStateNormal];
-    // The English title is wider than the original two-character Chinese label.
+    [respringButton setTitle:IOSMCPLocalizedString(@"Respring") forState:UIControlStateNormal];
     CGSize buttonSize = [respringButton sizeThatFits:CGSizeMake(CGFLOAT_MAX, 44.0)];
     respringButton.frame = CGRectMake(0.0, 0.0, MAX(52.0, ceil(buttonSize.width)), 44.0);
     [respringButton addTarget:self
@@ -181,6 +180,14 @@ static BOOL IOSMCPEnabledPreference(void) {
     NSString *key = [specifier propertyForKey:@"key"];
     if (![key isEqualToString:IOS_MCP_PORT_PREFERENCE_KEY]) {
         [super setPreferenceValue:value specifier:specifier];
+        CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+        if ([key isEqualToString:IOS_MCP_WAN_BRIDGE_ENABLED_KEY] ||
+            [key isEqualToString:IOS_MCP_WAN_BRIDGE_HOST_KEY] ||
+            [key isEqualToString:IOS_MCP_WAN_BRIDGE_PORT_KEY] ||
+            [key isEqualToString:IOS_MCP_PREFER_CELLULAR_KEY]) {
+            [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_WAN_RELOAD];
+            [self refreshPromptText];
+        }
         return;
     }
 
@@ -209,8 +216,8 @@ static BOOL IOSMCPEnabledPreference(void) {
     });
 
     if (!validPort) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"端口无效")
-                         message:[NSString stringWithFormat:IOSMCPLocalizedString(@"端口必须在 %d-%d 之间，已恢复为默认端口 %d。"),
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Invalid Port")
+                         message:[NSString stringWithFormat:IOSMCPLocalizedString(@"The port must be between %d and %d. It has been reset to the default port %d."),
                                   IOS_MCP_MIN_PORT,
                                   IOS_MCP_MAX_PORT,
                                   IOS_MCP_DEFAULT_PORT]];
@@ -236,8 +243,8 @@ static BOOL IOSMCPEnabledPreference(void) {
     [self setServerControlBusyState:YES];
     [self updateEnabledPreference:shouldStart];
     [self postNotification:shouldStart ? IOS_MCP_DARWIN_NOTIFICATION_START : IOS_MCP_DARWIN_NOTIFICATION_STOP];
-    [self updateControlStatusText:shouldStart ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：正在启动端口 %u..."), (unsigned int)port] : IOSMCPLocalizedString(@"当前状态：正在关闭...")
-                      buttonTitle:shouldStart ? IOSMCPLocalizedString(@"正在启动...") : IOSMCPLocalizedString(@"正在关闭...")
+    [self updateControlStatusText:shouldStart ? [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: Starting on port %u..."), (unsigned int)port] : IOSMCPLocalizedString(@"Status: Stopping...")
+                      buttonTitle:shouldStart ? IOSMCPLocalizedString(@"Starting...") : IOSMCPLocalizedString(@"Stopping...")
                     buttonEnabled:YES];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
@@ -259,7 +266,7 @@ static BOOL IOSMCPEnabledPreference(void) {
 - (void)copyPrompt:(PSSpecifier *)specifier {
     NSString *prompt = [self codexPrompt];
     if (prompt.length == 0) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法生成 MCP 提示词片段。")];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share") message:IOSMCPLocalizedString(@"Unable to generate the MCP prompt snippet.")];
         return;
     }
 
@@ -278,9 +285,9 @@ static BOOL IOSMCPEnabledPreference(void) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *logFiles = [NSMutableArray array];
     NSArray<NSString *> *paths = [MCPLogger allLogFilePaths];
     for (NSUInteger index = 0; index < paths.count; index++) {
-        NSString *title = IOSMCPLocalizedString(@"当前日志");
+        NSString *title = IOSMCPLocalizedString(@"Current Log");
         if (index == 1) {
-            title = IOSMCPLocalizedString(@"上一份日志");
+            title = IOSMCPLocalizedString(@"Previous Log");
         }
         [logFiles addObject:@{@"path": paths[index], @"title": title}];
     }
@@ -296,16 +303,16 @@ static BOOL IOSMCPEnabledPreference(void) {
                             attributes:nil
                                  error:&createError]) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败")
-                                 message:createError.localizedDescription ?: IOSMCPLocalizedString(@"无法准备 Debug 日志文件。")];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share")
+                                 message:createError.localizedDescription ?: IOSMCPLocalizedString(@"Unable to prepare the debug log files.")];
             });
             return;
         }
 
         __block BOOL hasLogFile = NO;
         NSMutableString *report = [NSMutableString stringWithString:
-                                   IOSMCPLocalizedString(@"iOS MCP Debug 日志\n"
-                                   @"此文件由 iOS MCP 设置页导出，用于排查服务启动、HTTP 请求、MCP 工具调用、耗时和错误。\n\n")];
+                                   IOSMCPLocalizedString(@"iOS MCP Debug Logs\n"
+                                   @"Exported from iOS MCP Settings to troubleshoot service startup, HTTP requests, MCP tool calls, timing, and errors.\n\n")];
         for (NSDictionary<NSString *, NSString *> *entry in logFiles) {
             NSString *sourcePath = entry[@"path"];
             NSString *title = entry[@"title"];
@@ -321,23 +328,23 @@ static BOOL IOSMCPEnabledPreference(void) {
                                                     error:&readError];
             NSString *body = nil;
             if (!data) {
-                body = [NSString stringWithFormat:IOSMCPLocalizedString(@"无法读取日志文件。\n错误：%@\n"),
-                        readError.localizedDescription ?: IOSMCPLocalizedString(@"未知错误")];
+                body = [NSString stringWithFormat:IOSMCPLocalizedString(@"Unable to read the log file.\nError: %@\n"),
+                        readError.localizedDescription ?: IOSMCPLocalizedString(@"Unknown error")];
             } else if (data.length > 0 && memchr(data.bytes, 0, data.length) != NULL) {
-                body = [NSString stringWithFormat:IOSMCPLocalizedString(@"日志文件包含不可显示内容，未直接导出原始内容。\n大小：%llu bytes\n"),
+                body = [NSString stringWithFormat:IOSMCPLocalizedString(@"The log file contains non-displayable data; its raw contents were not exported.\nSize: %llu bytes\n"),
                         (unsigned long long)data.length];
             } else {
                 body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                 if (!body) {
-                    body = [NSString stringWithFormat:IOSMCPLocalizedString(@"日志文件不是有效 UTF-8 文本。\n大小：%llu bytes\n"),
+                    body = [NSString stringWithFormat:IOSMCPLocalizedString(@"The log file is not valid UTF-8 text.\nSize: %llu bytes\n"),
                             (unsigned long long)data.length];
                 } else if (body.length == 0) {
-                    body = IOSMCPLocalizedString(@"日志文件为空。\n");
+                    body = IOSMCPLocalizedString(@"The log file is empty.\n");
                 }
             }
 
-            [report appendFormat:IOSMCPLocalizedString(@"## %@\n路径：%@\n\n%@\n\n"),
-             title ?: IOSMCPLocalizedString(@"日志"),
+            [report appendFormat:IOSMCPLocalizedString(@"## %@\nPath: %@\n\n%@\n\n"),
+             title ?: IOSMCPLocalizedString(@"Log"),
              sourcePath,
              body ?: @""];
         }
@@ -349,7 +356,7 @@ static BOOL IOSMCPEnabledPreference(void) {
                                       encoding:NSUTF8StringEncoding
                                          error:&writeError];
 
-        // 优先把两份原始日志打成一个 zip（zip 内保留原文件名），分享 zip。
+        // Package the raw log files into a zip archive for sharing.
         NSMutableArray<NSString *> *zipSources = [NSMutableArray array];
         for (NSDictionary<NSString *, NSString *> *entry in logFiles) {
             BOOL isDir = NO;
@@ -362,8 +369,8 @@ static BOOL IOSMCPEnabledPreference(void) {
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!hasLogFile) {
-                [self showAlertWithTitle:IOSMCPLocalizedString(@"没有日志")
-                                 message:IOSMCPLocalizedString(@"当前还没有可分享的 Debug 日志文件。")];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"No Logs")
+                                 message:IOSMCPLocalizedString(@"There are no debug log files to share yet.")];
                 return;
             }
 
@@ -385,8 +392,8 @@ static BOOL IOSMCPEnabledPreference(void) {
             }
 
             if (!wroteReport) {
-                [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败")
-                                 message:writeError.localizedDescription ?: IOSMCPLocalizedString(@"无法准备 Debug 日志文件。")];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share")
+                                 message:writeError.localizedDescription ?: IOSMCPLocalizedString(@"Unable to prepare the debug log files.")];
                 return;
             }
 
@@ -402,8 +409,7 @@ static BOOL IOSMCPEnabledPreference(void) {
     });
 }
 
-// 内置一个最小 ZIP writer，使用 store 模式保存日志文件。
-// 这样不依赖设备是否安装 /usr/bin/zip，也不受 libzip.a 缺少 arm64e slice 的限制。
+// Built-in minimal ZIP writer using store mode.
 - (BOOL)buildZipAtPath:(NSString *)zipPath fromFiles:(NSArray<NSString *> *)files {
     if (zipPath.length == 0 || files.count == 0) {
         return NO;
@@ -558,7 +564,7 @@ static BOOL IOSMCPEnabledPreference(void) {
 
 - (void)presentPromptShareSheetWithText:(NSString *)prompt sourceCell:(UITableViewCell *)sourceCell {
     if (prompt.length == 0) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法生成 MCP 提示词片段。")];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share") message:IOSMCPLocalizedString(@"Unable to generate the MCP prompt snippet.")];
         return;
     }
 
@@ -603,20 +609,16 @@ static BOOL IOSMCPEnabledPreference(void) {
 
 - (void)presentDebugLogShareSheetWithURL:(NSURL *)reportURL sourceCell:(UITableViewCell *)sourceCell {
     if (!reportURL) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法准备 Debug 日志文件。")];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share") message:IOSMCPLocalizedString(@"Unable to prepare the debug log files.")];
         return;
     }
 
-    // 关键：在 Preferences 里分享【文件 URL】会卡死——分享面板要为文件生成预览，需要跨沙箱的
-    // 文件协调能力，而 Preferences.app 没有该 entitlement 去派发文件访问令牌，于是 present 永不
-    // 完成、界面不可见（实测把文件 chmod 0644 仍卡死，排除了 POSIX 权限因素）。
-    // 但分享【文本内容】走的是进程内路径，不需要跨沙箱读文件，因此可以正常弹出真正的系统分享
-    // 面板（Copy / 存储到文件 / AirDrop / 邮件 等）。所以这里分享日志正文文本，而不是文件 URL。
+    // Share the in-process text payload rather than a file URL to avoid cross-sandbox file coordination deadlocks in Preferences.app.
     NSString *shareText = [NSString stringWithContentsOfURL:reportURL
                                                    encoding:NSUTF8StringEncoding
                                                       error:NULL];
     if (shareText.length == 0) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法读取 Debug 日志内容。")];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share") message:IOSMCPLocalizedString(@"Unable to read the debug log contents.")];
         return;
     }
 
@@ -637,7 +639,6 @@ static BOOL IOSMCPEnabledPreference(void) {
         presenter = presenter.presentedViewController;
     }
 
-    // iPad 上分享面板以 popover 呈现，必须锚定到在屏的真实视图（分享按钮所在的 cell）。
     UIPopoverPresentationController *popover = activityController.popoverPresentationController;
     if (popover) {
         UIView *anchorView = (sourceCell && sourceCell.window) ? sourceCell.contentView : presenter.view;
@@ -661,12 +662,10 @@ static BOOL IOSMCPEnabledPreference(void) {
 }
 
 - (void)presentDebugLogShareSheetWithZipURL:(NSURL *)zipURL sourceCell:(UITableViewCell *)sourceCell {
-    // 分享 zip 的【文件 URL】会和文本文件 URL 一样卡死（跨进程缩略图需要文件访问权限，
-    // Preferences 无法派发）。改为把 zip 读成内存数据，用 NSItemProvider 提供 data 表示 +
-    // suggestedName，走进程内路径分享，既不卡死，又能让“存储到文件”得到正确文件名。
+    // Share the ZIP archive via in-memory NSItemProvider data representation.
     NSData *zipData = zipURL ? [NSData dataWithContentsOfURL:zipURL] : nil;
     if (zipData.length == 0) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法读取 Debug 日志压缩包。")];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Share") message:IOSMCPLocalizedString(@"Unable to read the debug log archive.")];
         return;
     }
 
@@ -726,27 +725,27 @@ static BOOL IOSMCPEnabledPreference(void) {
 - (void)clearDebugLogs:(PSSpecifier *)specifier {
     NSError *error = nil;
     if ([MCPLogger clearLogsWithError:&error]) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"已清空")
-                         message:IOSMCPLocalizedString(@"Debug 日志文件已清空。")];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Logs Cleared")
+                         message:IOSMCPLocalizedString(@"The debug log files have been cleared.")];
         [self refreshDebugLogFooter];
         return;
     }
 
-    [self showAlertWithTitle:IOSMCPLocalizedString(@"清空失败")
-                     message:error.localizedDescription ?: IOSMCPLocalizedString(@"无法清空 Debug 日志文件。")];
+    [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Clear Logs")
+                     message:error.localizedDescription ?: IOSMCPLocalizedString(@"Unable to clear the debug log files.")];
 }
 
 - (void)respringButtonTapped:(id)sender {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:IOSMCPLocalizedString(@"重启 SpringBoard")
-                                                                  message:IOSMCPLocalizedString(@"确定要重启 SpringBoard 吗？重启后需要重新解锁设备。")
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:IOSMCPLocalizedString(@"Restart SpringBoard")
+                                                                  message:IOSMCPLocalizedString(@"Restart SpringBoard? You will need to unlock the device again afterward.")
                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"取消") style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"重启") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"Respring") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
             NSString *killallPath = IOSMCPKillallPath();
             if (!killallPath.length) {
                 [MCPLogger log:@"prefs_respring failed reason=missing_killall"];
-                [self showAlertWithTitle:IOSMCPLocalizedString(@"重启失败") message:IOSMCPLocalizedString(@"未找到可执行的 killall。")];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Restart") message:IOSMCPLocalizedString(@"The killall executable could not be found.")];
                 return;
             }
 
@@ -760,8 +759,8 @@ static BOOL IOSMCPEnabledPreference(void) {
                                      NULL);
             if (status != 0) {
                 [MCPLogger log:@"prefs_respring failed status=%d error=%s", status, strerror(status)];
-                [self showAlertWithTitle:IOSMCPLocalizedString(@"重启失败")
-                                 message:[NSString stringWithFormat:IOSMCPLocalizedString(@"无法执行 killall：%s"), strerror(status)]];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"Unable to Restart")
+                                 message:[NSString stringWithFormat:IOSMCPLocalizedString(@"Unable to execute killall: %s"), strerror(status)]];
                 return;
             }
 
@@ -769,36 +768,6 @@ static BOOL IOSMCPEnabledPreference(void) {
         });
     }]];
     [self presentViewController:alert animated:YES completion:nil];
-}
-
-- (void)openAuthorPage:(PSSpecifier *)specifier {
-    NSURL *url = [NSURL URLWithString:@"https://mp.weixin.qq.com/s/WERMNPzW6WV5YGFthVqCRg"];
-    if (!url) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"打开失败") message:IOSMCPLocalizedString(@"链接无效。")];
-        return;
-    }
-
-    UIApplication *application = UIApplication.sharedApplication;
-    if ([application respondsToSelector:@selector(openURL:options:completionHandler:)]) {
-        [application openURL:url
-                     options:@{}
-           completionHandler:^(BOOL success) {
-            if (!success) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlertWithTitle:IOSMCPLocalizedString(@"打开失败") message:IOSMCPLocalizedString(@"无法打开作者页面。")];
-                });
-            }
-        }];
-        return;
-    }
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    BOOL opened = [application openURL:url];
-#pragma clang diagnostic pop
-    if (!opened) {
-        [self showAlertWithTitle:IOSMCPLocalizedString(@"打开失败") message:IOSMCPLocalizedString(@"无法打开作者页面。")];
-    }
 }
 
 - (void)refreshServerStatus {
@@ -814,12 +783,12 @@ static BOOL IOSMCPEnabledPreference(void) {
 
         self.serverRunning = running;
         NSString *stoppedText = (error.code == NSURLErrorTimedOut)
-            ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：端口 %u 无响应"), (unsigned int)port]
-            : [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：未运行（端口 %u）"), (unsigned int)port];
-        [self updateControlStatusText:running ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：运行中（端口 %u）"), (unsigned int)port]
+            ? [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: No response on port %u"), (unsigned int)port]
+            : [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: Stopped (port %u)"), (unsigned int)port];
+        [self updateControlStatusText:running ? [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: Running (port %u)"), (unsigned int)port]
                                              : stoppedText
-                              buttonTitle:running ? IOSMCPLocalizedString(@"关闭 iOS MCP") : IOSMCPLocalizedString(@"启动 iOS MCP")
-                            buttonEnabled:YES];
+                          buttonTitle:running ? IOSMCPLocalizedString(@"Stop iOS MCP") : IOSMCPLocalizedString(@"Start iOS MCP")
+                        buttonEnabled:YES];
         [self setServerControlBusyState:NO];
     }];
 }
@@ -872,12 +841,12 @@ static BOOL IOSMCPEnabledPreference(void) {
         self.serverStatusGeneration++;
         self.serverRunning = running;
         NSString *stoppedText = (error.code == NSURLErrorTimedOut)
-            ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：端口 %u 无响应"), (unsigned int)port]
-            : [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：未运行（端口 %u）"), (unsigned int)port];
-        [self updateControlStatusText:running ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：运行中（端口 %u）"), (unsigned int)port]
+            ? [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: No response on port %u"), (unsigned int)port]
+            : [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: Stopped (port %u)"), (unsigned int)port];
+        [self updateControlStatusText:running ? [NSString stringWithFormat:IOSMCPLocalizedString(@"Status: Running (port %u)"), (unsigned int)port]
                                              : stoppedText
-                              buttonTitle:running ? IOSMCPLocalizedString(@"关闭 iOS MCP") : IOSMCPLocalizedString(@"启动 iOS MCP")
-                            buttonEnabled:YES];
+                          buttonTitle:running ? IOSMCPLocalizedString(@"Stop iOS MCP") : IOSMCPLocalizedString(@"Start iOS MCP")
+                        buttonEnabled:YES];
         [self setServerControlBusyState:NO];
     }];
 }
@@ -896,8 +865,8 @@ static BOOL IOSMCPEnabledPreference(void) {
 
     NSUInteger generation = ++self.serverStatusGeneration;
     [self setServerControlBusyState:YES];
-    [self updateControlStatusText:[NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：正在切换到端口 %u..."), (unsigned int)newPort]
-                      buttonTitle:IOSMCPLocalizedString(@"正在切换...")
+    [self updateControlStatusText:[NSString stringWithFormat:IOSMCPLocalizedString(@"Status: Switching to port %u..."), (unsigned int)newPort]
+                      buttonTitle:IOSMCPLocalizedString(@"Switching...")
                     buttonEnabled:YES];
     // START is handled as a serialized restart in SpringBoard. Do not guess
     // when an asynchronous dispatch-source cancellation has closed the old fd.
@@ -1200,10 +1169,10 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 
     NSString *lastError = [MCPLogger lastLogError];
     NSString *footer = [NSString stringWithFormat:
-                        IOSMCPLocalizedString(@"开启后会把服务启动、HTTP 请求、MCP 工具调用、耗时和错误写入文件，便于排查问题。不会记录截图内容、UI 树完整内容、剪贴板、输入文本或请求 body。\n\n当前日志：%@\n上一份日志：%@%@"),
+                        IOSMCPLocalizedString(@"Log service startup, HTTP requests, MCP tool calls, timing, and errors to help troubleshoot issues. Screenshot contents, full UI trees, clipboard contents, typed text, and request bodies are not recorded.\n\nCurrent log: %@\nPrevious log: %@%@"),
                         [MCPLogger logFilePath],
                         [MCPLogger previousLogFilePath],
-                        lastError.length ? [NSString stringWithFormat:IOSMCPLocalizedString(@"\n最近写入错误：%@"), lastError] : @""];
+                        lastError.length ? [NSString stringWithFormat:IOSMCPLocalizedString(@"\nLast write error: %@"), lastError] : @""];
     [debugSpecifier setProperty:footer forKey:PSFooterTextGroupKey];
     [self reloadSpecifier:debugSpecifier animated:NO];
 }
@@ -1262,17 +1231,43 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 
 - (NSString *)codexPrompt {
     NSString *promptFormat = IOSMCPLocalizedString(@"MCP_PROMPT");
-    return [NSString stringWithFormat:
-            promptFormat,
-            IOSMCPServiceURLString(),
-            IOSMCPHealthURLString()];
+    NSString *basePrompt = [NSString stringWithFormat:
+                            promptFormat,
+                            IOSMCPServiceURLString(),
+                            IOSMCPHealthURLString()];
+    NSDictionary *net = IOSMCPNetworkInterfacesSummary();
+    uint16_t port = IOSMCPConfiguredPort();
+    NSString *wifiIp = [net[@"wifi_ipv4"] isKindOfClass:NSString.class] ? net[@"wifi_ipv4"] : @"";
+    NSString *cellIpv4 = [net[@"cellular_ipv4"] isKindOfClass:NSString.class] ? net[@"cellular_ipv4"] : @"";
+    NSString *cellIpv6 = [net[@"cellular_ipv6"] isKindOfClass:NSString.class] ? net[@"cellular_ipv6"] : @"";
+    NSString *vpnIp = [net[@"vpn_tailscale_ipv4"] isKindOfClass:NSString.class] ? net[@"vpn_tailscale_ipv4"] : @"";
+    NSString *bridgeHost = IOSMCPWanBridgeHost();
+    uint16_t bridgePort = IOSMCPWanBridgePort();
+
+    NSMutableString *extra = [NSMutableString stringWithString:@"\n\n[Wi-Fi + Cellular WAN Endpoints]"];
+    if (wifiIp.length > 0) {
+        [extra appendFormat:@"\n- Wi-Fi (en0): http://%@:%u/mcp", wifiIp, (unsigned int)port];
+    }
+    if (cellIpv4.length > 0) {
+        [extra appendFormat:@"\n- Cellular IPv4 (pdp_ip0): http://%@:%u/mcp", cellIpv4, (unsigned int)port];
+    }
+    if (cellIpv6.length > 0) {
+        [extra appendFormat:@"\n- Cellular IPv6 (pdp_ip0): http://[%@]:%u/mcp", cellIpv6, (unsigned int)port];
+    }
+    if (vpnIp.length > 0) {
+        [extra appendFormat:@"\n- Tailscale/VPN (utun): http://%@:%u/mcp", vpnIp, (unsigned int)port];
+    }
+    if (bridgeHost.length > 0 && IOSMCPWanBridgeEnabled()) {
+        [extra appendFormat:@"\n- Remote Home-PC Bridge (%@:%u -> PC Local): http://127.0.0.1:8090/mcp", bridgeHost, (unsigned int)bridgePort];
+    }
+    return [basePrompt stringByAppendingString:extra];
 }
 
 - (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
     UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title
                                                                              message:message
                                                                       preferredStyle:UIAlertControllerStyleAlert];
-    [alertController addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"确定")
+    [alertController addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"OK")
                                                         style:UIAlertActionStyleDefault
                                                       handler:nil]];
     [self presentViewController:alertController animated:YES completion:nil];

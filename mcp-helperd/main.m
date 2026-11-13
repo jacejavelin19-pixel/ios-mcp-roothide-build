@@ -575,11 +575,11 @@ int main(int argc, char *argv[]) {
         }
 
         if (argc > 1 && strcmp(argv[1], "--daemon") == 0) {
-            MCPKillPreviousHelperDaemon();
             return MCPSpawnDetachedDaemon(argv[0]);
         }
 
         setsid();
+        usleep(150000);
         MCPKillPreviousHelperDaemon();
 
         if (getuid() == 0 || geteuid() == 0) {

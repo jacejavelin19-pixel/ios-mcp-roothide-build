@@ -2,9 +2,9 @@
 
 > Auto-generated from `MCPServer.m` by `scripts/generate_tool_docs.py`. Do not edit by hand.
 
-- **Total Canonical Tools**: `193`
-- **Normalized `<subsystem>_<verb>` Aliases**: `129`
-- **Tier Breakdown**: `core` = `60` | `advanced` = `86` | `debug` = `47`
+- **Total Canonical Tools**: `194`
+- **Normalized `<subsystem>_<verb>` Aliases**: `130`
+- **Tier Breakdown**: `core` = `61` | `advanced` = `86` | `debug` = `47`
 
 | # | Canonical Tool Name | Tier | Normalized Alias(es) | Description |
 | :---: | :--- | :---: | :--- | :--- |
@@ -201,3 +201,4 @@
 | 191 | `net_status` | `advanced` | — | Return network capture injection status, log path, byte size, and entry count for a target app. |
 | 192 | `net_dump` | `advanced` | — | Retrieve captured HTTP/HTTPS requests for a target app with automatic sensitive header/token redaction and inline body folding. |
 | 193 | `probe_help` | `core` | — | Discover all ios-mcp tools grouped by tier ('core', 'advanced', 'debug'), view normalized <subsystem>_<verb> aliases, or search tools by keyword. |
+| 194 | `wan_cellular_controller` | `core` | `net_wan_cellular` | Inspect Wi-Fi (en0), Cellular Data (pdp_ip0..4 IPv4/IPv6), and Tailscale/VPN (utun*) interfaces; configure the outbound Cellular/Wi-Fi WAN Reverse Bridge to keep the iPhone reachable from a remote computer (e.g. phone on cellular data at school, computer at home); force-wake cellular radio via IP_BOUND_IF; or start/stop an outbound public HTTPS tunnel. |

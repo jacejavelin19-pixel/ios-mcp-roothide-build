@@ -10,9 +10,9 @@
 			<key>id</key>
 			<string>serviceControlGroup</string>
 			<key>label</key>
-			<string>服务控制</string>
+			<string>Service Controls</string>
 			<key>footerText</key>
-			<string>当前状态：检测中...</string>
+			<string>Status: Checking...</string>
 		</dict>
 		<dict>
 			<key>action</key>
@@ -24,7 +24,7 @@
 			<key>id</key>
 			<string>toggleServerButton</string>
 			<key>label</key>
-			<string>检测中...</string>
+			<string>Checking...</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -32,9 +32,9 @@
 			<key>id</key>
 			<string>httpPortGroup</string>
 			<key>label</key>
-			<string>HTTP 端口</string>
+			<string>HTTP Port</string>
 			<key>footerText</key>
-			<string>默认端口为 8090。端口范围：1024-65535。服务运行时修改端口会自动切换。</string>
+			<string>Default: 8090. Valid range: 1024–65535. Changing the port while the service is running switches it automatically.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -50,7 +50,7 @@
 			<key>key</key>
 			<string>port</string>
 			<key>label</key>
-			<string>端口</string>
+			<string>Port</string>
 			<key>placeholder</key>
 			<string>8090</string>
 		</dict>
@@ -58,11 +58,61 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>id</key>
+			<string>wanCellularGroup</string>
+			<key>label</key>
+			<string>Wi-Fi &amp; Cellular WAN Bridge</string>
+			<key>footerText</key>
+			<string>Listens simultaneously on Wi-Fi (en0), Cellular Data (pdp_ip0 IPv4/IPv6), and Tailscale/VPN (utun*). When a Home-PC address is configured, the device maintains a reverse bridge over Cellular or Wi-Fi so your PC can connect via 127.0.0.1:8090 from anywhere.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.witchan.ios-mcp.preferences</string>
+			<key>key</key>
+			<string>wanBridgeEnabled</string>
+			<key>label</key>
+			<string>Enable Remote WAN Bridge</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSEditTextCell</string>
+			<key>default</key>
+			<string></string>
+			<key>defaults</key>
+			<string>com.witchan.ios-mcp.preferences</string>
+			<key>id</key>
+			<string>wanBridgeHostField</string>
+			<key>key</key>
+			<string>wanBridgeHost</string>
+			<key>label</key>
+			<string>Home PC Host</string>
+			<key>placeholder</key>
+			<string>IP / DDNS / Tailscale:8091</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.witchan.ios-mcp.preferences</string>
+			<key>key</key>
+			<string>preferCellularWan</string>
+			<key>label</key>
+			<string>Prefer Cellular Data (pdp_ip0)</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>id</key>
 			<string>debugLogGroup</string>
 			<key>label</key>
-			<string>Debug 日志</string>
+			<string>Debug Logging</string>
 			<key>footerText</key>
-			<string>开启后会把服务启动、HTTP 请求、MCP 工具调用、耗时和错误写入文件，便于排查问题。</string>
+			<string>Log service startup, HTTP requests, MCP tool calls, timing, and errors to help troubleshoot issues.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -74,7 +124,7 @@
 			<key>key</key>
 			<string>debugLoggingEnabled</string>
 			<key>label</key>
-			<string>启用 Debug 日志</string>
+			<string>Enable Debug Logging</string>
 		</dict>
 		<dict>
 			<key>action</key>
@@ -82,7 +132,7 @@
 			<key>cell</key>
 			<string>PSButtonCell</string>
 			<key>label</key>
-			<string>分享 Debug 日志</string>
+			<string>Share Debug Logs</string>
 		</dict>
 		<dict>
 			<key>action</key>
@@ -90,7 +140,7 @@
 			<key>cell</key>
 			<string>PSButtonCell</string>
 			<key>label</key>
-			<string>清空 Debug 日志</string>
+			<string>Clear Debug Logs</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -98,9 +148,9 @@
 			<key>id</key>
 			<string>safetyGuardGroup</string>
 			<key>label</key>
-			<string>安全与脱敏 (Safety &amp; Redaction)</string>
+			<string>Safety &amp; Redaction</string>
 			<key>footerText</key>
-			<string>路径保护阻止写入系统只读目录与越界路径；写入审批开启后需二次确认 approval_id；日志/抓包脱敏自动隐藏敏感 Token。</string>
+			<string>Path Safety blocks writes to read-only system roots and traversal paths; Write Approval requires confirmation via approval_id; Redaction masks sensitive tokens in logs and network captures.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -112,7 +162,7 @@
 			<key>key</key>
 			<string>pathSafetyEnabled</string>
 			<key>label</key>
-			<string>写入路径保护 (Path Safety)</string>
+			<string>Write Path Safety</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -124,7 +174,7 @@
 			<key>key</key>
 			<string>requireWriteApproval</string>
 			<key>label</key>
-			<string>文件写入需二次审批 (Write Approval)</string>
+			<string>Require Write Approval</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -136,7 +186,7 @@
 			<key>key</key>
 			<string>redactSensitiveEnabled</string>
 			<key>label</key>
-			<string>抓包与日志敏感信息脱敏</string>
+			<string>Redact Sensitive Tokens</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -144,9 +194,9 @@
 			<key>id</key>
 			<string>codexPromptGroup</string>
 			<key>label</key>
-			<string>MCP 提示词片段</string>
+			<string>MCP Prompt Snippet</string>
 			<key>footerText</key>
-			<string>正在获取当前局域网地址...</string>
+			<string>Getting the local network address...</string>
 		</dict>
 		<dict>
 			<key>action</key>
@@ -154,37 +204,7 @@
 			<key>cell</key>
 			<string>PSButtonCell</string>
 			<key>label</key>
-			<string>复制并分享 MCP 提示词片段</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>label</key>
-			<string>公众号</string>
-			<key>footerText</key>
-			<string>查看我的信息、联系方式和公众号二维码，或者直接扫码关注。</string>
-		</dict>
-		<dict>
-			<key>action</key>
-			<string>openAuthorPage:</string>
-			<key>cell</key>
-			<string>PSButtonCell</string>
-			<key>label</key>
-			<string>关于作者</string>
-		</dict>
-		<dict>
-			<key>caption</key>
-			<string>微信扫码关注公众号</string>
-			<key>cell</key>
-			<string>PSStaticTextCell</string>
-			<key>cellClass</key>
-			<string>IOSMCPQRCodeCell</string>
-			<key>enabled</key>
-			<false/>
-			<key>height</key>
-			<integer>390</integer>
-			<key>qrImageName</key>
-			<string>wechat_qr.jpg</string>
+			<string>Copy / Share MCP Prompt</string>
 		</dict>
 	</array>
 	<key>title</key>

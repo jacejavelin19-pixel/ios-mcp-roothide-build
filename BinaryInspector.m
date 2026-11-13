@@ -1718,6 +1718,22 @@ static NSDictionary *MCPDecompileInstructionBuffer(const uint8_t *codeBytes,
     NSString *bundleId = [args[@"bundle_id"] isKindOfClass:[NSString class]] ? args[@"bundle_id"] : nil;
     NSString *action = [args[@"action"] isKindOfClass:[NSString class]] ? args[@"action"] : @"set";
 
+    uint64_t pidVal = 0;
+    MCPParseHexOrUint64(args[@"pid"], &pidVal);
+    pid_t pid = (pid_t)pidVal;
+    if (pid <= 0 && bundleId.length) {
+        pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
+    }
+    if (!bundleId.length && pid > 0) {
+        NSArray<NSDictionary *> *running = [[AppManager sharedInstance] listRunningApps];
+        for (NSDictionary *app in running) {
+            if ([app[@"pid"] intValue] == pid && [app[@"bundle_id"] isKindOfClass:[NSString class]]) {
+                bundleId = app[@"bundle_id"];
+                break;
+            }
+        }
+    }
+
     // Prefer in-process engine hardware breakpoint handler when engine session exists and use_engine != false
     if (bundleId.length && (!args[@"use_engine"] || [args[@"use_engine"] boolValue])) {
         NSString *engErr = nil;
@@ -1729,12 +1745,6 @@ static NSDictionary *MCPDecompileInstructionBuffer(const uint8_t *codeBytes,
         if (engRes) return engRes;
     }
 
-    uint64_t pidVal = 0;
-    MCPParseHexOrUint64(args[@"pid"], &pidVal);
-    pid_t pid = (pid_t)pidVal;
-    if (pid <= 0 && bundleId.length) {
-        pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
-    }
     if (pid <= 0) {
         if (error) *error = @"Provide a running 'bundle_id' or positive 'pid' for hardware_breakpoint_hook";
         return nil;
@@ -2061,22 +2071,36 @@ static NSArray<NSString *> *MCPExtractPrintableStrings(const uint8_t *bytes, siz
     NSMutableArray<NSString *> *urls = [NSMutableArray array];
     NSMutableSet<NSString *> *seenURLs = [NSMutableSet set];
 
+    static NSRegularExpression *urlRegex = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        urlRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:https?://|wss?://|package:)[^'\"\\s<>\\)\\];,]+"
+                                                             options:0
+                                                               error:nil];
+    });
+
     size_t i = 0;
     while (i < len && (strings.count < maxStrings || urls.count < 200)) {
         while (i < len && (bytes[i] < 0x20 || bytes[i] > 0x7E)) i++;
         size_t start = i;
         while (i < len && bytes[i] >= 0x20 && bytes[i] <= 0x7E) i++;
         size_t slen = i - start;
-        if (slen >= 6 && slen <= 512) {
-            NSString *s = [[NSString alloc] initWithBytes:bytes + start length:slen encoding:NSUTF8StringEncoding];
+        if (slen >= 6) {
+            size_t decodeLen = MIN(slen, (size_t)65536);
+            NSString *s = [[NSString alloc] initWithBytes:bytes + start length:decodeLen encoding:NSUTF8StringEncoding];
             if (!s.length) continue;
-            if (([s hasPrefix:@"https://"] || [s hasPrefix:@"http://"] || [s hasPrefix:@"wss://"] || [s hasPrefix:@"package:"]) &&
-                ![seenURLs containsObject:s] && urls.count < 200) {
-                [seenURLs addObject:s];
-                [urls addObject:s];
+            if (urls.count < 200 && ([s containsString:@"://"] || [s containsString:@"package:"])) {
+                NSArray<NSTextCheckingResult *> *matches = [urlRegex matchesInString:s options:0 range:NSMakeRange(0, s.length)];
+                for (NSTextCheckingResult *m in matches) {
+                    NSString *u = [s substringWithRange:m.range];
+                    if (u.length > 0 && ![seenURLs containsObject:u] && urls.count < 200) {
+                        [seenURLs addObject:u];
+                        [urls addObject:u];
+                    }
+                }
             }
             if (strings.count < maxStrings) {
-                [strings addObject:s];
+                [strings addObject:(s.length > 512 ? [s substringToIndex:512] : s)];
             }
         }
     }
@@ -2327,19 +2351,24 @@ static NSArray<NSString *> *MCPExtractPrintableStrings(const uint8_t *bytes, siz
     }
 
     NSString *resolved = MCPResolvedJailbreakPath(explicitPath);
+    if (![[NSFileManager defaultManager] fileExistsAtPath:resolved] && [[NSFileManager defaultManager] fileExistsAtPath:explicitPath]) {
+        resolved = explicitPath;
+    }
     NSData *bData = [NSData dataWithContentsOfFile:resolved options:NSDataReadingMappedIfSafe error:nil];
-    if (bData.length < 128) {
-        if (error) *error = [NSString stringWithFormat:@"Bundle too small or unreadable: %@", explicitPath];
+    if (!bData.length) {
+        if (error) *error = [NSString stringWithFormat:@"Bundle empty or unreadable: %@", explicitPath];
         return nil;
     }
 
     const uint8_t *b = (const uint8_t *)bData.bytes;
     const uint64_t kHermesMagic = 0x1F1903C103BC1FC6ULL;
-    if (*(const uint64_t *)b != kHermesMagic) {
+    BOOL isHermes = (bData.length >= 128 && *(const uint64_t *)b == kHermesMagic);
+    if (!isHermes) {
         NSArray<NSString *> *urls = nil;
         NSArray<NSString *> *strings = MCPExtractPrintableStrings(b, bData.length, maxStrings, &urls);
         return @{
             @"path": explicitPath,
+            @"resolved_path": resolved,
             @"format": @"javascript_source_bundle",
             @"decoded_with": @"builtin_utf8_scanner",
             @"size_bytes": @(bData.length),

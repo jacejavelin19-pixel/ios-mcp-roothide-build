@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
  * One-command host MCP configuration installer for ios-mcp.
- * Supports Claude Desktop, Claude Code, Codex, OpenCode, VS Code, and Antigravity.
+ * Supports Claude Desktop, Claude Code, Codex (.codex/config.toml & mcp.json),
+ * OpenCode, VS Code, and Antigravity (.gemini/config/mcp_config.json).
  *
  * Usage:
- *   node scripts/install-mcp-config.mjs --url http://127.0.0.1:18080/mcp --client all
+ *   node scripts/install-mcp-config.mjs --url http://127.0.0.1:8090/mcp --client all
  */
 
 import fs from "node:fs";
@@ -13,7 +14,7 @@ import path from "node:path";
 
 function parseArgs(argv) {
   const opts = {
-    url: process.env.IOS_MCP_URL || "http://127.0.0.1:18080/mcp",
+    url: process.env.IOS_MCP_URL || "http://127.0.0.1:8090/mcp",
     client: "all",
     name: "ios-mcp",
     dryRun: false,
@@ -47,18 +48,33 @@ function getClientPaths() {
       ? path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
       : path.join(home, ".config", "Claude", "claude_desktop_config.json"),
     "claude-code": path.join(home, ".claude.json"),
-    codex: path.join(home, ".codex", "mcp.json"),
+    codex: path.join(home, ".codex", "config.toml"),
     opencode: path.join(home, ".config", "opencode", "opencode.json"),
     vscode: isWin
       ? path.join(appData, "Code", "User", "mcp.json")
       : isMac
       ? path.join(home, "Library", "Application Support", "Code", "User", "mcp.json")
       : path.join(home, ".config", "Code", "User", "mcp.json"),
-    antigravity: path.join(home, ".gemini", "antigravity", "mcp_config.json"),
+    antigravity: path.join(home, ".gemini", "config", "mcp_config.json"),
   };
 }
 
-function updateJsonConfig(filePath, serverName, url, rootKey = "mcpServers", dryRun = false) {
+function updateTomlConfig(filePath, serverName, url, dryRun = false) {
+  let content = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  const sectionRegex = new RegExp(`(\\[mcp_servers\\.${serverName}\\][\\s\\S]*?url\\s*=\\s*)"[^"]*"`, "m");
+  if (sectionRegex.test(content)) {
+    content = content.replace(sectionRegex, `$1"${url}"`);
+  } else {
+    content += `\n[mcp_servers.${serverName}]\nurl = "${url}"\n`;
+  }
+  if (!dryRun) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content, "utf8");
+  }
+  return { clientFile: filePath, updated: !dryRun, entry: { url } };
+}
+
+function updateJsonConfig(filePath, target, serverName, url, dryRun = false) {
   let obj = {};
   if (fs.existsSync(filePath)) {
     try {
@@ -67,18 +83,40 @@ function updateJsonConfig(filePath, serverName, url, rootKey = "mcpServers", dry
       obj = {};
     }
   }
-  if (!obj[rootKey] || typeof obj[rootKey] !== "object") {
-    obj[rootKey] = {};
+  let entry;
+  if (target === "opencode") {
+    if (!obj.mcp || typeof obj.mcp !== "object") obj.mcp = {};
+    if (obj.mcp.servers && typeof obj.mcp.servers === "object") {
+      obj.mcp.servers[serverName] = { type: "remote", url, oauth: false };
+      entry = obj.mcp.servers[serverName];
+    } else {
+      obj.mcp[serverName] = { type: "remote", url, oauth: false };
+      entry = obj.mcp[serverName];
+    }
+  } else if (target === "claude" && process.platform === "win32") {
+    if (!obj.mcpServers || typeof obj.mcpServers !== "object") obj.mcpServers = {};
+    obj.mcpServers[serverName] = {
+      command: "C:\\Program Files\\nodejs\\node.exe",
+      args: [
+        "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js",
+        "-y",
+        "mcp-remote",
+        url,
+        "--allow-http",
+      ],
+    };
+    entry = obj.mcpServers[serverName];
+  } else {
+    const rootKey = target === "vscode" ? "servers" : "mcpServers";
+    if (!obj[rootKey] || typeof obj[rootKey] !== "object") obj[rootKey] = {};
+    obj[rootKey][serverName] = target === "antigravity" ? { url } : { type: "streamable-http", url };
+    entry = obj[rootKey][serverName];
   }
-  obj[rootKey][serverName] = {
-    type: "streamable-http",
-    url,
-  };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, JSON.stringify(obj, null, 2) + "\n", "utf8");
   }
-  return { clientFile: filePath, updated: !dryRun, entry: obj[rootKey][serverName] };
+  return { clientFile: filePath, updated: !dryRun, entry };
 }
 
 function main() {
@@ -93,14 +131,14 @@ function main() {
   for (const target of targets) {
     const filePath = paths[target];
     if (target === "all") continue;
-    const rootKey = target === "vscode" ? "servers" : "mcpServers";
     if (opts.client === "all" && !fs.existsSync(path.dirname(filePath)) && target !== "claude-code") {
       continue;
     }
-    results.push({
-      client: target,
-      ...updateJsonConfig(filePath, opts.name, opts.url, rootKey, opts.dryRun),
-    });
+    const res =
+      target === "codex"
+        ? updateTomlConfig(filePath, opts.name, opts.url, opts.dryRun)
+        : updateJsonConfig(filePath, target, opts.name, opts.url, opts.dryRun);
+    results.push({ client: target, ...res });
   }
   console.log(JSON.stringify({ ok: true, url: opts.url, results }, null, 2));
 }

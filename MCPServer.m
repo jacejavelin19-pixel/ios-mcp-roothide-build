@@ -35,7 +35,10 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#import <netdb.h>
+#import <net/if.h>
 #import <unistd.h>
+
 #import <fcntl.h>
 #import <errno.h>
 #import <math.h>
@@ -640,6 +643,7 @@ static NSDictionary<NSString *, NSString *> *MCPToolAliasMap(void) {
             @"net_decode_protobuf": @"decode_protobuf",
             @"net_replay_request": @"replay_request_native",
             @"net_tls_cloak": @"tls_ja3_ja4_http2_cloak",
+            @"net_wan_cellular": @"wan_cellular_controller",
             @"crypto_trace": @"trace_crypto_primitives",
             @"crypto_get_events": @"get_crypto_events",
             // Memory & Reverse Engineering
@@ -742,7 +746,8 @@ static NSString *MCPTierForToolName(NSString *toolName) {
             @"read_file_chunk", @"tail_file", @"write_file", @"hash_file",
             @"zip_download", @"search_files", @"get_plist_value", @"set_plist_value",
             @"query_sqlite", @"get_syslog", @"get_crash_logs", @"read_crash_log",
-            @"set_otp", @"human_pause", @"respring", @"device_reboot", @"probe_help"
+            @"set_otp", @"human_pause", @"respring", @"device_reboot", @"probe_help",
+            @"wan_cellular_controller"
         ]];
     });
     if ([coreSet containsObject:canonical]) {
@@ -873,7 +878,8 @@ static NSArray<NSString *> *MCPLockGuardAllowedTools(void) {
             @"human_touch_physics_and_stream",
             @"human_pause",
             @"background_immortality_governor",
-            @"appgroup_icloud_account_inspector"
+            @"appgroup_icloud_account_inspector",
+            @"wan_cellular_controller"
         ];
     });
     return tools;
@@ -1178,6 +1184,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (NSDictionary *)executeHumanTouchPhysicsAndStream:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeBackgroundImmortalityGovernor:(id)reqId args:(NSDictionary *)args;
 - (NSDictionary *)executeAppgroupIcloudAccountInspector:(id)reqId args:(NSDictionary *)args;
+- (NSDictionary *)executeWanCellularController:(id)reqId args:(NSDictionary *)args;
 - (NSString *)jsonTextForObject:(id)object;
 - (NSString *)jsonTextForDictionary:(NSDictionary *)dict;
 - (NSDictionary *)sanitizeFrontmostInfo:(NSDictionary *)info debug:(BOOL)debug;
@@ -1202,7 +1209,11 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (void)releaseLargeResponseSlot;
 - (NSString *)negotiatedProtocolVersion;
 - (void)setNegotiatedProtocolVersion:(NSString *)version;
+- (void)maintainWanBridgePool;
+- (void)spawnWanBridgeWorker;
 @end
+
+#define MCP_WAN_BRIDGE_POOL_SIZE 1
 
 @implementation MCPServer {
     uint16_t _port;
@@ -1223,6 +1234,15 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
     NSMutableDictionary<NSNumber *, NSNumber *> *_activeClients;
     NSString *_sessionId;
     NSString *_negotiatedProtocolVersion;
+    NSObject *_wanBridgeLock;
+    NSMutableSet<NSNumber *> *_wanBridgeIdleSockets;
+    NSInteger _wanBridgeConnectingCount;
+    NSInteger _wanBridgeActiveRequests;
+    NSString *_wanBridgeLastBoundInterface;
+    NSString *_wanBridgeLastError;
+    NSString *_wanBridgeLastTargetFingerprint;
+    NSTimeInterval _wanBridgeLastConnectedAt;
+    dispatch_source_t _wanBridgeTimer;
 }
 
 + (instancetype)sharedInstance {
@@ -1247,6 +1267,11 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
         _largeResponseSemaphore = dispatch_semaphore_create(MCP_MAX_CONCURRENT_LARGE_RESPONSES);
         _lifecycleState = MCPServerLifecycleStateStopped;
         _activeClients = [NSMutableDictionary dictionary];
+        _wanBridgeLock = [[NSObject alloc] init];
+        _wanBridgeIdleSockets = [NSMutableSet set];
+        _wanBridgeLastBoundInterface = @"";
+        _wanBridgeLastError = @"";
+        _wanBridgeLastTargetFingerprint = @"";
         NSString *sessFile = [MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work") stringByAppendingPathComponent:@".mcp_session_id"];
         NSString *savedSess = [[NSString stringWithContentsOfFile:sessFile encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (savedSess.length > 0) {
@@ -1256,6 +1281,19 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
             [savedSess ?: _sessionId writeToFile:sessFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
         _negotiatedProtocolVersion = MCP_PROTOCOL_VERSION_LATEST;
+
+        __weak typeof(self) weakSelf = self;
+        _wanBridgeTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        if (_wanBridgeTimer) {
+            dispatch_source_set_timer(_wanBridgeTimer,
+                                      dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                                      15 * NSEC_PER_SEC,
+                                      3 * NSEC_PER_SEC);
+            dispatch_source_set_event_handler(_wanBridgeTimer, ^{
+                [weakSelf maintainWanBridgePool];
+            });
+            dispatch_resume(_wanBridgeTimer);
+        }
     }
     return self;
 }
@@ -1360,14 +1398,71 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
     if (_lifecycleState != MCPServerLifecycleStateStopped) return;
     _lifecycleState = MCPServerLifecycleStateStarting;
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        int socketError = errno;
-        MCP_LOG(@"Failed to create socket: %s", strerror(socketError));
-        _lifecycleState = MCPServerLifecycleStateStopped;
-        [self scheduleStartRetryLockedOnPort:port error:socketError];
-        return;
+    int sock = -1;
+    int reuse = 1;
+    int keepalive = 1;
+    BOOL boundOk = NO;
+
+    // 1. Prefer dual-stack AF_INET6 with IPV6_V6ONLY=0 so a single listener
+    // accepts connections across Wi-Fi (en0), Cellular IPv4/IPv6 (pdp_ip0..4),
+    // Tailscale/WireGuard VPN (utun*), USB, and loopback.
+    sock = socket(AF_INET6, SOCK_STREAM, 0);
+    if (sock >= 0) {
+        int v6only = 0;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+
+        struct sockaddr_in6 addr6;
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_len = sizeof(addr6);
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons(port);
+        addr6.sin6_addr = in6addr_any;
+
+        if (bind(sock, (struct sockaddr *)&addr6, sizeof(addr6)) == 0) {
+            boundOk = YES;
+        } else {
+            close(sock);
+            sock = -1;
+        }
     }
+
+    // 2. Fallback to AF_INET (0.0.0.0) if dual-stack AF_INET6 bind failed.
+    if (!boundOk) {
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            int socketError = errno;
+            MCP_LOG(@"Failed to create socket: %s", strerror(socketError));
+            _lifecycleState = MCPServerLifecycleStateStopped;
+            [self scheduleStartRetryLockedOnPort:port error:socketError];
+            return;
+        }
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons(port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            int socketError = errno;
+            MCP_LOG(@"Failed to bind on port %d: %s", port, strerror(socketError));
+            close(sock);
+            _lifecycleState = MCPServerLifecycleStateStopped;
+            [self scheduleStartRetryLockedOnPort:port error:socketError];
+            return;
+        }
+    }
+
     if (!MCPSetCloseOnExec(sock)) {
         int socketError = errno;
         MCP_LOG(@"Failed to set close-on-exec on listener: %s", strerror(socketError));
@@ -1381,24 +1476,6 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
     if (socketFlags < 0 || fcntl(sock, F_SETFL, socketFlags | O_NONBLOCK) < 0) {
         int socketError = errno;
         MCP_LOG(@"Failed to make listener non-blocking: %s", strerror(socketError));
-        close(sock);
-        _lifecycleState = MCPServerLifecycleStateStopped;
-        [self scheduleStartRetryLockedOnPort:port error:socketError];
-        return;
-    }
-
-    int reuse = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        int socketError = errno;
-        MCP_LOG(@"Failed to bind on port %d: %s", port, strerror(socketError));
         close(sock);
         _lifecycleState = MCPServerLifecycleStateStopped;
         [self scheduleStartRetryLockedOnPort:port error:socketError];
@@ -1452,8 +1529,335 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
     _startRetryAttempt = 0;
 
     dispatch_resume(source);
-    MCP_LOG(@"MCP server started on port %d", port);
+    MCP_LOG(@"MCP server started on port %d (dual-stack Wi-Fi + Cellular)", port);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [self maintainWanBridgePool];
+    });
 }
+
+#pragma mark - Outbound Cellular/Wi-Fi WAN Reverse Bridge Pool
+
+static int MCPConnectOutboundSocket(NSString *host,
+                                    uint16_t port,
+                                    BOOL forceCellular,
+                                    NSString **outInterface,
+                                    NSString **outError) {
+    if (outInterface) *outInterface = @"default";
+    if (outError) *outError = nil;
+    if (!host.length || port == 0) {
+        if (outError) *outError = @"Missing bridge host or port";
+        return -1;
+    }
+
+    NSDictionary *netSummary = IOSMCPNetworkInterfacesSummary();
+    NSString *cellIf = [netSummary[@"cellular_interface"] isKindOfClass:[NSString class]] ? netSummary[@"cellular_interface"] : @"pdp_ip0";
+    unsigned int cellIfIdx = forceCellular ? if_nametoindex(cellIf.UTF8String) : 0;
+    if (forceCellular && cellIfIdx == 0) {
+        for (NSString *cand in @[@"pdp_ip0", @"pdp_ip1", @"pdp_ip2", @"pdp_ip3"]) {
+            cellIfIdx = if_nametoindex(cand.UTF8String);
+            if (cellIfIdx != 0) {
+                cellIf = cand;
+                break;
+            }
+        }
+    }
+
+    char portStr[16];
+    snprintf(portStr, sizeof(portStr), "%u", (unsigned int)port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host.UTF8String, portStr, &hints, &res);
+    if (gai != 0 || !res) {
+        if (outError) *outError = [NSString stringWithFormat:@"DNS resolve failed for %@: %s", host, gai_strerror(gai)];
+        return -1;
+    }
+
+    int connectedFd = -1;
+    NSString *lastErr = nil;
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        MCPSetCloseOnExec(fd);
+
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+
+        if (forceCellular && cellIfIdx != 0) {
+            if (ai->ai_family == AF_INET) {
+                setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &cellIfIdx, sizeof(cellIfIdx));
+            } else if (ai->ai_family == AF_INET6) {
+                setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &cellIfIdx, sizeof(cellIfIdx));
+            }
+            if (outInterface) *outInterface = cellIf;
+        }
+
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0 && errno != EINPROGRESS) {
+            lastErr = [NSString stringWithFormat:@"%s", strerror(errno)];
+            close(fd);
+            continue;
+        }
+        if (rc != 0) {
+            struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int prc = poll(&pfd, 1, 5000);
+            int soErr = 0;
+            socklen_t soLen = sizeof(soErr);
+            if (prc <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soLen) < 0 || soErr != 0) {
+                lastErr = [NSString stringWithFormat:@"connect timeout/error (%d)", soErr ?: errno];
+                close(fd);
+                continue;
+            }
+        }
+        if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        connectedFd = fd;
+        break;
+    }
+
+    freeaddrinfo(res);
+    if (connectedFd < 0 && outError) {
+        *outError = lastErr ?: @"Unable to connect to WAN bridge";
+    }
+    return connectedFd;
+}
+
+- (NSString *)currentWanTargetFingerprint {
+    NSString *host = IOSMCPWanBridgeHost();
+    if (!IOSMCPWanBridgeEnabled() || !host.length) {
+        return @"disabled";
+    }
+    NSDictionary *net = IOSMCPNetworkInterfacesSummary();
+    return [NSString stringWithFormat:@"%@:%u:cell=%d:wifi=%@:cell4=%@:cell6=%@",
+            host,
+            (unsigned int)IOSMCPWanBridgePort(),
+            IOSMCPPreferCellularWan() ? 1 : 0,
+            net[@"wifi_ipv4"] ?: @"",
+            net[@"cellular_ipv4"] ?: @"",
+            net[@"cellular_ipv6"] ?: @""];
+}
+
+- (void)handleNetworkOrWanConfigurationChange {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *newFp = [self currentWanTargetFingerprint];
+        NSMutableArray<NSNumber *> *toClose = [NSMutableArray array];
+        @synchronized (self->_wanBridgeLock) {
+            if ([newFp isEqualToString:self->_wanBridgeLastTargetFingerprint] && self->_wanBridgeIdleSockets.count > 0) {
+                return;
+            }
+            self->_wanBridgeLastTargetFingerprint = [newFp copy];
+            for (NSNumber *n in self->_wanBridgeIdleSockets) {
+                [toClose addObject:n];
+            }
+            [self->_wanBridgeIdleSockets removeAllObjects];
+        }
+        for (NSNumber *n in toClose) {
+            shutdown(n.intValue, SHUT_RDWR);
+        }
+        [self maintainWanBridgePool];
+    });
+}
+
+- (NSDictionary *)wanBridgeStatusSummary {
+    NSString *host = IOSMCPWanBridgeHost();
+    uint16_t port = IOSMCPWanBridgePort();
+    BOOL enabled = IOSMCPWanBridgeEnabled();
+    BOOL preferCell = IOSMCPPreferCellularWan();
+    NSString *statusFile = [MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work") stringByAppendingPathComponent:@"wan_status.json"];
+    NSDictionary *diskStatus = [NSDictionary dictionaryWithContentsOfFile:statusFile] ?: @{};
+    NSString *publicTunnelUrl = [diskStatus[@"public_tunnel_url"] isKindOfClass:[NSString class]] ? diskStatus[@"public_tunnel_url"] : @"";
+
+    NSUInteger idleCount = 0;
+    NSInteger connecting = 0;
+    NSInteger activeReqs = 0;
+    NSString *boundIf = @"";
+    NSString *lastErr = @"";
+    NSTimeInterval lastConn = 0;
+    @synchronized (_wanBridgeLock) {
+        idleCount = _wanBridgeIdleSockets.count;
+        connecting = _wanBridgeConnectingCount;
+        activeReqs = _wanBridgeActiveRequests;
+        boundIf = _wanBridgeLastBoundInterface ?: @"";
+        lastErr = _wanBridgeLastError ?: @"";
+        lastConn = _wanBridgeLastConnectedAt;
+    }
+
+    return @{
+        @"enabled": @(enabled),
+        @"configured": @(host.length > 0),
+        @"bridge_host": host ?: @"",
+        @"bridge_port": @(port),
+        @"prefer_cellular": @(preferCell),
+        @"connected": @(idleCount > 0 || activeReqs > 0),
+        @"idle_pool_connections": @(idleCount),
+        @"connecting_workers": @(connecting),
+        @"active_requests": @(activeReqs),
+        @"bound_interface": boundIf,
+        @"last_connected_at": @(lastConn),
+        @"last_error": lastErr,
+        @"public_tunnel_url": publicTunnelUrl
+    };
+}
+
+- (void)maintainWanBridgePool {
+    if (!self.isRunning || !IOSMCPWanBridgeEnabled()) return;
+    NSString *host = IOSMCPWanBridgeHost();
+    if (!host.length) return;
+
+    NSInteger toSpawn = 0;
+    @synchronized (_wanBridgeLock) {
+        NSInteger total = (NSInteger)_wanBridgeIdleSockets.count + _wanBridgeConnectingCount;
+        if (total < MCP_WAN_BRIDGE_POOL_SIZE) {
+            toSpawn = MCP_WAN_BRIDGE_POOL_SIZE - total;
+            _wanBridgeConnectingCount += toSpawn;
+        }
+    }
+
+    for (NSInteger i = 0; i < toSpawn; i++) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [self spawnWanBridgeWorker];
+        });
+    }
+}
+
+- (void)spawnWanBridgeWorker {
+    NSString *host = IOSMCPWanBridgeHost();
+    uint16_t bridgePort = IOSMCPWanBridgePort();
+    BOOL preferCellular = IOSMCPPreferCellularWan();
+    NSString *usedIf = nil;
+    NSString *connErr = nil;
+
+    int sock = MCPConnectOutboundSocket(host, bridgePort, preferCellular, &usedIf, &connErr);
+    if (sock < 0 && !preferCellular) {
+        // Automatic Cellular Failover: if default Wi-Fi route is blocked (e.g. school/corporate firewall),
+        // retry bound directly to pdp_ip0 (Cellular Data)!
+        NSDictionary *net = IOSMCPNetworkInterfacesSummary();
+        if ([net[@"cellular_ipv4"] length] > 0 || [net[@"cellular_ipv6"] length] > 0) {
+            sock = MCPConnectOutboundSocket(host, bridgePort, YES, &usedIf, &connErr);
+        }
+    }
+
+    if (sock < 0) {
+        @synchronized (_wanBridgeLock) {
+            if (_wanBridgeConnectingCount > 0) _wanBridgeConnectingCount--;
+            _wanBridgeLastError = connErr ?: @"connect failed";
+        }
+        return;
+    }
+
+    NSDictionary *net = IOSMCPNetworkInterfacesSummary();
+    NSDictionary *helloPayload = @{
+        @"version": MCP_SERVER_VERSION,
+        @"port": @(self.port ?: IOSMCPConfiguredPort()),
+        @"mode": net[@"active_connection_mode"] ?: @"unknown",
+        @"wifi_ipv4": net[@"wifi_ipv4"] ?: @"",
+        @"cellular_ipv4": net[@"cellular_ipv4"] ?: @"",
+        @"cellular_ipv6": net[@"cellular_ipv6"] ?: @"",
+        @"vpn_tailscale_ipv4": net[@"vpn_tailscale_ipv4"] ?: @"",
+        @"bound_interface": usedIf ?: @"default",
+        @"session_id": [self currentSessionId]
+    };
+    NSData *helloJson = [NSJSONSerialization dataWithJSONObject:helloPayload options:0 error:nil];
+    NSString *helloStr = [[NSString alloc] initWithData:helloJson encoding:NSUTF8StringEncoding] ?: @"{}";
+    NSString *helloLine = [NSString stringWithFormat:@"MCP-HELLO %@\n", helloStr];
+    NSData *helloBytes = [helloLine dataUsingEncoding:NSUTF8StringEncoding];
+    if (!MCPWriteAllToFD(sock, helloBytes.bytes, helloBytes.length)) {
+        close(sock);
+        @synchronized (_wanBridgeLock) {
+            if (_wanBridgeConnectingCount > 0) _wanBridgeConnectingCount--;
+            _wanBridgeLastError = @"handshake write failed";
+        }
+        return;
+    }
+
+    @synchronized (_wanBridgeLock) {
+        if (_wanBridgeConnectingCount > 0) _wanBridgeConnectingCount--;
+        [_wanBridgeIdleSockets addObject:@(sock)];
+        _wanBridgeLastBoundInterface = usedIf ?: @"default";
+        _wanBridgeLastError = @"";
+        _wanBridgeLastConnectedAt = [[NSDate date] timeIntervalSince1970];
+        _wanBridgeLastTargetFingerprint = [[self currentWanTargetFingerprint] copy];
+    }
+
+    // Wait for MCP-PING or MCP-REQ line (1-byte line reader prevents consuming any HTTP request bytes)
+    char lineBuf[256];
+    size_t lineLen = 0;
+    BOOL handoffToHttp = NO;
+
+    while (self.isRunning && IOSMCPWanBridgeEnabled() && IOSMCPWanBridgeHost().length > 0) {
+        struct pollfd pfd = {.fd = sock, .events = POLLIN, .revents = 0};
+        int prc = poll(&pfd, 1, 25000);
+        if (prc == 0) {
+            // 25s keepalive heartbeat to hold cellular CGNAT pinhole open
+            static const char kPing[] = "MCP-PING\n";
+            if (!MCPWriteAllToFD(sock, kPing, sizeof(kPing) - 1)) {
+                break;
+            }
+            continue;
+        }
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        char ch = 0;
+        ssize_t n = read(sock, &ch, 1);
+        if (n <= 0) break;
+        if (ch == '\n') {
+            lineBuf[lineLen] = '\0';
+            if (lineLen > 0 && lineBuf[lineLen - 1] == '\r') {
+                lineBuf[lineLen - 1] = '\0';
+            }
+            if (strncmp(lineBuf, "MCP-PING", 8) == 0) {
+                static const char kPong[] = "MCP-PONG\n";
+                if (!MCPWriteAllToFD(sock, kPong, sizeof(kPong) - 1)) break;
+                lineLen = 0;
+                continue;
+            } else if (strncmp(lineBuf, "MCP-PONG", 8) == 0) {
+                lineLen = 0;
+                continue;
+            } else if (strncmp(lineBuf, "MCP-REQ", 7) == 0) {
+                handoffToHttp = YES;
+                break;
+            }
+            lineLen = 0;
+        } else if (lineLen + 1 < sizeof(lineBuf)) {
+            lineBuf[lineLen++] = ch;
+        } else {
+            lineLen = 0;
+        }
+    }
+
+    @synchronized (_wanBridgeLock) {
+        [_wanBridgeIdleSockets removeObject:@(sock)];
+        if (handoffToHttp) {
+            _wanBridgeActiveRequests++;
+        }
+    }
+
+    // Immediately replenish the pool
+    [self maintainWanBridgePool];
+
+    if (handoffToHttp) {
+        @try {
+            MCPConfigureAcceptedSocket(sock);
+            [self handleClient:sock listenerPort:(self.port ?: IOSMCPConfiguredPort())];
+        } @finally {
+            @synchronized (_wanBridgeLock) {
+                if (_wanBridgeActiveRequests > 0) _wanBridgeActiveRequests--;
+            }
+            close(sock);
+        }
+    } else {
+        close(sock);
+    }
+}
+
 
 - (void)scheduleStartRetryLockedOnPort:(uint16_t)port error:(int)errorNumber {
     if (!_desiredRunning || _desiredPort != port ||
@@ -1824,7 +2228,9 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
             @"version": MCP_SERVER_VERSION,
             @"port": @(listenerPort),
             @"protocolVersion": [self negotiatedProtocolVersion],
-            @"supportedProtocolVersions": MCPSupportedProtocolVersions()
+            @"supportedProtocolVersions": MCPSupportedProtocolVersions(),
+            @"network": IOSMCPNetworkInterfacesSummary(),
+            @"wan_bridge": [self wanBridgeStatusSummary]
         };
         [self sendJSONResponse:clientSocket status:200 body:health requestLogId:nil];
     } else {
@@ -4853,6 +5259,22 @@ static NSString *MCPLogId(id reqId) {
                     @"include_schemas": @{@"type": @"boolean", @"description": @"Include full inputSchema for matching tools (default false)."}
                 }
             }
+        },
+        // Wi-Fi + Cellular WAN Reachability & Reverse Bridge Controller
+        @{
+            @"name": @"wan_cellular_controller",
+            @"description": @"Inspect Wi-Fi (en0), Cellular Data (pdp_ip0..4 IPv4/IPv6), and Tailscale/VPN (utun*) interfaces; configure the outbound Cellular/Wi-Fi WAN Reverse Bridge to keep the iPhone reachable from a remote computer (e.g. phone on cellular data at school, computer at home); force-wake cellular radio via IP_BOUND_IF; or start/stop an outbound public HTTPS tunnel.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"action": @{@"type": @"string", @"description": @"Operation: 'status' (default), 'configure_bridge', 'wake_cellular', 'start_public_tunnel', or 'stop_public_tunnel'."},
+                    @"enabled": @{@"type": @"boolean", @"description": @"Enable or disable the outbound WAN reverse bridge (for configure_bridge)."},
+                    @"bridge_host": @{@"type": @"string", @"description": @"Home computer public IP, DDNS hostname, or Tailscale IP (optionally host:port) for outbound reverse bridge."},
+                    @"bridge_port": @{@"type": @"number", @"description": @"Home computer reverse bridge TCP port (default 8091)."},
+                    @"prefer_cellular": @{@"type": @"boolean", @"description": @"Bind outbound bridge sockets directly to cellular data interface (pdp_ip0 via IP_BOUND_IF) even when Wi-Fi is connected."},
+                    @"provider": @{@"type": @"string", @"description": @"Tunnel provider for start_public_tunnel: 'auto', 'cloudflared', or 'ssh' (localhost.run)."}
+                }
+            }
         }
     ];
 
@@ -5233,6 +5655,8 @@ static NSString *MCPLogId(id reqId) {
         return [self executeSessionForceUnlock:reqId args:args];
     } else if ([toolName isEqualToString:@"session_respawn"]) {
         return [self executeSessionRespawn:reqId args:args];
+    } else if ([toolName isEqualToString:@"wan_cellular_controller"]) {
+        return [self executeWanCellularController:reqId args:args];
     } else if ([toolName isEqualToString:@"respring"]) {
         return [self executeRespring:reqId args:args];
     } else if ([toolName isEqualToString:@"device_reboot"]) {
@@ -6520,6 +6944,10 @@ static NSString *MCPLogId(id reqId) {
         // Uptime
         result[@"uptimeSeconds"] = @([NSProcessInfo processInfo].systemUptime);
 
+        // Wi-Fi + Cellular + VPN Network Interfaces & WAN Bridge Status
+        result[@"network"] = IOSMCPNetworkInterfacesSummary();
+        result[@"wanBridge"] = [self wanBridgeStatusSummary];
+
         info = [result copy];
     };
 
@@ -6978,16 +7406,20 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
         }
         [helperArgs addObjectsFromArray:@[@"write", pidText, addressText, encoded]];
     } else {
-        NSString *addressText = nil;
-        NSString *endText = nil;
-        NSString *encoded = nil;
-        NSString *plainText = nil;
-        if (!MCPStringFromArgs(args, @"address", NO, &addressText, &paramError) ||
-            !MCPStringFromArgs(args, @"end", NO, &endText, &paramError) ||
-            !MCPStringFromArgs(args, @"data", NO, &encoded, &paramError) ||
-            !MCPStringFromArgs(args, @"text", NO, &plainText, &paramError)) {
-            return [self mcpError:reqId code:-32602 message:paramError];
+        NSString *addressText = [args[@"address"] ?: (args[@"start"] ?: args[@"start_address"]) isKindOfClass:[NSString class]]
+            ? (args[@"address"] ?: (args[@"start"] ?: args[@"start_address"])) : nil;
+        if (!addressText && [args[@"address"] ?: (args[@"start"] ?: args[@"start_address"]) respondsToSelector:@selector(unsignedLongLongValue)]) {
+            addressText = [NSString stringWithFormat:@"0x%llx", [args[@"address"] ?: (args[@"start"] ?: args[@"start_address"]) unsignedLongLongValue]];
         }
+        NSString *endText = [args[@"end"] ?: args[@"end_address"] isKindOfClass:[NSString class]]
+            ? (args[@"end"] ?: args[@"end_address"]) : nil;
+        if (!endText && [args[@"end"] ?: args[@"end_address"] respondsToSelector:@selector(unsignedLongLongValue)]) {
+            endText = [NSString stringWithFormat:@"0x%llx", [args[@"end"] ?: args[@"end_address"] unsignedLongLongValue]];
+        }
+        NSString *encoded = [args[@"data"] ?: (args[@"data_base64"] ?: args[@"base64"]) isKindOfClass:[NSString class]]
+            ? (args[@"data"] ?: (args[@"data_base64"] ?: args[@"base64"])) : nil;
+        NSString *plainText = [args[@"text"] ?: args[@"pattern"] isKindOfClass:[NSString class]]
+            ? (args[@"text"] ?: args[@"pattern"]) : nil;
         if (!addressText.length) addressText = @"0x0";
         if (!endText.length) endText = @"0x7fffffffffff";
         uint64_t address = 0, end = 0;
@@ -7484,6 +7916,12 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
 }
 
 - (NSDictionary *)executeEngineTool:(NSString *)toolName reqId:(id)reqId args:(NSDictionary *)args {
+    if ([toolName isEqualToString:@"engine_decode_protobuf"]) {
+        NSString *err = nil;
+        NSDictionary *result = [[NetworkCaptureManager sharedInstance] decodeProtobufWithArgs:args error:&err];
+        if (!result) return [self mcpSuccess:reqId text:(err ?: @"engine_decode_protobuf failed") isError:YES];
+        return [self mcpSuccess:reqId structuredContent:result];
+    }
     NSString *bundleId = nil, *paramError = nil;
     if (!MCPStringFromArgs(args, @"bundle_id", YES, &bundleId, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
@@ -8500,6 +8938,13 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     NSString *err = nil;
     NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] sessionRespawnWithArgs:args error:&err];
     if (!result) return [self mcpSuccess:reqId text:(err ?: @"session_respawn failed") isError:YES];
+    return [self mcpSuccess:reqId structuredContent:result];
+}
+
+- (NSDictionary *)executeWanCellularController:(id)reqId args:(NSDictionary *)args {
+    NSString *err = nil;
+    NSDictionary *result = [[SystemCapabilitiesManager sharedInstance] wanCellularControllerWithArgs:args error:&err];
+    if (!result) return [self mcpSuccess:reqId text:(err ?: @"wan_cellular_controller failed") isError:YES];
     return [self mcpSuccess:reqId structuredContent:result];
 }
 

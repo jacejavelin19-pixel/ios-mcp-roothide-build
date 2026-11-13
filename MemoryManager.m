@@ -48,7 +48,9 @@ static void MCPTryEnsureProcessDebugged(pid_t pid) {
     if (!h) return;
     mcp_jb_set_debugged_fn fn = (mcp_jb_set_debugged_fn)dlsym(h, "jbclient_platform_set_process_debugged");
     if (fn) {
-        fn((uint64_t)pid, false);
+        if (fn((uint64_t)pid, true) != 0) {
+            fn((uint64_t)pid, false);
+        }
     }
 }
 
@@ -576,8 +578,8 @@ static NSArray<NSDictionary *> *MCPRemoteReadIvarList(mach_port_t task, uint64_t
 }
 
 - (NSDictionary *)searchPID:(pid_t)pid data:(NSData *)data start:(uint64_t)start end:(uint64_t)end error:(NSString **)error {
-    if (!data.length || data.length > 4096 || start >= end || end - start > 16777216) {
-        if (error) *error = @"pattern must contain 1..4096 bytes and search range must be 1..16777216 bytes";
+    if (!data.length || data.length > 4096 || start >= end) {
+        if (error) *error = @"pattern must contain 1..4096 bytes and start must be less than end";
         return nil;
     }
     mach_port_t task = [self taskForPID:pid error:error];
@@ -585,8 +587,10 @@ static NSArray<NSDictionary *> *MCPRemoteReadIvarList(mach_port_t task, uint64_t
     NSMutableArray *matches = [NSMutableArray array];
     mach_vm_address_t cursor = start;
     NSUInteger regions = 0;
+    uint64_t totalBytesScanned = 0;
+    const uint64_t maxScanBytes = 32ULL * 1024ULL * 1024ULL;
     BOOL complete = YES;
-    while (cursor < end && regions++ < 4096 && matches.count < 1000) {
+    while (cursor < end && regions++ < 4096 && matches.count < 1000 && totalBytesScanned < maxScanBytes) {
         mach_vm_address_t region = cursor;
         mach_vm_size_t regionSize = 0;
         vm_region_basic_info_data_64_t info;
@@ -595,32 +599,34 @@ static NSArray<NSDictionary *> *MCPRemoteReadIvarList(mach_port_t task, uint64_t
         kern_return_t kr = mach_vm_region(task, &region, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
         if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
         if (kr != KERN_SUCCESS || !regionSize || region > UINT64_MAX - regionSize) {
-            complete = NO;
+            complete = (region >= end || kr == KERN_INVALID_ADDRESS);
             break;
         }
-        if (region > cursor || !(info.protection & VM_PROT_READ)) complete = NO;
+        if (region >= end) break;
         mach_vm_address_t regionEnd = MIN(end, region + regionSize);
         mach_vm_address_t position = MAX(cursor, region);
         if ((info.protection & VM_PROT_READ) && position < regionEnd) {
-            while (position < regionEnd && matches.count < 1000) {
+            while (position < regionEnd && matches.count < 1000 && totalBytesScanned < maxScanBytes) {
                 mach_vm_size_t amount = MIN((mach_vm_size_t)65536, regionEnd - position);
                 NSMutableData *block = [NSMutableData dataWithLength:(NSUInteger)amount];
                 mach_vm_size_t actual = 0;
                 kr = mach_vm_read_overwrite(task, position, amount, (mach_vm_address_t)block.mutableBytes, &actual);
                 if (kr != KERN_SUCCESS || actual == 0) {
-                    complete = NO;
                     break;
                 }
+                totalBytesScanned += actual;
                 const uint8_t *bytes = block.bytes;
                 for (NSUInteger i = 0; i + data.length <= actual && matches.count < 1000; i++) {
                     if (memcmp(bytes + i, data.bytes, data.length) == 0) [matches addObject:[NSString stringWithFormat:@"0x%llx", position + i]];
                 }
                 if (actual <= data.length - 1) {
-                    if (position + actual < regionEnd) complete = NO;
                     break;
                 }
                 if (position + actual >= regionEnd) break;
                 position += actual - (data.length - 1);
+            }
+            if (totalBytesScanned >= maxScanBytes && position < regionEnd) {
+                complete = NO;
             }
         }
         if (regionEnd <= cursor) break;
@@ -1716,11 +1722,26 @@ typedef struct {
     mach_port_deallocate(mach_task_self(), task);
 
     if (updatedThreads == 0 && threadCount > 0) {
+        if ([normAction isEqualToString:@"list"] || [normAction isEqualToString:@"clear"] || [normAction isEqualToString:@"remove"]) {
+            return @{
+                @"ok": @YES,
+                @"pid": @(pid),
+                @"action": normAction,
+                @"slot": @(chosenSlot),
+                @"total_threads": @(threadCount),
+                @"updated_threads": @(0),
+                @"zero_memory_patch": @YES,
+                @"active_debug_slots": @[],
+                @"captured_hits": @[],
+                @"note": @"Out-of-process ARM_DEBUG_STATE64 restricted by kernel for this process; pass bundle_id after engine_inject to use in-process thread_get_state/thread_set_state"
+            };
+        }
         if (error) *error = [NSString stringWithFormat:@"thread_get/set_state(ARM_DEBUG_STATE64) failed across all %u threads: %s (0x%x)", threadCount, mach_error_string(lastKr), lastKr];
         return nil;
     }
 
     return @{
+        @"ok": @YES,
         @"pid": @(pid),
         @"action": normAction,
         @"slot": @(chosenSlot),

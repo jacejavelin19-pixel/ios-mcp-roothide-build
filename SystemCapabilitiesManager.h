@@ -83,4 +83,8 @@
 - (NSDictionary *)sessionRespawnWithArgs:(NSDictionary *)args
                                    error:(NSString **)error;
 
+- (NSDictionary *)wanCellularControllerWithArgs:(NSDictionary *)args
+                                          error:(NSString **)error;
+
 @end
+

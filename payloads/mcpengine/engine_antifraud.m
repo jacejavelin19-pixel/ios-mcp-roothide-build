@@ -541,7 +541,7 @@ static int hook_af_isatty(int fd) {
 }
 
 static pid_t hook_af_fork(void) {
-    if (atomic_load(&g_af_shield_active) && MEDepth == 0) {
+    if (atomic_load(&g_af_shield_active) || atomic_load(&g_af_kernel_cloak_active)) {
         errno = EPERM;
         return -1;
     }
@@ -674,8 +674,8 @@ static int hook_af_getifaddrs(struct ifaddrs **ifap) {
 }
 
 static Boolean hook_af_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags) {
-    Boolean ok = orig_af_SCNetworkReachabilityGetFlags ? orig_af_SCNetworkReachabilityGetFlags(target, flags) : TRUE;
-    if (ok && flags && atomic_load(&g_af_network_cloak_active) && MEDepth == 0) {
+    Boolean ok = (target != NULL && orig_af_SCNetworkReachabilityGetFlags) ? orig_af_SCNetworkReachabilityGetFlags(target, flags) : TRUE;
+    if (flags && (atomic_load(&g_af_network_cloak_active) || atomic_load(&g_af_shield_active)) && MEDepth == 0) {
         *flags &= ~(SCNetworkReachabilityFlags)kSCNetworkReachabilityFlagsTransientConnection;
         *flags |= (SCNetworkReachabilityFlags)kSCNetworkReachabilityFlagsReachable;
     }
@@ -1353,6 +1353,8 @@ static NSDictionary *MEAFAuditCheck(int index, NSString *category, NSString *nam
 }
 
 static NSDictionary *MEAFRun50PointAudit(void) {
+    int savedDepth = MEDepth;
+    MEDepth = 0;
     NSMutableArray<NSDictionary *> *checks = [NSMutableArray arrayWithCapacity:50];
     int checkId = 1;
 
@@ -1466,16 +1468,16 @@ static NSDictionary *MEAFRun50PointAudit(void) {
     // 32..37: Jailbreak URL Scheme Probe Filter
     NSArray<NSString *> *schemes = @[@"cydia://", @"sileo://", @"zbra://", @"filza://", @"roothide://", @"trollstore://"];
     for (NSString *sch in schemes) {
-        BOOL canOpen = swizzled_af_canOpenURL([UIApplication sharedApplication], @selector(canOpenURL:), [NSURL URLWithString:sch]);
+        BOOL canOpen = swizzled_af_canOpenURL(nil, @selector(canOpenURL:), [NSURL URLWithString:sch]);
         [checks addObject:MEAFAuditCheck(checkId++, @"url_scheme_cloak", [NSString stringWithFormat:@"canOpenURL(%@)", sch], !canOpen, @"NO")];
     }
 
     // 38..45: Hardware Identity, MobileGestalt, Timezone, Locale, Carrier & Battery Coherence
-    NSUUID *idfv = swizzled_af_idfv([UIDevice currentDevice], @selector(identifierForVendor));
+    NSUUID *idfv = swizzled_af_idfv(nil, @selector(identifierForVendor));
     [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"UIDevice.identifierForVendor valid", idfv != nil, idfv.UUIDString ?: @"")];
-    UIDeviceBatteryState bState = swizzled_af_batteryState([UIDevice currentDevice], @selector(batteryState));
+    UIDeviceBatteryState bState = swizzled_af_batteryState(nil, @selector(batteryState));
     [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"UIDevice.batteryState == Unplugged", bState == UIDeviceBatteryStateUnplugged, @"UIDeviceBatteryStateUnplugged")];
-    float bLevel = swizzled_af_batteryLevel([UIDevice currentDevice], @selector(batteryLevel));
+    float bLevel = swizzled_af_batteryLevel(nil, @selector(batteryLevel));
     [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"UIDevice.batteryLevel natural discharge", bLevel > 0.15f && bLevel < 0.99f, [NSString stringWithFormat:@"%.3f", bLevel])];
     NSTimeZone *tz = swizzled_af_localTimeZone([NSTimeZone class], @selector(localTimeZone));
     [checks addObject:MEAFAuditCheck(checkId++, @"persona_identity", @"NSTimeZone.localTimeZone coherent", tz.name.length > 0, tz.name ?: @"")];
@@ -1503,6 +1505,8 @@ static NSDictionary *MEAFRun50PointAudit(void) {
     NSArray *svcSites = MEAFScanDirectSyscalls(NO);
     [checks addObject:MEAFAuditCheck(checkId++, @"syscall_shield", @"Direct SVC #0x80 scanner & shield operational", YES, [NSString stringWithFormat:@"svc_sites=%lu", (unsigned long)svcSites.count])];
 
+    MEDepth = savedDepth;
+
     NSUInteger passedCount = 0;
     for (NSDictionary *c in checks) {
         if ([c[@"passed"] boolValue]) passedCount++;
@@ -1522,14 +1526,21 @@ static NSDictionary *MEAFRun50PointAudit(void) {
 
 static NSDictionary *MEAFEnableAllLayersWithPersona(NSDictionary *persona, BOOL scanSvcTraps) {
     MEAFInit();
-    if ([persona isKindOfClass:[NSDictionary class]] && persona.count > 0) {
-        @synchronized(g_af_lock) {
+    @synchronized(g_af_lock) {
+        if ([persona isKindOfClass:[NSDictionary class]] && persona.count > 0) {
             [g_af_persona addEntriesFromDictionary:persona];
-            if (!g_af_persona[@"birthtime_jitter_sec"]) {
-                uint32_t seed = [g_af_persona[@"canvas_seed"] unsignedIntValue] ?: 0x13572468u;
-                g_af_persona[@"birthtime_jitter_sec"] = @((int64_t)((seed % 86400) + 3600));
-                g_af_persona[@"birthtime_jitter_nsec"] = @((int64_t)((seed * 2654435761u) % 999999999u));
-            }
+        }
+        uint32_t seed = [g_af_persona[@"canvas_seed"] unsignedIntValue] ?: 0x13572468u;
+        if (!g_af_persona[@"birthtime_jitter_sec"]) {
+            g_af_persona[@"birthtime_jitter_sec"] = @((int64_t)((seed % 86400) + 3600));
+            g_af_persona[@"birthtime_jitter_nsec"] = @((int64_t)((seed * 2654435761u) % 999999999u));
+        }
+        if (!g_af_persona[@"fsid_0"]) {
+            g_af_persona[@"fsid_0"] = @((int32_t)(0x1A2B3C40u ^ seed));
+            g_af_persona[@"fsid_1"] = @((int32_t)(0x00010011u));
+        }
+        if (!g_af_persona[@"idfv"]) {
+            g_af_persona[@"idfv"] = [[NSUUID UUID] UUIDString];
         }
     }
     atomic_store(&g_af_shield_active, 1);

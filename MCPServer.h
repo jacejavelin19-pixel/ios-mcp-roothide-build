@@ -10,5 +10,8 @@
 - (void)startOnPort:(uint16_t)port;
 - (void)restartOnPort:(uint16_t)port;
 - (void)stop;
+- (void)handleNetworkOrWanConfigurationChange;
+- (NSDictionary *)wanBridgeStatusSummary;
 
 @end
+

@@ -4,6 +4,7 @@
 #import "IOSMCPPreferences.h"
 #import <CommonCrypto/CommonDigest.h>
 #import <sys/stat.h>
+#import <zlib.h>
 
 #define FS_LOG(fmt, ...) [MCPLogger log:@"[FileSystem] " fmt, ##__VA_ARGS__]
 
@@ -147,6 +148,15 @@ static NSString *FSModeOctal(mode_t mode) {
 
 #pragma mark - List directory
 
+static BOOL FSIsTmpRootPath(NSString *path) {
+    if (!path.length) return NO;
+    NSString *std = [path stringByStandardizingPath];
+    return [std isEqualToString:@"/var/tmp"] || [std hasPrefix:@"/var/tmp/"] ||
+           [std isEqualToString:@"/private/var/tmp"] || [std hasPrefix:@"/private/var/tmp/"] ||
+           [std isEqualToString:@"/tmp"] || [std hasPrefix:@"/tmp/"] ||
+           [std isEqualToString:@"/private/tmp"] || [std hasPrefix:@"/private/tmp/"];
+}
+
 - (NSDictionary *)listDirectoryAtPath:(NSString *)path error:(NSString **)error {
     if (error) *error = nil;
     if (path.length == 0) {
@@ -159,17 +169,43 @@ static NSString *FSModeOctal(mode_t mode) {
 
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:resolved isDirectory:&isDir]) {
-        if (error) *error = [NSString stringWithFormat:@"No such file or directory: %@", path];
-        return nil;
+        if ([fm fileExistsAtPath:path isDirectory:&isDir]) {
+            resolved = path;
+        } else {
+            if (error) *error = [NSString stringWithFormat:@"No such file or directory: %@", path];
+            return nil;
+        }
     }
     if (!isDir) {
         if (error) *error = @"path is not a directory; use read_file";
         return nil;
     }
 
+    NSMutableOrderedSet<NSString *> *mergedNames = [NSMutableOrderedSet orderedSet];
+    NSMutableDictionary<NSString *, NSString *> *nameToDir = [NSMutableDictionary dictionary];
+
     NSError *listError = nil;
-    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:resolved error:&listError];
-    if (!names) {
+    NSArray<NSString *> *primaryNames = [fm contentsOfDirectoryAtPath:resolved error:&listError];
+    if (primaryNames) {
+        for (NSString *n in primaryNames) {
+            [mergedNames addObject:n];
+            nameToDir[n] = resolved;
+        }
+    }
+    if (FSIsTmpRootPath(path) && ![resolved isEqualToString:path]) {
+        BOOL rawIsDir = NO;
+        if ([fm fileExistsAtPath:path isDirectory:&rawIsDir] && rawIsDir) {
+            NSArray<NSString *> *rawNames = [fm contentsOfDirectoryAtPath:path error:nil];
+            for (NSString *n in rawNames) {
+                if (![mergedNames containsObject:n]) {
+                    [mergedNames addObject:n];
+                    nameToDir[n] = path;
+                }
+            }
+        }
+    }
+
+    if (!primaryNames && mergedNames.count == 0) {
         if (error) *error = [NSString stringWithFormat:@"Cannot list directory: %@",
                              listError.localizedDescription ?: @"permission denied"];
         FS_LOG(@"list failed path=%@ err=%@", path, listError.localizedDescription ?: @"-");
@@ -177,8 +213,10 @@ static NSString *FSModeOctal(mode_t mode) {
     }
 
     NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
-    for (NSString *name in [names sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
-        NSString *child = [resolved stringByAppendingPathComponent:name];
+    NSArray<NSString *> *sortedNames = [[mergedNames array] sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+    for (NSString *name in sortedNames) {
+        NSString *parentDir = nameToDir[name] ?: resolved;
+        NSString *child = [parentDir stringByAppendingPathComponent:name];
         struct stat st;
         NSMutableDictionary *entry = [@{@"name": name} mutableCopy];
         if (lstat(child.fileSystemRepresentation, &st) == 0) {
@@ -537,6 +575,159 @@ static NSString *FSModeOctal(mode_t mode) {
     };
 }
 
+static void FSAppendLE16(NSMutableData *buf, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF) };
+    [buf appendBytes:b length:2];
+}
+
+static void FSAppendLE32(NSMutableData *buf, uint32_t v) {
+    uint8_t b[4] = {
+        (uint8_t)(v & 0xFF),
+        (uint8_t)((v >> 8) & 0xFF),
+        (uint8_t)((v >> 16) & 0xFF),
+        (uint8_t)((v >> 24) & 0xFF)
+    };
+    [buf appendBytes:b length:4];
+}
+
+static BOOL FSCreateNativeZipArchive(NSString *sourcePath, NSString *zipPath) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:sourcePath isDirectory:&isDir]) return NO;
+
+    NSMutableArray<NSDictionary *> *filesToPack = [NSMutableArray array];
+    if (!isDir) {
+        [filesToPack addObject:@{
+            @"rel": [sourcePath lastPathComponent] ?: @"file",
+            @"full": sourcePath
+        }];
+    } else {
+        NSString *rootName = [sourcePath lastPathComponent] ?: @"archive";
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:sourcePath];
+        NSString *rel = nil;
+        while ((rel = [en nextObject])) {
+            NSString *full = [sourcePath stringByAppendingPathComponent:rel];
+            BOOL childDir = NO;
+            if ([fm fileExistsAtPath:full isDirectory:&childDir] && !childDir) {
+                [filesToPack addObject:@{
+                    @"rel": [rootName stringByAppendingPathComponent:rel],
+                    @"full": full
+                }];
+            }
+        }
+    }
+
+    NSMutableData *zipData = [NSMutableData data];
+    NSMutableData *centralDir = [NSMutableData data];
+    uint16_t entryCount = 0;
+
+    for (NSDictionary *item in filesToPack) {
+        if (entryCount == 0xFFFF) break;
+        NSString *relPath = item[@"rel"];
+        NSString *fullPath = item[@"full"];
+        NSData *rawData = [NSData dataWithContentsOfFile:fullPath options:NSDataReadingMappedIfSafe error:NULL];
+        if (!rawData) continue;
+        NSData *nameData = [relPath dataUsingEncoding:NSUTF8StringEncoding];
+        if (!nameData.length || nameData.length > 0xFFFF) continue;
+
+        uLong crc = crc32(0L, Z_NULL, 0);
+        if (rawData.length > 0) {
+            crc = crc32(crc, (const Bytef *)rawData.bytes, (uInt)rawData.length);
+        }
+        uint32_t uncompSize = (uint32_t)rawData.length;
+        uint32_t localHeaderOffset = (uint32_t)zipData.length;
+
+        // Local file header (STORE method = 0)
+        FSAppendLE32(zipData, 0x04034b50u);
+        FSAppendLE16(zipData, 20);
+        FSAppendLE16(zipData, 0);
+        FSAppendLE16(zipData, 0);
+        FSAppendLE16(zipData, 0);
+        FSAppendLE16(zipData, 0);
+        FSAppendLE32(zipData, (uint32_t)crc);
+        FSAppendLE32(zipData, uncompSize);
+        FSAppendLE32(zipData, uncompSize);
+        FSAppendLE16(zipData, (uint16_t)nameData.length);
+        FSAppendLE16(zipData, 0);
+        [zipData appendData:nameData];
+        [zipData appendData:rawData];
+
+        // Central directory header
+        FSAppendLE32(centralDir, 0x02014b50u);
+        FSAppendLE16(centralDir, 20);
+        FSAppendLE16(centralDir, 20);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE32(centralDir, (uint32_t)crc);
+        FSAppendLE32(centralDir, uncompSize);
+        FSAppendLE32(centralDir, uncompSize);
+        FSAppendLE16(centralDir, (uint16_t)nameData.length);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE16(centralDir, 0);
+        FSAppendLE32(centralDir, 0);
+        FSAppendLE32(centralDir, localHeaderOffset);
+        [centralDir appendData:nameData];
+
+        entryCount++;
+    }
+
+    uint32_t cdOffset = (uint32_t)zipData.length;
+    uint32_t cdSize = (uint32_t)centralDir.length;
+    [zipData appendData:centralDir];
+
+    // End of central directory record
+    FSAppendLE32(zipData, 0x06054b50u);
+    FSAppendLE16(zipData, 0);
+    FSAppendLE16(zipData, 0);
+    FSAppendLE16(zipData, entryCount);
+    FSAppendLE16(zipData, entryCount);
+    FSAppendLE32(zipData, cdSize);
+    FSAppendLE32(zipData, cdOffset);
+    FSAppendLE16(zipData, 0);
+
+    return [zipData writeToFile:zipPath atomically:YES];
+}
+
+static NSRegularExpression *FSCompileGlobOrRegex(NSString *pattern) {
+    if (!pattern.length) return nil;
+    // If pattern looks like a shell glob (e.g. "*.ips", "*.plist", "*crash*") where '*' or '?' is used as wildcard
+    BOOL isGlob = ([pattern hasPrefix:@"*"] || [pattern hasPrefix:@"?"]);
+    if (!isGlob && ([pattern containsString:@"*"] || [pattern containsString:@"?"])) {
+        if (![pattern containsString:@".*"] && ![pattern containsString:@".+"] &&
+            ![pattern containsString:@"["] && ![pattern containsString:@"("] &&
+            ![pattern containsString:@"^"] && ![pattern containsString:@"$"]) {
+            isGlob = YES;
+        }
+    }
+    if (isGlob) {
+        NSMutableString *rx = [NSMutableString stringWithString:@"^"];
+        for (NSUInteger i = 0; i < pattern.length; i++) {
+            unichar ch = [pattern characterAtIndex:i];
+            if (ch == '*') {
+                [rx appendString:@".*"];
+            } else if (ch == '?') {
+                [rx appendString:@"."];
+            } else if (strchr(".+^$()[]{}|\\", (int)ch) != NULL) {
+                [rx appendFormat:@"\\%C", ch];
+            } else {
+                [rx appendFormat:@"%C", ch];
+            }
+        }
+        [rx appendString:@"$"];
+        NSRegularExpression *globRe = [NSRegularExpression regularExpressionWithPattern:rx
+                                                                                options:NSRegularExpressionCaseInsensitive
+                                                                                  error:NULL];
+        if (globRe) return globRe;
+    }
+    return [NSRegularExpression regularExpressionWithPattern:pattern
+                                                     options:NSRegularExpressionCaseInsensitive
+                                                       error:NULL];
+}
+
 - (NSDictionary *)zipDirectoryAtPath:(NSString *)path
                           outputPath:(NSString *)outputPath
                                error:(NSString **)error {
@@ -548,8 +739,12 @@ static NSString *FSModeOctal(mode_t mode) {
     NSString *resolved = FSResolvePath(path);
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:resolved]) {
-        if (error) *error = [NSString stringWithFormat:@"Path not found: %@", path];
-        return nil;
+        if ([fm fileExistsAtPath:path]) {
+            resolved = path;
+        } else {
+            if (error) *error = [NSString stringWithFormat:@"Path not found: %@", path];
+            return nil;
+        }
     }
 
     NSString *archivePath = outputPath.length ? FSResolvePath(outputPath) : nil;
@@ -558,7 +753,11 @@ static NSString *FSModeOctal(mode_t mode) {
         [fm createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:NULL];
         NSString *baseName = [[resolved lastPathComponent] stringByReplacingOccurrencesOfString:@" " withString:@"_"];
         if (!baseName.length) baseName = @"archive";
-        archivePath = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%lld.tar.gz", baseName, (long long)[[NSDate date] timeIntervalSince1970]]];
+        archivePath = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%lld.zip", baseName, (long long)[[NSDate date] timeIntervalSince1970]]];
+    }
+    NSString *archiveParent = [archivePath stringByDeletingLastPathComponent];
+    if (archiveParent.length) {
+        [fm createDirectoryAtPath:archiveParent withIntermediateDirectories:YES attributes:nil error:NULL];
     }
     [fm removeItemAtPath:archivePath error:NULL];
 
@@ -566,17 +765,23 @@ static NSString *FSModeOctal(mode_t mode) {
     NSString *targetName = [resolved lastPathComponent];
     int status = -1;
     NSString *out = nil;
-    if ([archivePath hasSuffix:@".zip"]) {
-        out = MCPReadCommandOutput(@[@"zip", @"-r", @"-q", archivePath, resolved], 60.0, &status);
-    }
-    if (status != 0 || ![fm fileExistsAtPath:archivePath]) {
-        if (![archivePath hasSuffix:@".tar.gz"] && ![archivePath hasSuffix:@".tgz"]) {
-            archivePath = [archivePath stringByAppendingString:@".tar.gz"];
-        }
+    if ([archivePath hasSuffix:@".tar.gz"] || [archivePath hasSuffix:@".tgz"]) {
         out = MCPReadCommandOutput(@[@"tar", @"-czf", archivePath, @"-C", parentDir, targetName], 60.0, &status);
+    } else {
+        if (!FSCreateNativeZipArchive(resolved, archivePath)) {
+            out = MCPReadCommandOutput(@[@"zip", @"-r", @"-q", archivePath, resolved], 60.0, &status);
+        } else {
+            status = 0;
+        }
     }
     if (![fm fileExistsAtPath:archivePath]) {
-        if (error) *error = [NSString stringWithFormat:@"Failed to create archive: %@", out ?: @"zip/tar unavailable"];
+        // Fallback to native zip if tar failed
+        if (FSCreateNativeZipArchive(resolved, archivePath)) {
+            status = 0;
+        }
+    }
+    if (![fm fileExistsAtPath:archivePath]) {
+        if (error) *error = [NSString stringWithFormat:@"Failed to create archive: %@", out ?: @"archive write failed"];
         return nil;
     }
 
@@ -610,61 +815,73 @@ static NSString *FSModeOctal(mode_t mode) {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:resolved isDirectory:&isDir] || !isDir) {
-        if (error) *error = [NSString stringWithFormat:@"Directory not found: %@", path];
-        return nil;
+        if ([fm fileExistsAtPath:path isDirectory:&isDir] && isDir) {
+            resolved = path;
+        } else {
+            if (error) *error = [NSString stringWithFormat:@"Directory not found: %@", path];
+            return nil;
+        }
     }
 
-    NSRegularExpression *nameRegex = nil;
-    if (pattern.length) {
-        nameRegex = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:NULL];
-    }
-    NSRegularExpression *contentRegex = nil;
-    if (contentPattern.length) {
-        contentRegex = [NSRegularExpression regularExpressionWithPattern:contentPattern options:NSRegularExpressionCaseInsensitive error:NULL];
+    NSRegularExpression *nameRegex = FSCompileGlobOrRegex(pattern);
+    NSRegularExpression *contentRegex = FSCompileGlobOrRegex(contentPattern);
+
+    NSMutableArray<NSString *> *rootsToSearch = [NSMutableArray arrayWithObject:resolved];
+    if (FSIsTmpRootPath(path) && ![resolved isEqualToString:path]) {
+        BOOL rawIsDir = NO;
+        if ([fm fileExistsAtPath:path isDirectory:&rawIsDir] && rawIsDir) {
+            [rootsToSearch addObject:path];
+        }
     }
 
     NSMutableArray<NSDictionary *> *matches = [NSMutableArray array];
-    NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:resolved];
-    NSString *rel = nil;
-    while ((rel = [enumerator nextObject]) && matches.count < maxResults) {
-        @autoreleasepool {
-            NSUInteger depth = [[rel pathComponents] count];
-            if (depth > maxDepth) {
-                [enumerator skipDescendants];
-                continue;
-            }
-            NSString *fileName = [rel lastPathComponent];
-            if (pattern.length) {
-                BOOL nameMatch = nameRegex
-                    ? ([nameRegex firstMatchInString:fileName options:0 range:NSMakeRange(0, fileName.length)] != nil)
-                    : ([fileName rangeOfString:pattern options:NSCaseInsensitiveSearch].location != NSNotFound);
-                if (!nameMatch) continue;
-            }
+    NSMutableSet<NSString *> *seenRelPaths = [NSMutableSet set];
 
-            NSString *fullPath = [resolved stringByAppendingPathComponent:rel];
-            NSDictionary *attrs = [enumerator fileAttributes];
-            NSString *fileType = attrs[NSFileType];
-            BOOL isRegular = [fileType isEqualToString:NSFileTypeRegular];
+    for (NSString *searchRoot in rootsToSearch) {
+        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:searchRoot];
+        NSString *rel = nil;
+        while ((rel = [enumerator nextObject]) && matches.count < maxResults) {
+            @autoreleasepool {
+                if ([seenRelPaths containsObject:rel]) continue;
+                NSUInteger depth = [[rel pathComponents] count];
+                if (depth > maxDepth) {
+                    [enumerator skipDescendants];
+                    continue;
+                }
+                NSString *fileName = [rel lastPathComponent];
+                if (pattern.length) {
+                    BOOL nameMatch = nameRegex
+                        ? ([nameRegex firstMatchInString:fileName options:0 range:NSMakeRange(0, fileName.length)] != nil)
+                        : ([fileName rangeOfString:pattern options:NSCaseInsensitiveSearch].location != NSNotFound);
+                    if (!nameMatch) continue;
+                }
 
-            if (contentPattern.length) {
-                if (!isRegular || [attrs[NSFileSize] unsignedLongLongValue] > 2 * 1024 * 1024) continue;
-                NSData *d = [NSData dataWithContentsOfFile:fullPath options:NSDataReadingMappedIfSafe error:NULL];
-                if (!d.length) continue;
-                NSString *txt = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-                if (!txt) continue;
-                BOOL textMatch = contentRegex
-                    ? ([contentRegex firstMatchInString:txt options:0 range:NSMakeRange(0, txt.length)] != nil)
-                    : ([txt rangeOfString:contentPattern options:NSCaseInsensitiveSearch].location != NSNotFound);
-                if (!textMatch) continue;
+                NSString *fullPath = [searchRoot stringByAppendingPathComponent:rel];
+                NSDictionary *attrs = [enumerator fileAttributes];
+                NSString *fileType = attrs[NSFileType];
+                BOOL isRegular = [fileType isEqualToString:NSFileTypeRegular];
+
+                if (contentPattern.length) {
+                    if (!isRegular || [attrs[NSFileSize] unsignedLongLongValue] > 2 * 1024 * 1024) continue;
+                    NSData *d = [NSData dataWithContentsOfFile:fullPath options:NSDataReadingMappedIfSafe error:NULL];
+                    if (!d.length) continue;
+                    NSString *txt = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+                    if (!txt) continue;
+                    BOOL textMatch = contentRegex
+                        ? ([contentRegex firstMatchInString:txt options:0 range:NSMakeRange(0, txt.length)] != nil)
+                        : ([txt rangeOfString:contentPattern options:NSCaseInsensitiveSearch].location != NSNotFound);
+                    if (!textMatch) continue;
+                }
+
+                [seenRelPaths addObject:rel];
+                [matches addObject:@{
+                    @"relative_path": rel,
+                    @"path": fullPath,
+                    @"type": [fileType isEqualToString:NSFileTypeDirectory] ? @"directory" : (isRegular ? @"file" : @"other"),
+                    @"size": attrs[NSFileSize] ?: @0,
+                    @"mtime": @([attrs[NSFileModificationDate] timeIntervalSince1970])
+                }];
             }
-
-            [matches addObject:@{
-                @"relative_path": rel,
-                @"path": fullPath,
-                @"type": [fileType isEqualToString:NSFileTypeDirectory] ? @"directory" : (isRegular ? @"file" : @"other"),
-                @"size": attrs[NSFileSize] ?: @0,
-                @"mtime": @([attrs[NSFileModificationDate] timeIntervalSince1970])
-            }];
         }
     }
 

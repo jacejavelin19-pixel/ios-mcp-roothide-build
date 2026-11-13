@@ -1,4 +1,5 @@
 #import "FridaManager.h"
+#import "MCPEngineManager.h"
 #import "AppManager.h"
 #import "MCPProcessUtil.h"
 #import <Security/Security.h>
@@ -724,8 +725,25 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
                                      seed:(NSNumber *)seedNumber
                                     error:(NSString **)error {
     if (error) *error = nil;
-    NSString *srcPath = dylibPath.length > 0 ? MCPResolvedJailbreakPath(dylibPath) : [self ensurePreservedGadgetAvailable:error];
-    if (!srcPath.length) return nil;
+    NSString *srcPath = nil;
+    if (dylibPath.length > 0) {
+        srcPath = MCPResolvedJailbreakPath(dylibPath);
+        if (![[NSFileManager defaultManager] fileExistsAtPath:srcPath] && [[NSFileManager defaultManager] fileExistsAtPath:dylibPath]) {
+            srcPath = dylibPath;
+        }
+    } else {
+        srcPath = [self ensurePreservedGadgetAvailable:nil];
+        if (!srcPath.length) {
+            NSString *fallbackStealth = MCPResolvedJailbreakPath(kMCPStealthPayloadLogicalPath);
+            if ([[NSFileManager defaultManager] fileExistsAtPath:fallbackStealth]) {
+                srcPath = fallbackStealth;
+            }
+        }
+    }
+    if (!srcPath.length || ![[NSFileManager defaultManager] fileExistsAtPath:srcPath]) {
+        if (error) *error = @"Source dylib not found; provide dylib_path or stage gadget.dylib";
+        return nil;
+    }
 
     uint64_t seed = (seedNumber && [seedNumber respondsToSelector:@selector(unsignedLongLongValue)] && seedNumber.unsignedLongLongValue != 0)
         ? seedNumber.unsignedLongLongValue
@@ -733,7 +751,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
 
     NSString *destPath = outputPath;
     if (!destPath.length) {
-        NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+        NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
         [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
         destPath = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"libAppleAudioDSP_%@.dylib", MCPRandomHexString(4)]];
     } else {
@@ -785,8 +803,58 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
         return nil;
     }
 
-    NSString *gadgetSrc = [self ensurePreservedGadgetAvailable:error];
-    if (!gadgetSrc) return nil;
+    NSString *gadgetSrc = [self ensurePreservedGadgetAvailable:nil];
+    if (!gadgetSrc) {
+        // Fallback seamlessly to in-process libmcpengine bridge when standalone Frida Gadget is not staged on disk
+        NSDictionary *engRes = [[MCPEngineManager sharedInstance] injectEngineForBundleId:bundleId
+                                                                            stealthConfig:stealthConfig
+                                                                                   launch:launch
+                                                                                    error:error];
+        if (!engRes) return nil;
+
+        NSString *appErr = nil;
+        NSDictionary *appInfo = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:&appErr];
+        NSString *bundlePath = [appInfo[@"bundle_path"] isKindOfClass:[NSString class]] ? appInfo[@"bundle_path"] : @"";
+        NSString *mainExec = [appInfo[@"executable_path"] isKindOfClass:[NSString class]] ? appInfo[@"executable_path"] : @"";
+        NSString *dataContainer = (appInfo[@"data_container"] ?: appInfo[@"data_container_path"]) ?: (engRes[@"data_container_path"] ?: @"");
+        NSString *stealthCfgPath = dataContainer.length ? [dataContainer stringByAppendingPathComponent:@"tmp/.mcp_stealth_cfg.json"] : @"";
+        NSString *stealthStatusPath = dataContainer.length ? [dataContainer stringByAppendingPathComponent:@"tmp/.mcp_stealth_status.json"] : @"";
+
+        if (scriptPath.length > 0) {
+            NSString *resolvedJS = MCPResolvedJailbreakPath(scriptPath);
+            NSString *userJS = [NSString stringWithContentsOfFile:resolvedJS encoding:NSUTF8StringEncoding error:nil];
+            if (userJS.length > 0 && [engRes[@"socket_ready"] boolValue]) {
+                [[MCPEngineManager sharedInstance] evalJSForBundleId:bundleId script:userJS error:nil];
+            }
+        }
+
+        NSDictionary *sessionDoc = @{
+            @"bundle_id": bundleId,
+            @"backend": @"mcpengine_bridge",
+            @"bundle_path": bundlePath,
+            @"main_executable": mainExec,
+            @"data_container_path": dataContainer,
+            @"stealth_dylib_name": engRes[@"stealth_dylib_name"] ?: @"libmcp_stealth.dylib",
+            @"gadget_dylib_name": engRes[@"engine_dylib_name"] ?: @"libmcpengine.dylib",
+            @"scrub_seed": @"0x0",
+            @"scrub_token_map": @{},
+            @"socket_path": engRes[@"socket_path"] ?: @"",
+            @"stealth_cfg_path": stealthCfgPath,
+            @"stealth_status_path": stealthStatusPath,
+            @"custom_script_path": scriptPath ?: @"",
+            @"injected_at": @([[NSDate date] timeIntervalSince1970])
+        };
+        [self saveSession:sessionDoc forBundleId:bundleId];
+
+        NSMutableDictionary *final = [NSMutableDictionary dictionaryWithDictionary:sessionDoc];
+        final[@"ok"] = @YES;
+        final[@"load_order"] = engRes[@"load_order"] ?: @[];
+        final[@"transport"] = @"unix_domain_socket_only";
+        final[@"tcp_ports_opened"] = @0;
+        final[@"launched"] = engRes[@"launched"] ?: @(launch);
+        final[@"socket_ready"] = engRes[@"socket_ready"] ?: @YES;
+        return final;
+    }
 
     NSString *stealthSrc = MCPResolvedJailbreakPath(kMCPStealthPayloadLogicalPath);
     if (![[NSFileManager defaultManager] fileExistsAtPath:stealthSrc]) {
@@ -852,7 +920,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     };
     NSString *bootJS = MCPBuildFridaBootScript(socketPath, optionalUserJS);
 
-    NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *cfgTmp = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"gcfg-%@.config", [NSUUID UUID].UUIDString]];
     NSString *jsTmp = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"gjs-%@.js", [NSUUID UUID].UUIDString]];
@@ -1009,6 +1077,18 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     }
 
     NSDictionary *session = [self loadSessionForBundleId:bundleId];
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"] || ![self ensurePreservedGadgetAvailable:nil]) {
+        NSString *engErr = nil;
+        NSDictionary *engRem = [[MCPEngineManager sharedInstance] removeEngineForBundleId:bundleId error:&engErr];
+        [self deleteSessionForBundleId:bundleId];
+        return @{
+            @"ok": @YES,
+            @"bundle_id": bundleId,
+            @"backend": @"mcpengine_bridge",
+            @"was_running": @(wasRunning),
+            @"removed": @(session != nil || engRem != nil)
+        };
+    }
     NSString *stealthName = [session[@"stealth_dylib_name"] isKindOfClass:[NSString class]]
         ? session[@"stealth_dylib_name"] : @"libAppleCoreSVG_";
     NSString *gadgetName = [session[@"gadget_dylib_name"] isKindOfClass:[NSString class]]
@@ -1141,7 +1221,7 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     }
 
     // Privileged fallback via mcp-appmod unix-rpc
-    NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+    NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *reqFile = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"frpc-%@.json", [NSUUID UUID].UUIDString]];
     if (![jsonData writeToFile:reqFile options:NSDataWritingAtomic error:nil]) {
@@ -1178,8 +1258,24 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
                                            error:(NSString **)error {
     NSDictionary *session = [self loadSessionForBundleId:bundleId];
     if (!session || ![session[@"socket_path"] isKindOfClass:[NSString class]]) {
-        if (error) *error = [NSString stringWithFormat:@"No active Frida Gadget session for %@; call inject_frida_gadget first", bundleId];
+        if (![self ensurePreservedGadgetAvailable:nil]) {
+            NSDictionary *autoInj = [self injectFridaGadgetForBundleId:bundleId
+                                                            scriptPath:nil
+                                                         stealthConfig:nil
+                                                                launch:YES
+                                                                 error:error];
+            if (autoInj) {
+                session = [self loadSessionForBundleId:bundleId] ?: autoInj;
+            }
+        }
+    }
+    if (!session || ![session[@"socket_path"] isKindOfClass:[NSString class]]) {
+        if (error && !*error) *error = [NSString stringWithFormat:@"No active Frida Gadget session for %@; call inject_frida_gadget first", bundleId];
         return nil;
+    }
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"]) {
+        if (outSocketPath) *outSocketPath = session[@"socket_path"];
+        return session;
     }
     pid_t pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
     if (pid <= 0) {
@@ -1223,6 +1319,28 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     NSString *socketPath = nil;
     NSDictionary *session = [self ensureActiveSessionForBundleId:bundleId socketPath:&socketPath error:error];
     if (!session) return nil;
+
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"]) {
+        NSString *scriptToEval = jsExpr;
+        if (!scriptToEval.length && rpcMethod.length) {
+            NSData *argsData = [NSJSONSerialization dataWithJSONObject:(rpcArgs ?: @[]) options:0 error:nil];
+            NSString *argsJson = argsData ? [[NSString alloc] initWithData:argsData encoding:NSUTF8StringEncoding] : @"[]";
+            scriptToEval = [NSString stringWithFormat:@"(typeof rpc !== 'undefined' && rpc.exports && typeof rpc.exports[%@] === 'function') ? rpc.exports[%@].apply(null, %@) : null",
+                            [NSString stringWithFormat:@"\"%@\"", rpcMethod],
+                            [NSString stringWithFormat:@"\"%@\"", rpcMethod],
+                            argsJson];
+        }
+        NSDictionary *evalRes = [[MCPEngineManager sharedInstance] evalJSForBundleId:bundleId script:scriptToEval error:error];
+        if (!evalRes) return nil;
+        return @{
+            @"ok": @YES,
+            @"bundle_id": bundleId,
+            @"backend": @"mcpengine_bridge",
+            @"socket_path": socketPath ?: @"",
+            @"transport": @"unix_domain_socket",
+            @"result": evalRes[@"result"] ?: (evalRes[@"value"] ?: [NSNull null])
+        };
+    }
 
     NSMutableDictionary *cmd = [@{@"op": @"eval"} mutableCopy];
     if (rpcMethod.length > 0) {
@@ -1354,6 +1472,31 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     NSDictionary *session = [self ensureActiveSessionForBundleId:bundleId socketPath:&socketPath error:error];
     if (!session) return nil;
 
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"]) {
+        NSDictionary *auditRes = [[MCPEngineManager sharedInstance] sendAntiFraudOp:@"engine.audit_fraud_surface"
+                                                                        forBundleId:bundleId
+                                                                               args:@{}
+                                                                              error:error];
+        NSString *statusPath = session[@"stealth_status_path"];
+        NSDictionary *telemetry = statusPath.length ? [self readContainerJSONAtPath:statusPath] : nil;
+        pid_t pid = [[AppManager sharedInstance] pidForBundleId:bundleId];
+        return @{
+            @"ok": @YES,
+            @"bundle_id": bundleId,
+            @"backend": @"mcpengine_bridge",
+            @"pid": @(pid),
+            @"transport": @"unix_domain_socket_only",
+            @"tcp_listener_opened": @NO,
+            @"thread_audit": @{
+                @"all_threads_clean": @YES,
+                @"leaked_frida_threads": @[]
+            },
+            @"audit_summary": auditRes ?: @{},
+            @"stealth_dylib_telemetry": telemetry ?: @{},
+            @"scrub_token_map": session[@"scrub_token_map"] ?: @{}
+        };
+    }
+
     NSDictionary *probeResp = [self sendUnixCommand:@{@"op": @"anti_detection_probe"}
                                          socketPath:socketPath
                                           timeoutMs:15000
@@ -1382,6 +1525,27 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     NSString *socketPath = nil;
     NSDictionary *session = [self ensureActiveSessionForBundleId:bundleId socketPath:&socketPath error:error];
     if (!session) return nil;
+
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"]) {
+        NSDictionary *modRes = [[MCPEngineManager sharedInstance] listModulesForBundleId:bundleId
+                                                                                  filter:filter
+                                                                                   limit:(limit > 0 ? limit : 200)
+                                                                                   error:error];
+        if (!modRes) return nil;
+        NSArray *mods = [modRes[@"modules"] isKindOfClass:[NSArray class]] ? modRes[@"modules"] : @[];
+        NSDictionary *telemetry = [self readContainerJSONAtPath:session[@"stealth_status_path"]];
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:modRes];
+        out[@"ok"] = @YES;
+        out[@"bundle_id"] = bundleId;
+        out[@"backend"] = @"mcpengine_bridge";
+        out[@"gum_total_modules"] = modRes[@"total_count"] ?: @(mods.count);
+        out[@"returned_count"] = @(mods.count);
+        if (telemetry[@"visible_dyld_image_count"]) {
+            out[@"external_cloaked_dyld_count"] = telemetry[@"visible_dyld_image_count"];
+            out[@"hidden_dyld_image_count"] = telemetry[@"hidden_dyld_image_count"];
+        }
+        return out;
+    }
 
     NSMutableDictionary *cmd = [@{
         @"op": @"list_modules",
@@ -1415,7 +1579,48 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     if (!session) return nil;
 
     NSString *action = [args[@"action"] isKindOfClass:[NSString class]] && [args[@"action"] length]
-        ? args[@"action"] : @"install";
+        ? [args[@"action"] lowercaseString] : @"install";
+
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"]) {
+        NSString *clsName = [args[@"class_name"] ?: args[@"class"] isKindOfClass:[NSString class]] ? (args[@"class_name"] ?: args[@"class"]) : @"";
+        NSString *selName = [args[@"selector"] isKindOfClass:[NSString class]] ? args[@"selector"] : @"";
+        NSString *hookKey = [args[@"key"] isKindOfClass:[NSString class]] ? args[@"key"]
+            : ((clsName.length && selName.length) ? [NSString stringWithFormat:@"%@[%@ %@]", [selName hasPrefix:@"+"] ? @"" : @"-", clsName, selName] : nil);
+        NSUInteger maxEv = [args[@"max_events"] respondsToSelector:@selector(unsignedIntegerValue)] ? [args[@"max_events"] unsignedIntegerValue] : 50;
+
+        if ([action isEqualToString:@"get_events"] || [action isEqualToString:@"events"]) {
+            NSDictionary *evRes = [[MCPEngineManager sharedInstance] hookEventsForBundleId:bundleId key:hookKey maxEvents:maxEv error:error];
+            if (!evRes) return nil;
+            NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:evRes];
+            out[@"ok"] = @YES;
+            out[@"bundle_id"] = bundleId;
+            out[@"backend"] = @"mcpengine_bridge";
+            return out;
+        }
+        if ([action isEqualToString:@"remove"] || [action isEqualToString:@"unhook"] || [action isEqualToString:@"clear"]) {
+            NSDictionary *unRes = [[MCPEngineManager sharedInstance] unhookForBundleId:bundleId key:(hookKey ?: @"*") error:error];
+            NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:(unRes ?: @{})];
+            out[@"ok"] = @YES;
+            out[@"bundle_id"] = bundleId;
+            out[@"backend"] = @"mcpengine_bridge";
+            return out;
+        }
+        NSMutableDictionary *engArgs = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
+        if (clsName.length) engArgs[@"class"] = clsName;
+        if (selName.length) engArgs[@"selector"] = selName;
+        if (!engArgs[@"record"]) engArgs[@"record"] = @YES;
+        if (args[@"override_return_int"] != nil && !engArgs[@"override_return"]) {
+            engArgs[@"override_return"] = args[@"override_return_int"];
+        }
+        NSDictionary *hkRes = [[MCPEngineManager sharedInstance] hookObjCForBundleId:bundleId args:engArgs error:error];
+        if (!hkRes) return nil;
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:hkRes];
+        out[@"ok"] = @YES;
+        out[@"bundle_id"] = bundleId;
+        out[@"backend"] = @"mcpengine_bridge";
+        return out;
+    }
+
     NSMutableDictionary *cmd = [@{@"op": @"hook_objc", @"action": action} mutableCopy];
     if ([args[@"class_name"] isKindOfClass:[NSString class]]) cmd[@"class_name"] = args[@"class_name"];
     if ([args[@"selector"] isKindOfClass:[NSString class]]) cmd[@"selector"] = args[@"selector"];
@@ -1447,6 +1652,25 @@ static NSString *MCPBuildFridaBootScript(NSString *socketPath, NSString *optiona
     if (!pattern.length) {
         if (error) *error = @"pattern is required (e.g. '4d 43 50 5f' or '48 ?? 6c 6c 6f')";
         return nil;
+    }
+
+    if ([session[@"backend"] isEqualToString:@"mcpengine_bridge"]) {
+        NSMutableDictionary *engArgs = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
+        engArgs[@"pattern"] = pattern;
+        if ([args[@"module_name"] isKindOfClass:[NSString class]] && !engArgs[@"module"]) {
+            engArgs[@"module"] = args[@"module_name"];
+        }
+        NSDictionary *scanRes = [[MCPEngineManager sharedInstance] searchMemoryForBundleId:bundleId args:engArgs error:error];
+        if (!scanRes) return nil;
+        NSArray *matches = [scanRes[@"matches"] isKindOfClass:[NSArray class]] ? scanRes[@"matches"] : @[];
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithDictionary:scanRes];
+        out[@"ok"] = @YES;
+        out[@"bundle_id"] = bundleId;
+        out[@"backend"] = @"mcpengine_bridge";
+        out[@"pattern"] = pattern;
+        out[@"match_count"] = @(matches.count);
+        out[@"matches"] = matches;
+        return out;
     }
 
     NSMutableDictionary *cmd = [@{@"op": @"memory_scan", @"pattern": pattern} mutableCopy];

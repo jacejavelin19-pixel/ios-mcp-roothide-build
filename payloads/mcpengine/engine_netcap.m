@@ -1330,10 +1330,25 @@ NSDictionary *MENetCap(NSString *op, NSDictionary *a) {
 
     if ([op isEqualToString:@"engine.decode_protobuf"]) {
         NSData *raw = nil;
-        if ([a[@"data_base64"] isKindOfClass:[NSString class]]) {
-            raw = [[NSData alloc] initWithBase64EncodedString:a[@"data_base64"] options:NSDataBase64DecodingIgnoreUnknownCharacters];
-        } else if ([a[@"data_hex"] isKindOfClass:[NSString class]]) {
-            NSString *hex = [[a[@"data_hex"] stringByReplacingOccurrencesOfString:@" " withString:@""]
+        NSString *b64Str = [a[@"data_base64"] isKindOfClass:[NSString class]] ? a[@"data_base64"]
+            : ([a[@"base64"] isKindOfClass:[NSString class]] ? a[@"base64"]
+            : ([a[@"payload_base64"] isKindOfClass:[NSString class]] ? a[@"payload_base64"] : nil));
+        NSString *hexStr = [a[@"data_hex"] isKindOfClass:[NSString class]] ? a[@"data_hex"]
+            : ([a[@"hex"] isKindOfClass:[NSString class]] ? a[@"hex"]
+            : ([a[@"payload_hex"] isKindOfClass:[NSString class]] ? a[@"payload_hex"] : nil));
+        if (!b64Str && !hexStr && [a[@"data"] isKindOfClass:[NSString class]]) {
+            NSString *cand = a[@"data"];
+            NSCharacterSet *nonHex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF xX"] invertedSet];
+            if (cand.length >= 2 && [cand rangeOfCharacterFromSet:nonHex].location == NSNotFound) {
+                hexStr = cand;
+            } else {
+                b64Str = cand;
+            }
+        }
+        if (b64Str.length > 0) {
+            raw = [[NSData alloc] initWithBase64EncodedString:b64Str options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        } else if (hexStr.length > 0) {
+            NSString *hex = [[hexStr stringByReplacingOccurrencesOfString:@" " withString:@""]
                              stringByReplacingOccurrencesOfString:@"0x" withString:@""];
             NSMutableData *m = [NSMutableData dataWithCapacity:hex.length / 2];
             for (NSUInteger i = 0; i + 1 < hex.length; i += 2) {
@@ -1344,7 +1359,7 @@ NSDictionary *MENetCap(NSString *op, NSDictionary *a) {
             raw = m;
         }
         if (!raw.length) {
-            return @{@"error": @"missing or invalid data_base64 / data_hex"};
+            return @{@"error": @"missing or invalid data_base64 (or base64) / data_hex (or hex)"};
         }
         NSArray<NSDictionary *> *fields = MCPCapDecodeProtobufFields((const uint8_t *)raw.bytes, raw.length, 0);
         return @{

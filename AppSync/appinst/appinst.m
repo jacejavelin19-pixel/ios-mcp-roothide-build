@@ -1529,6 +1529,71 @@ int main(int argc, const char *argv[]) {
 			}
 		}
 
+			if (argc == 3 && (strcmp(argv[1], "--uninstall") == 0 || strcmp(argv[1], "-u") == 0)) {
+				NSString *targetBundleId = [NSString stringWithUTF8String:argv[2]];
+				if (!targetBundleId.length) {
+					printf("Empty bundle identifier.\n");
+					return AppInstExitCodeUnknown;
+				}
+				Class lsWorkspaceCls = objc_getClass("LSApplicationWorkspace");
+				id workspace = lsWorkspaceCls ? [lsWorkspaceCls performSelector:@selector(defaultWorkspace)] : nil;
+				Class lsProxyCls = objc_getClass("LSApplicationProxy");
+				id proxy = (lsProxyCls && [lsProxyCls respondsToSelector:@selector(applicationProxyForIdentifier:)])
+					? [lsProxyCls performSelector:@selector(applicationProxyForIdentifier:) withObject:targetBundleId]
+					: nil;
+				NSURL *bundleURL = (proxy && [proxy respondsToSelector:@selector(bundleURL)]) ? [proxy performSelector:@selector(bundleURL)] : nil;
+				NSURL *bundleContainerURL = (proxy && [proxy respondsToSelector:@selector(bundleContainerURL)]) ? [proxy performSelector:@selector(bundleContainerURL)] : nil;
+				NSURL *dataContainerURL = (proxy && [proxy respondsToSelector:@selector(dataContainerURL)]) ? [proxy performSelector:@selector(dataContainerURL)] : nil;
+				NSString *bundlePath = bundleURL.path;
+				NSString *bundleContainerPath = bundleContainerURL.path ?: (bundlePath.length ? [bundlePath stringByDeletingLastPathComponent] : nil);
+				NSString *dataContainerPath = dataContainerURL.path;
+
+				BOOL uninstalled = NO;
+				if (workspace && [workspace respondsToSelector:@selector(uninstallApplication:withOptions:)]) {
+					NSMethodSignature *sig = [workspace methodSignatureForSelector:@selector(uninstallApplication:withOptions:)];
+					if (sig) {
+						NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+						inv.target = workspace;
+						inv.selector = @selector(uninstallApplication:withOptions:);
+						NSString *bid = targetBundleId;
+						NSDictionary *opts = @{};
+						[inv setArgument:&bid atIndex:2];
+						[inv setArgument:&opts atIndex:3];
+						[inv invoke];
+						if (strcmp(sig.methodReturnType, @encode(BOOL)) == 0) {
+							[inv getReturnValue:&uninstalled];
+						}
+					}
+				}
+				if (!uninstalled && workspace && bundleURL && [workspace respondsToSelector:@selector(unregisterApplication:)]) {
+					NSMethodSignature *sig = [workspace methodSignatureForSelector:@selector(unregisterApplication:)];
+					if (sig) {
+						NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+						inv.target = workspace;
+						inv.selector = @selector(unregisterApplication:);
+						NSURL *burl = bundleURL;
+						[inv setArgument:&burl atIndex:2];
+						[inv invoke];
+						if (strcmp(sig.methodReturnType, @encode(BOOL)) == 0) {
+							[inv getReturnValue:&uninstalled];
+						}
+					}
+				}
+				if (bundleContainerPath.length &&
+					([bundleContainerPath hasPrefix:@"/var/containers/Bundle/Application/"] ||
+					 [bundleContainerPath hasPrefix:@"/private/var/containers/Bundle/Application/"])) {
+					[fileManager removeItemAtPath:bundleContainerPath error:nil];
+					uninstalled = YES;
+				}
+				if (dataContainerPath.length &&
+					([dataContainerPath hasPrefix:@"/var/mobile/Containers/Data/Application/"] ||
+					 [dataContainerPath hasPrefix:@"/private/var/mobile/Containers/Data/Application/"])) {
+					[fileManager removeItemAtPath:dataContainerPath error:nil];
+				}
+				printf("Successfully uninstalled %s\n", [targetBundleId UTF8String]);
+				return uninstalled ? AppInstExitCodeSuccess : AppInstExitCodeUnknown;
+			}
+
 			BOOL bundleIdentifierOnly = (argc == 3 &&
 				(strcmp(argv[1], "--bundle-id") == 0 || strcmp(argv[1], "-b") == 0));
 
@@ -1536,6 +1601,7 @@ int main(int argc, const char *argv[]) {
 			if (!(argc == 2 || bundleIdentifierOnly)) {
 				printf("Usage: appinst <path to IPA file>\n");
 				printf("       appinst --bundle-id <path to IPA file>\n");
+				printf("       appinst --uninstall <bundle identifier>\n");
 				return AppInstExitCodeUnknown;
 			}
 
