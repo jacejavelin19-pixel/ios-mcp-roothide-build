@@ -96,6 +96,9 @@ static _Atomic uint64_t g_af_egress_proxy_connect = 0;
 static _Atomic uint64_t g_af_egress_proxy_http = 0;
 static _Atomic uint64_t g_af_egress_proxy_fail = 0;
 static _Atomic int g_af_egress_nw_proxy_active = 0;
+static _Atomic uint64_t g_af_egress_urlproto_hits = 0;
+static _Atomic uint64_t g_af_egress_urlproto_tls = 0;
+static _Atomic uint64_t g_af_egress_urlproto_err = 0;
 static char g_af_egress_if_name[32] = "pdp_ip0";
 
 static NSMutableDictionary *g_af_persona = nil;
@@ -1397,6 +1400,443 @@ static void MEAFApplyWebKitEgressPin(int mode, uint16_t proxyPort) {
     }
 }
 
+
+static NSString *const kMEAFEgressProtoHandledKey = @"com.apple.cfnetwork.egress.handled";
+
+static NSData *MEAFDecodeChunkedBody(const uint8_t *bytes, size_t len, BOOL *outComplete) {
+    if (outComplete) *outComplete = NO;
+    NSMutableData *out = [NSMutableData data];
+    size_t pos = 0;
+    while (pos < len) {
+        size_t lineEnd = pos;
+        while (lineEnd + 1 < len && !(bytes[lineEnd] == '\r' && bytes[lineEnd + 1] == '\n')) {
+            lineEnd++;
+        }
+        if (lineEnd + 1 >= len) return nil;
+        char sizeBuf[32];
+        size_t slen = MIN(lineEnd - pos, sizeof(sizeBuf) - 1);
+        memcpy(sizeBuf, bytes + pos, slen);
+        sizeBuf[slen] = '\0';
+        char *semi = strchr(sizeBuf, ';');
+        if (semi) *semi = '\0';
+        char *endp = NULL;
+        unsigned long chunkSz = strtoul(sizeBuf, &endp, 16);
+        if (endp == sizeBuf) return nil;
+        pos = lineEnd + 2;
+        if (chunkSz == 0) {
+            if (pos + 2 <= len && bytes[pos] == '\r' && bytes[pos + 1] == '\n') {
+                if (outComplete) *outComplete = YES;
+                return out;
+            }
+            // Search for trailer end \r\n\r\n
+            for (size_t k = pos; k + 3 < len; k++) {
+                if (bytes[k] == '\r' && bytes[k + 1] == '\n' && bytes[k + 2] == '\r' && bytes[k + 3] == '\n') {
+                    if (outComplete) *outComplete = YES;
+                    return out;
+                }
+            }
+            return nil;
+        }
+        if (pos + chunkSz + 2 > len) return nil;
+        [out appendBytes:bytes + pos length:chunkSz];
+        pos += chunkSz + 2;
+    }
+    return nil;
+}
+
+static NSData *MEAFReadURLRequestBody(NSURLRequest *req) {
+    if (req.HTTPBody.length > 0) return req.HTTPBody;
+    NSInputStream *stream = req.HTTPBodyStream;
+    if (!stream || stream.streamStatus != NSStreamStatusNotOpen) return nil;
+    NSMutableData *buf = [NSMutableData data];
+    [stream open];
+    uint8_t tmp[4096];
+    while (stream.hasBytesAvailable && buf.length < 4 * 1024 * 1024) {
+        NSInteger r = [stream read:tmp maxLength:sizeof(tmp)];
+        if (r <= 0) break;
+        [buf appendBytes:tmp length:(NSUInteger)r];
+    }
+    [stream close];
+    return buf;
+}
+
+@interface MEAFEgressURLProtocol : NSURLProtocol
+@property (nonatomic, strong) nw_connection_t nwConn;
+@property (nonatomic, assign) BOOL stopped;
+@end
+
+static void MEAFURLProtoFinishResponse(MEAFEgressURLProtocol *proto, NSMutableData *rawBuf, NSError *connErr, atomic_int *doneFlag) {
+    if (atomic_exchange(doneFlag, 1) != 0) return;
+    if (proto.stopped) return;
+    nw_connection_t conn = proto.nwConn;
+    proto.nwConn = nil;
+    if (conn) {
+        nw_connection_set_state_changed_handler(conn, NULL);
+        nw_connection_cancel(conn);
+    }
+
+    if (rawBuf.length == 0) {
+        atomic_fetch_add(&g_af_egress_urlproto_err, 1);
+        NSError *err = connErr ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorNetworkConnectionLost userInfo:@{NSLocalizedDescriptionKey: @"Egress connection closed without response"}];
+        [proto.client URLProtocol:proto didFailWithError:err];
+        return;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)rawBuf.bytes;
+    size_t len = rawBuf.length;
+    size_t hdrStart = 0;
+    NSInteger hdrEnd = -1;
+
+    // Skip optional 100 Continue informational headers
+    while (hdrStart < len) {
+        hdrEnd = -1;
+        for (size_t i = hdrStart; i + 3 < len; i++) {
+            if (bytes[i] == '\r' && bytes[i + 1] == '\n' && bytes[i + 2] == '\r' && bytes[i + 3] == '\n') {
+                hdrEnd = (NSInteger)(i + 4);
+                break;
+            }
+        }
+        if (hdrEnd < 0) break;
+        NSString *firstHdr = [[NSString alloc] initWithBytes:bytes + hdrStart length:(NSUInteger)(hdrEnd - (NSInteger)hdrStart) encoding:NSISOLatin1StringEncoding] ?: @"";
+        if ([firstHdr hasPrefix:@"HTTP/1.1 100 "] || [firstHdr hasPrefix:@"HTTP/1.0 100 "]) {
+            hdrStart = (size_t)hdrEnd;
+            continue;
+        }
+        break;
+    }
+
+    if (hdrEnd < 0) {
+        atomic_fetch_add(&g_af_egress_urlproto_err, 1);
+        NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:@{NSLocalizedDescriptionKey: @"Malformed HTTP response headers"}];
+        [proto.client URLProtocol:proto didFailWithError:err];
+        return;
+    }
+
+    NSString *hdrStr = [[NSString alloc] initWithBytes:bytes + hdrStart length:(NSUInteger)(hdrEnd - (NSInteger)hdrStart) encoding:NSISOLatin1StringEncoding] ?: @"";
+    NSArray<NSString *> *lines = [hdrStr componentsSeparatedByString:@"\r\n"];
+    NSInteger statusCode = 200;
+    NSString *httpVer = @"HTTP/1.1";
+    if (lines.count > 0) {
+        NSArray<NSString *> *sp = [lines[0] componentsSeparatedByString:@" "];
+        if (sp.count >= 1 && sp[0].length > 0) httpVer = sp[0];
+        if (sp.count >= 2) statusCode = [sp[1] integerValue];
+    }
+
+    NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *setCookies = [NSMutableArray array];
+    BOOL isChunked = NO;
+    for (NSUInteger i = 1; i < lines.count; i++) {
+        NSString *ln = lines[i];
+        NSRange col = [ln rangeOfString:@":"];
+        if (col.location == NSNotFound) continue;
+        NSString *k = [[ln substringToIndex:col.location] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *v = [[ln substringFromIndex:col.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (!k.length) continue;
+        NSString *kl = [k lowercaseString];
+        if ([kl isEqualToString:@"transfer-encoding"] && [[v lowercaseString] containsString:@"chunked"]) {
+            isChunked = YES;
+        }
+        if ([kl isEqualToString:@"set-cookie"]) {
+            [setCookies addObject:v];
+        }
+        if (headers[k]) {
+            headers[k] = [NSString stringWithFormat:@"%@, %@", headers[k], v];
+        } else {
+            headers[k] = v;
+        }
+    }
+
+    NSURL *reqURL = proto.request.URL;
+    if (proto.request.HTTPShouldHandleCookies && setCookies.count > 0 && reqURL) {
+        for (NSString *sc in setCookies) {
+            NSArray<NSHTTPCookie *> *cks = [NSHTTPCookie cookiesWithResponseHeaderFields:@{@"Set-Cookie": sc} forURL:reqURL];
+            if (cks.count > 0) {
+                [[NSHTTPCookieStorage sharedHTTPCookieStorage] setCookies:cks forURL:reqURL mainDocumentURL:proto.request.mainDocumentURL];
+            }
+        }
+    }
+
+    NSData *bodyData = [NSData data];
+    if ((size_t)hdrEnd < len) {
+        const uint8_t *bodyPtr = bytes + (size_t)hdrEnd;
+        size_t bodyLen = len - (size_t)hdrEnd;
+        if (isChunked) {
+            BOOL chunkDone = NO;
+            NSData *decoded = MEAFDecodeChunkedBody(bodyPtr, bodyLen, &chunkDone);
+            bodyData = decoded ?: [NSData dataWithBytes:bodyPtr length:bodyLen];
+        } else {
+            bodyData = [NSData dataWithBytes:bodyPtr length:bodyLen];
+        }
+    }
+
+    NSHTTPURLResponse *httpResp = [[NSHTTPURLResponse alloc] initWithURL:reqURL statusCode:statusCode HTTPVersion:httpVer headerFields:headers];
+
+    // Forward 3xx redirects cleanly to NSURLSession's redirect handler
+    NSString *loc = nil;
+    for (NSString *hk in headers) {
+        if ([[hk lowercaseString] isEqualToString:@"location"]) {
+            loc = headers[hk];
+            break;
+        }
+    }
+    if ((statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307 || statusCode == 308) && loc.length > 0 && reqURL) {
+        NSURL *redirURL = [NSURL URLWithString:loc relativeToURL:reqURL].absoluteURL;
+        if (redirURL) {
+            NSMutableURLRequest *redirReq = [proto.request mutableCopy];
+            redirReq.URL = redirURL;
+            if (statusCode == 303 || ((statusCode == 301 || statusCode == 302) && ![proto.request.HTTPMethod.uppercaseString isEqualToString:@"GET"] && ![proto.request.HTTPMethod.uppercaseString isEqualToString:@"HEAD"])) {
+                redirReq.HTTPMethod = @"GET";
+                redirReq.HTTPBody = nil;
+                redirReq.HTTPBodyStream = nil;
+                [redirReq setValue:nil forHTTPHeaderField:@"Content-Length"];
+                [redirReq setValue:nil forHTTPHeaderField:@"Content-Type"];
+            }
+            [NSURLProtocol removePropertyForKey:kMEAFEgressProtoHandledKey inRequest:redirReq];
+            [proto.client URLProtocol:proto wasRedirectedToRequest:redirReq redirectResponse:httpResp];
+            return;
+        }
+    }
+
+    [proto.client URLProtocol:proto didReceiveResponse:httpResp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    if (bodyData.length > 0) {
+        [proto.client URLProtocol:proto didLoadData:bodyData];
+    }
+    [proto.client URLProtocolDidFinishLoading:proto];
+}
+
+static BOOL MEAFURLProtoResponseIsComplete(NSMutableData *rawBuf, BOOL isHead) {
+    const uint8_t *bytes = (const uint8_t *)rawBuf.bytes;
+    size_t len = rawBuf.length;
+    NSInteger hdrEnd = -1;
+    size_t hdrStart = 0;
+    while (hdrStart < len) {
+        hdrEnd = -1;
+        for (size_t i = hdrStart; i + 3 < len; i++) {
+            if (bytes[i] == '\r' && bytes[i + 1] == '\n' && bytes[i + 2] == '\r' && bytes[i + 3] == '\n') {
+                hdrEnd = (NSInteger)(i + 4);
+                break;
+            }
+        }
+        if (hdrEnd < 0) return NO;
+        NSString *firstHdr = [[NSString alloc] initWithBytes:bytes + hdrStart length:(NSUInteger)(hdrEnd - (NSInteger)hdrStart) encoding:NSISOLatin1StringEncoding] ?: @"";
+        if ([firstHdr hasPrefix:@"HTTP/1.1 100 "] || [firstHdr hasPrefix:@"HTTP/1.0 100 "]) {
+            hdrStart = (size_t)hdrEnd;
+            continue;
+        }
+        if (isHead) return YES;
+        NSArray<NSString *> *lines = [firstHdr componentsSeparatedByString:@"\r\n"];
+        NSInteger code = 200;
+        if (lines.count > 0) {
+            NSArray<NSString *> *sp = [lines[0] componentsSeparatedByString:@" "];
+            if (sp.count >= 2) code = [sp[1] integerValue];
+        }
+        if (code == 204 || code == 304 || (code >= 100 && code < 200)) return YES;
+        NSInteger contentLen = -1;
+        BOOL isChunked = NO;
+        for (NSUInteger j = 1; j < lines.count; j++) {
+            NSString *low = [lines[j] lowercaseString];
+            if ([low hasPrefix:@"content-length:"]) {
+                contentLen = [[lines[j] substringFromIndex:15] integerValue];
+            } else if ([low hasPrefix:@"transfer-encoding:"] && [low containsString:@"chunked"]) {
+                isChunked = YES;
+            }
+        }
+        size_t bodyLen = len - (size_t)hdrEnd;
+        if (contentLen >= 0 && bodyLen >= (size_t)contentLen) return YES;
+        if (isChunked) {
+            BOOL chunkDone = NO;
+            MEAFDecodeChunkedBody(bytes + (size_t)hdrEnd, bodyLen, &chunkDone);
+            if (chunkDone) return YES;
+        }
+        return NO;
+    }
+    return NO;
+}
+
+static void MEAFURLProtoRecvNext(MEAFEgressURLProtocol *proto, nw_connection_t conn, NSMutableData *rawBuf, NSMutableData *doneBox, BOOL isHead) {
+    atomic_int *doneFlag = (atomic_int *)doneBox.mutableBytes;
+    if (atomic_load(doneFlag) || proto.stopped) return;
+    nw_connection_receive(conn, 1, 65536, ^(dispatch_data_t content, __unused nw_content_context_t ctx, bool isComplete, nw_error_t error) {
+        if (atomic_load(doneFlag) || proto.stopped) return;
+        if (content) {
+            dispatch_data_apply(content, ^bool(__unused dispatch_data_t region, __unused size_t offset, const void *buffer, size_t size) {
+                if (size > 0) [rawBuf appendBytes:buffer length:size];
+                return true;
+            });
+        }
+        if (MEAFURLProtoResponseIsComplete(rawBuf, isHead)) {
+            MEAFURLProtoFinishResponse(proto, rawBuf, nil, doneFlag);
+            return;
+        }
+        if (isComplete || error) {
+            NSError *nsErr = nil;
+            if (error && rawBuf.length == 0) {
+                nsErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost userInfo:@{NSLocalizedDescriptionKey: @"Cellular egress receive error"}];
+            }
+            MEAFURLProtoFinishResponse(proto, rawBuf, nsErr, doneFlag);
+            return;
+        }
+        MEAFURLProtoRecvNext(proto, conn, rawBuf, doneBox, isHead);
+    });
+}
+
+@implementation MEAFEgressURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if (atomic_load(&g_af_egress_mode) == 0) return NO;
+    NSURL *u = request.URL;
+    if (!u || !u.host.length) return NO;
+    NSString *scheme = [u.scheme lowercaseString];
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+    if (MEAFHostIsLoopback(u.host)) return NO;
+    if ([[NSURLProtocol propertyForKey:kMEAFEgressProtoHandledKey inRequest:request] boolValue]) return NO;
+    return YES;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSURLRequest *req = self.request;
+    NSURL *u = req.URL;
+    NSString *scheme = [u.scheme lowercaseString];
+    BOOL isTLS = [scheme isEqualToString:@"https"];
+    NSString *host = u.host ?: @"";
+    NSString *portStr = u.port ? [u.port stringValue] : (isTLS ? @"443" : @"80");
+    BOOL isDefaultPort = (isTLS && [portStr isEqualToString:@"443"]) || (!isTLS && [portStr isEqualToString:@"80"]);
+    NSString *method = req.HTTPMethod.length ? [req.HTTPMethod uppercaseString] : @"GET";
+    BOOL isHead = [method isEqualToString:@"HEAD"];
+
+    atomic_fetch_add(&g_af_egress_urlproto_hits, 1);
+    if (isTLS) atomic_fetch_add(&g_af_egress_urlproto_tls, 1);
+
+    // Preserve exact percent-encoded path & query
+    NSURLComponents *comps = [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:YES];
+    NSString *pathPart = comps.percentEncodedPath.length ? comps.percentEncodedPath : @"/";
+    NSString *reqTarget = comps.percentEncodedQuery.length ? [NSString stringWithFormat:@"%@?%@", pathPart, comps.percentEncodedQuery] : pathPart;
+
+    NSData *reqBody = MEAFReadURLRequestBody(req);
+    NSMutableString *wire = [NSMutableString stringWithFormat:@"%@ %@ HTTP/1.1\r\n", method, reqTarget];
+    if (isDefaultPort) {
+        [wire appendFormat:@"Host: %@\r\n", host];
+    } else {
+        [wire appendFormat:@"Host: %@:%@\r\n", host, portStr];
+    }
+    [wire appendString:@"Connection: close\r\n"];
+    [wire appendString:@"Accept-Encoding: identity\r\n"];
+
+    BOOL hasUA = NO;
+    BOOL hasCookie = NO;
+    NSDictionary<NSString *, NSString *> *hdrs = req.allHTTPHeaderFields ?: @{};
+    for (NSString *k in hdrs) {
+        NSString *kl = [k lowercaseString];
+        if ([kl isEqualToString:@"host"] || [kl isEqualToString:@"connection"] ||
+            [kl isEqualToString:@"accept-encoding"] || [kl isEqualToString:@"content-length"] ||
+            [kl isEqualToString:@"proxy-connection"]) {
+            continue;
+        }
+        if ([kl isEqualToString:@"user-agent"]) hasUA = YES;
+        if ([kl isEqualToString:@"cookie"]) hasCookie = YES;
+        [wire appendFormat:@"%@: %@\r\n", k, hdrs[k]];
+    }
+    if (!hasUA) {
+        [wire appendString:@"User-Agent: CFNetwork/1400 Darwin/22.0.0\r\n"];
+    }
+    if (!hasCookie && req.HTTPShouldHandleCookies) {
+        NSArray<NSHTTPCookie *> *cks = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL:u];
+        if (cks.count > 0) {
+            NSDictionary<NSString *, NSString *> *ckHdrs = [NSHTTPCookie requestHeaderFieldsWithCookies:cks];
+            NSString *ckVal = ckHdrs[@"Cookie"];
+            if (ckVal.length > 0) [wire appendFormat:@"Cookie: %@\r\n", ckVal];
+        }
+    }
+    if (reqBody.length > 0 || [method isEqualToString:@"POST"] || [method isEqualToString:@"PUT"] || [method isEqualToString:@"PATCH"]) {
+        [wire appendFormat:@"Content-Length: %lu\r\n", (unsigned long)reqBody.length];
+    }
+    [wire appendString:@"\r\n"];
+
+    NSMutableData *wireData = [[wire dataUsingEncoding:NSISOLatin1StringEncoding] mutableCopy];
+    if (reqBody.length > 0) [wireData appendData:reqBody];
+
+    s_af_egress_depth++;
+    nw_parameters_t params = nil;
+    if (isTLS) {
+        nw_protocol_options_t tlsOpts = nw_tls_create_options();
+        sec_protocol_options_t secOpts = nw_tls_copy_sec_protocol_options(tlsOpts);
+        if (secOpts) {
+            sec_protocol_options_set_tls_server_name(secOpts, host.UTF8String);
+            sec_protocol_options_add_tls_application_protocol(secOpts, "http/1.1");
+        }
+        params = nw_parameters_create_secure_tcp(tlsOpts, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+    } else {
+        params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+    }
+    int mode = atomic_load(&g_af_egress_mode);
+    if (mode == 1) {
+        nw_parameters_set_required_interface_type(params, nw_interface_type_cellular);
+        nw_parameters_prohibit_interface_type(params, nw_interface_type_wifi);
+    } else if (mode == 2) {
+        nw_parameters_set_required_interface_type(params, nw_interface_type_wifi);
+        nw_parameters_prohibit_interface_type(params, nw_interface_type_cellular);
+    }
+    nw_endpoint_t ep = nw_endpoint_create_host(host.UTF8String, portStr.UTF8String);
+    nw_connection_t conn = nw_connection_create(ep, params);
+    s_af_egress_depth--;
+
+    self.nwConn = conn;
+    dispatch_queue_t nwQ = MEAFEgressNWQueue();
+    nw_connection_set_queue(conn, nwQ);
+
+    NSMutableData *rawBuf = [NSMutableData dataWithCapacity:4096];
+    NSMutableData *doneBox = [NSMutableData dataWithLength:sizeof(atomic_int)];
+    atomic_init((atomic_int *)doneBox.mutableBytes, 0);
+
+    double timeoutSec = (req.timeoutInterval > 1.0 && req.timeoutInterval < 60.0) ? req.timeoutInterval : 15.0;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeoutSec * NSEC_PER_SEC)), nwQ, ^{
+        MEAFEgressURLProtocol *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        atomic_int *flag = (atomic_int *)doneBox.mutableBytes;
+        if (atomic_load(flag) == 0 && !strongSelf.stopped) {
+            NSError *toErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorTimedOut userInfo:@{NSLocalizedDescriptionKey: @"Cellular egress request timed out"}];
+            MEAFURLProtoFinishResponse(strongSelf, rawBuf, toErr, flag);
+        }
+    });
+
+    nw_connection_set_state_changed_handler(conn, ^(nw_connection_state_t state, nw_error_t err) {
+        atomic_int *flag = (atomic_int *)doneBox.mutableBytes;
+        if (atomic_load(flag) || self.stopped) return;
+        if (state == nw_connection_state_ready) {
+            dispatch_data_t sendData = dispatch_data_create(wireData.bytes, wireData.length, nwQ, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+            nw_connection_send(conn, sendData, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(nw_error_t sendErr) {
+                if (sendErr) {
+                    NSError *nsErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost userInfo:@{NSLocalizedDescriptionKey: @"Cellular egress send failed"}];
+                    MEAFURLProtoFinishResponse(self, rawBuf, nsErr, flag);
+                    return;
+                }
+                MEAFURLProtoRecvNext(self, conn, rawBuf, doneBox, isHead);
+            });
+        } else if (state == nw_connection_state_failed || state == nw_connection_state_cancelled) {
+            NSError *nsErr = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCannotConnectToHost userInfo:@{NSLocalizedDescriptionKey: err ? @"Cellular egress connection failed" : @"Cellular egress connection cancelled"}];
+            MEAFURLProtoFinishResponse(self, rawBuf, nsErr, flag);
+        }
+    });
+    nw_connection_start(conn);
+}
+
+- (void)stopLoading {
+    self.stopped = YES;
+    nw_connection_t conn = self.nwConn;
+    self.nwConn = nil;
+    if (conn) {
+        nw_connection_set_state_changed_handler(conn, NULL);
+        nw_connection_cancel(conn);
+    }
+}
+
+@end
+
 static void MEAFApplySessionConfigEgressPin(NSURLSessionConfiguration *cfg) {
     if (!cfg) return;
     int mode = atomic_load(&g_af_egress_mode);
@@ -1421,47 +1861,17 @@ static void MEAFApplySessionConfigEgressPin(NSURLSessionConfiguration *cfg) {
         if ([cfg respondsToSelector:selForceNew]) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, selForceNew, YES);
         }
-        if (proxyPort > 0) {
-            BOOL appliedModern = NO;
-            id pcObj = MEAFCreateNWProxyConfig(proxyPort);
-            SEL selPubProxy = NSSelectorFromString(@"setProxyConfigurations:");
-            SEL selPrivProxy = NSSelectorFromString(@"set_proxyConfigurations:");
-            SEL selGetPrivProxy = NSSelectorFromString(@"_proxyConfigurations");
-            if (pcObj) {
-                NSArray *proxyArr = @[pcObj];
-                if ([cfg respondsToSelector:selPubProxy]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(cfg, selPubProxy, proxyArr);
-                    appliedModern = YES;
-                }
-                if ([cfg respondsToSelector:selPrivProxy]) {
-                    NSArray *curPriv = [cfg respondsToSelector:selGetPrivProxy]
-                        ? ((id (*)(id, SEL))objc_msgSend)(cfg, selGetPrivProxy)
-                        : nil;
-                    if (![curPriv isKindOfClass:[NSArray class]] || curPriv.count == 0) {
-                        ((void (*)(id, SEL, id))objc_msgSend)(cfg, selPrivProxy, proxyArr);
-                    }
-                    appliedModern = YES;
-                }
+        // Prepend MEAFEgressURLProtocol so every NSURLSession HTTP/HTTPS request routes directly over pinned nw_connection
+        NSArray<Class> *existingProtos = cfg.protocolClasses ?: @[];
+        if (existingProtos.firstObject != [MEAFEgressURLProtocol class]) {
+            NSMutableArray<Class> *updated = [NSMutableArray arrayWithObject:[MEAFEgressURLProtocol class]];
+            for (Class cls in existingProtos) {
+                if (cls != [MEAFEgressURLProtocol class]) [updated addObject:cls];
             }
-            if (appliedModern) {
-                atomic_store(&g_af_egress_nw_proxy_active, 1);
-                cfg.connectionProxyDictionary = nil;
-            } else {
-                // iOS 14-16 fallback: configure both SOCKS5 and HTTP/HTTPS proxy dictionary keys
-                cfg.connectionProxyDictionary = @{
-                    @"SOCKSEnable": @1,
-                    @"SOCKSProxy": @"127.0.0.1",
-                    @"SOCKSPort": @(proxyPort),
-                    @"HTTPEnable": @1,
-                    @"HTTPProxy": @"127.0.0.1",
-                    @"HTTPPort": @(proxyPort),
-                    @"HTTPSEnable": @1,
-                    @"HTTPSProxy": @"127.0.0.1",
-                    @"HTTPSPort": @(proxyPort),
-                    @"ExceptionsList": @[@"localhost", @"127.0.0.1", @"::1"]
-                };
-            }
+            cfg.protocolClasses = updated;
         }
+        atomic_store(&g_af_egress_nw_proxy_active, 1);
+        (void)proxyPort;
     } @catch (__unused NSException *ex) {}
 }
 
@@ -1558,6 +1968,7 @@ static NSURLSession *swizzled_af_sharedSession(id self, SEL _cmd) {
 static void MEAFInstallSessionEgressSwizzlesOnce(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        [NSURLProtocol registerClass:[MEAFEgressURLProtocol class]];
         Method mDef = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
         if (mDef) {
             orig_af_defaultSessionConfig = (typeof(orig_af_defaultSessionConfig))method_setImplementation(mDef, (IMP)swizzled_af_defaultSessionConfig);
@@ -3067,6 +3478,9 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
             @"proxy_connect": @(atomic_load(&g_af_egress_proxy_connect)),
             @"proxy_http": @(atomic_load(&g_af_egress_proxy_http)),
             @"proxy_fail": @(atomic_load(&g_af_egress_proxy_fail)),
+            @"urlproto_hits": @(atomic_load(&g_af_egress_urlproto_hits)),
+            @"urlproto_tls": @(atomic_load(&g_af_egress_urlproto_tls)),
+            @"urlproto_err": @(atomic_load(&g_af_egress_urlproto_err)),
             @"status_code": @(statusCode),
             @"target": (mode == 1 ? @"cellular" : (mode == 2 ? @"wifi" : @"default")),
             @"interface": g_af_egress_if_name[0] ? @(g_af_egress_if_name) : @"",
