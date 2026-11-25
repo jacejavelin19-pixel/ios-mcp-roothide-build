@@ -6,6 +6,7 @@
 #import <CFNetwork/CFNetwork.h>
 #import <Network/Network.h>
 #import <SystemConfiguration/SystemConfiguration.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #import <CoreMotion/CoreMotion.h>
 #include <objc/message.h>
@@ -89,6 +90,12 @@ static _Atomic uint64_t g_af_egress_gen = 0;
 static _Atomic int g_af_egress_inline_active = 0;
 static _Atomic uint16_t g_af_egress_proxy_port = 0;
 static _Atomic int g_af_egress_proxy_listen_fd = -1;
+static _Atomic uint64_t g_af_egress_proxy_accepts = 0;
+static _Atomic uint64_t g_af_egress_proxy_socks5 = 0;
+static _Atomic uint64_t g_af_egress_proxy_connect = 0;
+static _Atomic uint64_t g_af_egress_proxy_http = 0;
+static _Atomic uint64_t g_af_egress_proxy_fail = 0;
+static _Atomic int g_af_egress_nw_proxy_active = 0;
 static char g_af_egress_if_name[32] = "pdp_ip0";
 
 static NSMutableDictionary *g_af_persona = nil;
@@ -836,6 +843,15 @@ static dispatch_queue_t MEAFEgressProxyQueue(void) {
     return q;
 }
 
+static dispatch_queue_t MEAFEgressNWQueue(void) {
+    static dispatch_queue_t q = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.apple.cfnetwork.egress.nw", DISPATCH_QUEUE_CONCURRENT);
+    });
+    return q;
+}
+
 static BOOL MEAFWriteAllFD(int fd, const void *buf, size_t len) {
     const uint8_t *ptr = (const uint8_t *)buf;
     size_t rem = len;
@@ -847,6 +863,71 @@ static BOOL MEAFWriteAllFD(int fd, const void *buf, size_t len) {
         rem -= (size_t)w;
     }
     return YES;
+}
+
+static BOOL MEAFReadExactFD(int fd, void *buf, size_t len) {
+    uint8_t *ptr = (uint8_t *)buf;
+    size_t rem = len;
+    while (rem > 0) {
+        ssize_t r = recv(fd, ptr, rem, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return NO;
+        ptr += (size_t)r;
+        rem -= (size_t)r;
+    }
+    return YES;
+}
+
+static BOOL MEAFHostIsLoopback(NSString *host) {
+    if (!host.length) return NO;
+    NSString *low = [host lowercaseString];
+    return [low isEqualToString:@"127.0.0.1"] ||
+           [low isEqualToString:@"localhost"] ||
+           [low isEqualToString:@"::1"] ||
+           [low hasPrefix:@"127."];
+}
+
+static nw_connection_t MEAFEgressOpenUpstream(NSString *host, NSString *portStr, BOOL *outReady) {
+    if (outReady) *outReady = NO;
+    if (!host.length || !portStr.length) return nil;
+
+    s_af_egress_depth++;
+    nw_parameters_t params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+    int mode = atomic_load(&g_af_egress_mode);
+    if (!MEAFHostIsLoopback(host)) {
+        if (mode == 1) {
+            nw_parameters_set_required_interface_type(params, nw_interface_type_cellular);
+            nw_parameters_prohibit_interface_type(params, nw_interface_type_wifi);
+        } else if (mode == 2) {
+            nw_parameters_set_required_interface_type(params, nw_interface_type_wifi);
+            nw_parameters_prohibit_interface_type(params, nw_interface_type_cellular);
+        }
+    }
+    nw_endpoint_t ep = nw_endpoint_create_host(host.UTF8String, portStr.UTF8String);
+    nw_connection_t conn = nw_connection_create(ep, params);
+    s_af_egress_depth--;
+
+    nw_connection_set_queue(conn, MEAFEgressNWQueue());
+    dispatch_semaphore_t readySem = dispatch_semaphore_create(0);
+    __block atomic_int signaled = ATOMIC_VAR_INIT(0);
+    __block BOOL isReady = NO;
+    nw_connection_set_state_changed_handler(conn, ^(nw_connection_state_t state, __unused nw_error_t err) {
+        if (state == nw_connection_state_ready) {
+            isReady = YES;
+            if (atomic_exchange(&signaled, 1) == 0) dispatch_semaphore_signal(readySem);
+        } else if (state == nw_connection_state_failed || state == nw_connection_state_cancelled) {
+            if (atomic_exchange(&signaled, 1) == 0) dispatch_semaphore_signal(readySem);
+        }
+    });
+    nw_connection_start(conn);
+    dispatch_semaphore_wait(readySem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)));
+    if (outReady) *outReady = isReady;
+    if (!isReady) {
+        atomic_fetch_add(&g_af_egress_proxy_fail, 1);
+        nw_connection_cancel(conn);
+        return nil;
+    }
+    return conn;
 }
 
 static void MEAFEgressProxyRecvNext(int clientFD, nw_connection_t conn, NSMutableData *closedBox, void (^teardown)(void)) {
@@ -877,7 +958,8 @@ static void MEAFEgressProxyRecvNext(int clientFD, nw_connection_t conn, NSMutabl
 }
 
 static void MEAFEgressProxyPump(int clientFD, nw_connection_t conn) {
-    dispatch_queue_t q = MEAFEgressProxyQueue();
+    dispatch_queue_t ioQueue = MEAFEgressProxyQueue();
+    dispatch_queue_t nwQueue = MEAFEgressNWQueue();
     NSMutableData *closedBox = [NSMutableData dataWithLength:sizeof(atomic_int)];
     atomic_int *closedFlag = (atomic_int *)closedBox.mutableBytes;
     atomic_init(closedFlag, 0);
@@ -891,11 +973,11 @@ static void MEAFEgressProxyPump(int clientFD, nw_connection_t conn) {
         }
     };
 
-    // Direction 1: remote nw_connection -> local clientFD
+    // Direction 1: remote nw_connection -> local clientFD (runs on MEAFEgressNWQueue)
     MEAFEgressProxyRecvNext(clientFD, conn, closedBox, teardown);
 
-    // Direction 2: local clientFD -> remote nw_connection (blocking reader on concurrent queue)
-    dispatch_async(q, ^{
+    // Direction 2: local clientFD -> remote nw_connection (runs on MEAFEgressProxyQueue)
+    dispatch_async(ioQueue, ^{
         uint8_t buf[32768];
         atomic_int *flag = (atomic_int *)closedBox.mutableBytes;
         while (!atomic_load(flag)) {
@@ -913,7 +995,7 @@ static void MEAFEgressProxyPump(int clientFD, nw_connection_t conn) {
                 return;
             }
             if (n < 0) break;
-            dispatch_data_t chunk = dispatch_data_create(buf, (size_t)n, q, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+            dispatch_data_t chunk = dispatch_data_create(buf, (size_t)n, nwQueue, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             dispatch_semaphore_t sendSem = dispatch_semaphore_create(0);
             __block BOOL sendOk = YES;
             nw_connection_send(conn, chunk, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(nw_error_t sendErr) {
@@ -927,15 +1009,125 @@ static void MEAFEgressProxyPump(int clientFD, nw_connection_t conn) {
     });
 }
 
+static void MEAFEgressProxyHandleSOCKS5(int clientFD) {
+    uint8_t nmethods = 0;
+    if (!MEAFReadExactFD(clientFD, &nmethods, 1) || nmethods == 0) {
+        close(clientFD);
+        return;
+    }
+    uint8_t methods[256];
+    if (!MEAFReadExactFD(clientFD, methods, nmethods)) {
+        close(clientFD);
+        return;
+    }
+    BOOL hasNoAuth = NO;
+    for (uint16_t i = 0; i < nmethods; i++) {
+        if (methods[i] == 0x00) { hasNoAuth = YES; break; }
+    }
+    if (!hasNoAuth) {
+        const uint8_t rej[2] = {0x05, 0xFF};
+        MEAFWriteAllFD(clientFD, rej, sizeof(rej));
+        close(clientFD);
+        return;
+    }
+    const uint8_t okMethod[2] = {0x05, 0x00};
+    if (!MEAFWriteAllFD(clientFD, okMethod, sizeof(okMethod))) {
+        close(clientFD);
+        return;
+    }
+
+    uint8_t reqHdr[4];
+    if (!MEAFReadExactFD(clientFD, reqHdr, 4) || reqHdr[0] != 0x05) {
+        close(clientFD);
+        return;
+    }
+    if (reqHdr[1] != 0x01) { // Only TCP CONNECT supported
+        const uint8_t badCmd[10] = {0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+        MEAFWriteAllFD(clientFD, badCmd, sizeof(badCmd));
+        close(clientFD);
+        return;
+    }
+
+    NSString *host = nil;
+    uint8_t atyp = reqHdr[3];
+    if (atyp == 0x01) { // IPv4
+        uint8_t ip4[4];
+        if (!MEAFReadExactFD(clientFD, ip4, 4)) { close(clientFD); return; }
+        char ipStr[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, ip4, ipStr, sizeof(ipStr))) {
+            host = @(ipStr);
+        }
+    } else if (atyp == 0x03) { // Domain name
+        uint8_t dlen = 0;
+        if (!MEAFReadExactFD(clientFD, &dlen, 1) || dlen == 0) { close(clientFD); return; }
+        char dom[256];
+        if (!MEAFReadExactFD(clientFD, dom, dlen)) { close(clientFD); return; }
+        dom[dlen] = '\0';
+        host = @(dom);
+    } else if (atyp == 0x04) { // IPv6
+        uint8_t ip6[16];
+        if (!MEAFReadExactFD(clientFD, ip6, 16)) { close(clientFD); return; }
+        char ipStr[INET6_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET6, ip6, ipStr, sizeof(ipStr))) {
+            host = @(ipStr);
+        }
+    } else {
+        const uint8_t badAddr[10] = {0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+        MEAFWriteAllFD(clientFD, badAddr, sizeof(badAddr));
+        close(clientFD);
+        return;
+    }
+
+    uint8_t portBytes[2];
+    if (!MEAFReadExactFD(clientFD, portBytes, 2)) { close(clientFD); return; }
+    uint16_t dstPort = (uint16_t)(((uint16_t)portBytes[0] << 8) | (uint16_t)portBytes[1]);
+    NSString *portStr = [NSString stringWithFormat:@"%u", (unsigned)dstPort];
+    atomic_fetch_add(&g_af_egress_proxy_socks5, 1);
+
+    BOOL isReady = NO;
+    nw_connection_t conn = MEAFEgressOpenUpstream(host, portStr, &isReady);
+    if (!conn || !isReady) {
+        const uint8_t failReply[10] = {0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+        MEAFWriteAllFD(clientFD, failReply, sizeof(failReply));
+        close(clientFD);
+        return;
+    }
+
+    struct timeval longTv = {.tv_sec = 60, .tv_usec = 0};
+    setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &longTv, sizeof(longTv));
+    setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &longTv, sizeof(longTv));
+
+    const uint8_t okReply[10] = {0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
+    if (!MEAFWriteAllFD(clientFD, okReply, sizeof(okReply))) {
+        nw_connection_cancel(conn);
+        close(clientFD);
+        return;
+    }
+    MEAFEgressProxyPump(clientFD, conn);
+}
+
 static void MEAFEgressProxyHandleClient(int clientFD) {
     @autoreleasepool {
+        atomic_fetch_add(&g_af_egress_proxy_accepts, 1);
         int one = 1;
         setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
         struct timeval tv = {.tv_sec = 8, .tv_usec = 0};
         setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+        // Auto-detect SOCKS5 (first byte 0x05) vs HTTP / HTTPS CONNECT on the same listener
+        uint8_t firstByte = 0;
+        if (!MEAFReadExactFD(clientFD, &firstByte, 1)) {
+            close(clientFD);
+            return;
+        }
+        if (firstByte == 0x05) {
+            MEAFEgressProxyHandleSOCKS5(clientFD);
+            return;
+        }
+
         NSMutableData *headerBuf = [NSMutableData dataWithCapacity:2048];
+        [headerBuf appendBytes:&firstByte length:1];
         NSInteger headerEnd = -1;
         uint8_t tmp[4096];
         while (headerBuf.length < 65536) {
@@ -979,6 +1171,7 @@ static void MEAFEgressProxyHandleClient(int clientFD) {
         NSData *initialUpstreamPayload = nil;
 
         if (isConnect) {
+            atomic_fetch_add(&g_af_egress_proxy_connect, 1);
             if ([target hasPrefix:@"["]) {
                 NSRange closeB = [target rangeOfString:@"]"];
                 if (closeB.location != NSNotFound && closeB.location > 1) {
@@ -997,6 +1190,7 @@ static void MEAFEgressProxyHandleClient(int clientFD) {
                 }
             }
         } else {
+            atomic_fetch_add(&g_af_egress_proxy_http, 1);
             NSURL *u = [NSURL URLWithString:target];
             host = u.host;
             if (u.port) portStr = [u.port stringValue];
@@ -1037,48 +1231,20 @@ static void MEAFEgressProxyHandleClient(int clientFD) {
             return;
         }
 
-        nw_parameters_t params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
-        int mode = atomic_load(&g_af_egress_mode);
-        if (mode == 1) {
-            nw_parameters_set_required_interface_type(params, nw_interface_type_cellular);
-            nw_parameters_prohibit_interface_type(params, nw_interface_type_wifi);
-        } else if (mode == 2) {
-            nw_parameters_set_required_interface_type(params, nw_interface_type_wifi);
-            nw_parameters_prohibit_interface_type(params, nw_interface_type_cellular);
-        }
-
-        nw_endpoint_t ep = nw_endpoint_create_host(host.UTF8String, portStr.UTF8String);
-        nw_connection_t conn = nw_connection_create(ep, params);
-        dispatch_queue_t ioQueue = MEAFEgressProxyQueue();
-        nw_connection_set_queue(conn, ioQueue);
-
-        dispatch_semaphore_t readySem = dispatch_semaphore_create(0);
-        __block atomic_int signaled = ATOMIC_VAR_INIT(0);
-        __block BOOL isReady = NO;
-        nw_connection_set_state_changed_handler(conn, ^(nw_connection_state_t state, __unused nw_error_t err) {
-            if (state == nw_connection_state_ready) {
-                isReady = YES;
-                if (atomic_exchange(&signaled, 1) == 0) dispatch_semaphore_signal(readySem);
-            } else if (state == nw_connection_state_failed || state == nw_connection_state_cancelled) {
-                if (atomic_exchange(&signaled, 1) == 0) dispatch_semaphore_signal(readySem);
-            }
-        });
-        nw_connection_start(conn);
-        dispatch_semaphore_wait(readySem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)));
-
-        if (!isReady) {
-            nw_connection_cancel(conn);
+        BOOL isReady = NO;
+        nw_connection_t conn = MEAFEgressOpenUpstream(host, portStr, &isReady);
+        if (!conn || !isReady) {
             const char *fail = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             MEAFWriteAllFD(clientFD, fail, strlen(fail));
             close(clientFD);
             return;
         }
 
-        // Clear short header timeout before long-lived tunnel/streaming pump
         struct timeval longTv = {.tv_sec = 60, .tv_usec = 0};
         setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &longTv, sizeof(longTv));
         setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &longTv, sizeof(longTv));
 
+        dispatch_queue_t nwQueue = MEAFEgressNWQueue();
         if (isConnect) {
             const char *okResp = "HTTP/1.1 200 Connection Established\r\n\r\n";
             if (!MEAFWriteAllFD(clientFD, okResp, strlen(okResp))) {
@@ -1089,13 +1255,13 @@ static void MEAFEgressProxyHandleClient(int clientFD) {
             if ((NSUInteger)headerEnd < headerBuf.length) {
                 NSUInteger extraLen = headerBuf.length - (NSUInteger)headerEnd;
                 dispatch_data_t extraData = dispatch_data_create(((const uint8_t *)headerBuf.bytes) + headerEnd,
-                                                                 extraLen, ioQueue, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                                                                 extraLen, nwQueue, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
                 nw_connection_send(conn, extraData, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(__unused nw_error_t e) {});
             }
         } else if (initialUpstreamPayload.length > 0) {
             dispatch_data_t reqData = dispatch_data_create(initialUpstreamPayload.bytes,
                                                            initialUpstreamPayload.length,
-                                                           ioQueue,
+                                                           nwQueue,
                                                            DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             nw_connection_send(conn, reqData, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(__unused nw_error_t e) {});
         }
@@ -1166,10 +1332,68 @@ static void MEAFEgressProxyStop(void) {
     @synchronized(g_af_lock) {
         int fd = atomic_exchange(&g_af_egress_proxy_listen_fd, -1);
         atomic_store(&g_af_egress_proxy_port, 0);
+        atomic_store(&g_af_egress_nw_proxy_active, 0);
         if (fd >= 0) {
             shutdown(fd, SHUT_RDWR);
             close(fd);
         }
+    }
+}
+
+typedef void *(*me_nw_proxy_socksv5_fn)(void *);
+typedef void (*me_nw_proxy_failover_fn)(void *, bool);
+typedef void (*me_nw_proxy_excl_domain_fn)(void *, const char *);
+
+static id MEAFCreateNWProxyConfig(uint16_t proxyPort) {
+    if (proxyPort == 0) return nil;
+    static me_nw_proxy_socksv5_fn s_createSocks5 = NULL;
+    static me_nw_proxy_failover_fn s_setFailover = NULL;
+    static me_nw_proxy_excl_domain_fn s_addExcl = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s_createSocks5 = (me_nw_proxy_socksv5_fn)dlsym(RTLD_DEFAULT, "nw_proxy_config_create_socksv5");
+        s_setFailover = (me_nw_proxy_failover_fn)dlsym(RTLD_DEFAULT, "nw_proxy_config_set_failover_allowed");
+        s_addExcl = (me_nw_proxy_excl_domain_fn)dlsym(RTLD_DEFAULT, "nw_proxy_config_add_excluded_domain");
+    });
+    if (!s_createSocks5) return nil;
+
+    char portBuf[16];
+    snprintf(portBuf, sizeof(portBuf), "%u", (unsigned)proxyPort);
+    nw_endpoint_t ep = nw_endpoint_create_host("127.0.0.1", portBuf);
+    if (!ep) return nil;
+    void *rawCfg = s_createSocks5((__bridge void *)ep);
+    if (!rawCfg) return nil;
+    if (s_setFailover) {
+        // Strict pin: never silently fall back to direct Wi-Fi
+        s_setFailover(rawCfg, false);
+    }
+    if (s_addExcl) {
+        s_addExcl(rawCfg, "localhost");
+        s_addExcl(rawCfg, "127.0.0.1");
+    }
+    return (__bridge_transfer id)rawCfg;
+}
+
+static void MEAFApplyWebKitEgressPin(int mode, uint16_t proxyPort) {
+    Class wkStoreCls = NSClassFromString(@"WKWebsiteDataStore");
+    if (!wkStoreCls) return;
+    SEL defSel = NSSelectorFromString(@"defaultDataStore");
+    SEL setSel = NSSelectorFromString(@"setProxyConfigurations:");
+    if (![wkStoreCls respondsToSelector:defSel]) return;
+    id pcObj = (mode != 0 && proxyPort > 0) ? MEAFCreateNWProxyConfig(proxyPort) : nil;
+    NSArray *arr = pcObj ? @[pcObj] : @[];
+    void (^applyBlock)(void) = ^{
+        @try {
+            id store = ((id (*)(id, SEL))objc_msgSend)(wkStoreCls, defSel);
+            if (store && [store respondsToSelector:setSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(store, setSel, arr);
+            }
+        } @catch (__unused NSException *ex) {}
+    };
+    if ([NSThread isMainThread]) {
+        applyBlock();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), applyBlock);
     }
 }
 
@@ -1188,15 +1412,55 @@ static void MEAFApplySessionConfigEgressPin(NSURLSessionConfiguration *cfg) {
                 cfg.allowsConstrainedNetworkAccess = YES;
             }
         }
+        // Disable HTTP/3 QUIC (bypasses TCP SOCKS5/HTTP proxies) and avoid pooled Wi-Fi sockets
+        SEL selHTTP3 = NSSelectorFromString(@"set_allowsHTTP3:");
+        if ([cfg respondsToSelector:selHTTP3]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, selHTTP3, NO);
+        }
+        SEL selForceNew = NSSelectorFromString(@"set_forcesNewConnections:");
+        if ([cfg respondsToSelector:selForceNew]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, selForceNew, YES);
+        }
         if (proxyPort > 0) {
-            cfg.connectionProxyDictionary = @{
-                @"HTTPEnable": @1,
-                @"HTTPProxy": @"127.0.0.1",
-                @"HTTPPort": @(proxyPort),
-                @"HTTPSEnable": @1,
-                @"HTTPSProxy": @"127.0.0.1",
-                @"HTTPSPort": @(proxyPort)
-            };
+            BOOL appliedModern = NO;
+            id pcObj = MEAFCreateNWProxyConfig(proxyPort);
+            SEL selPubProxy = NSSelectorFromString(@"setProxyConfigurations:");
+            SEL selPrivProxy = NSSelectorFromString(@"set_proxyConfigurations:");
+            SEL selGetPrivProxy = NSSelectorFromString(@"_proxyConfigurations");
+            if (pcObj) {
+                NSArray *proxyArr = @[pcObj];
+                if ([cfg respondsToSelector:selPubProxy]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(cfg, selPubProxy, proxyArr);
+                    appliedModern = YES;
+                }
+                if ([cfg respondsToSelector:selPrivProxy]) {
+                    NSArray *curPriv = [cfg respondsToSelector:selGetPrivProxy]
+                        ? ((id (*)(id, SEL))objc_msgSend)(cfg, selGetPrivProxy)
+                        : nil;
+                    if (![curPriv isKindOfClass:[NSArray class]] || curPriv.count == 0) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(cfg, selPrivProxy, proxyArr);
+                    }
+                    appliedModern = YES;
+                }
+            }
+            if (appliedModern) {
+                atomic_store(&g_af_egress_nw_proxy_active, 1);
+                cfg.connectionProxyDictionary = nil;
+            } else {
+                // iOS 14-16 fallback: configure both SOCKS5 and HTTP/HTTPS proxy dictionary keys
+                cfg.connectionProxyDictionary = @{
+                    @"SOCKSEnable": @1,
+                    @"SOCKSProxy": @"127.0.0.1",
+                    @"SOCKSPort": @(proxyPort),
+                    @"HTTPEnable": @1,
+                    @"HTTPProxy": @"127.0.0.1",
+                    @"HTTPPort": @(proxyPort),
+                    @"HTTPSEnable": @1,
+                    @"HTTPSProxy": @"127.0.0.1",
+                    @"HTTPSPort": @(proxyPort),
+                    @"ExceptionsList": @[@"localhost", @"127.0.0.1", @"::1"]
+                };
+            }
         }
     } @catch (__unused NSException *ex) {}
 }
@@ -2669,6 +2933,7 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
             MEAFEgressProxyStop();
         }
         MEAFInstallSessionEgressSwizzlesOnce();
+        MEAFApplyWebKitEgressPin(mode, proxyPort);
         BOOL inlineActive = (mode != 0) ? MEAFInstallInlineEgressHooksOnce() : (atomic_load(&g_af_egress_inline_active) != 0);
         MEAFInstallGOTHooks(NULL, NULL, NULL);
 
@@ -2713,6 +2978,7 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
             @"interface_index": @(ifIdx),
             @"inline_hooks_active": inlineActive ? @YES : @NO,
             @"egress_proxy_port": @(proxyPort),
+            @"nw_proxy_active": atomic_load(&g_af_egress_nw_proxy_active) ? @YES : @NO,
             @"session_swizzles_active": @YES,
             @"uses_webkit": usesWebKit ? @YES : @NO,
             @"pid": @(getpid())
@@ -2795,6 +3061,12 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
             @"https_egress_ip": httpsIp,
             @"https_error": httpsErr,
             @"egress_proxy_port": @(atomic_load(&g_af_egress_proxy_port)),
+            @"nw_proxy_active": atomic_load(&g_af_egress_nw_proxy_active) ? @YES : @NO,
+            @"proxy_accepts": @(atomic_load(&g_af_egress_proxy_accepts)),
+            @"proxy_socks5": @(atomic_load(&g_af_egress_proxy_socks5)),
+            @"proxy_connect": @(atomic_load(&g_af_egress_proxy_connect)),
+            @"proxy_http": @(atomic_load(&g_af_egress_proxy_http)),
+            @"proxy_fail": @(atomic_load(&g_af_egress_proxy_fail)),
             @"status_code": @(statusCode),
             @"target": (mode == 1 ? @"cellular" : (mode == 2 ? @"wifi" : @"default")),
             @"interface": g_af_egress_if_name[0] ? @(g_af_egress_if_name) : @"",
@@ -2860,8 +3132,9 @@ static void MEAntiFraudAutoInit(void) {
                 atomic_store(&g_af_egress_mode, mode);
                 atomic_store(&g_af_egress_if_idx, idx);
                 atomic_fetch_add(&g_af_egress_gen, 1);
-                MEAFEgressProxyEnsureStarted();
+                uint16_t autoPort = MEAFEgressProxyEnsureStarted();
                 MEAFInstallSessionEgressSwizzlesOnce();
+                MEAFApplyWebKitEgressPin(mode, autoPort);
                 MEAFInstallInlineEgressHooksOnce();
                 MEAFInstallGOTHooks(NULL, NULL, NULL);
             }
