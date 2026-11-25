@@ -1762,13 +1762,16 @@ static void MEAFURLProtoRecvNext(MEAFEgressURLProtocol *proto, nw_connection_t c
     s_af_egress_depth++;
     nw_parameters_t params = nil;
     if (isTLS) {
-        nw_protocol_options_t tlsOpts = nw_tls_create_options();
-        sec_protocol_options_t secOpts = nw_tls_copy_sec_protocol_options(tlsOpts);
-        if (secOpts) {
-            sec_protocol_options_set_tls_server_name(secOpts, host.UTF8String);
-            sec_protocol_options_add_tls_application_protocol(secOpts, "http/1.1");
-        }
-        params = nw_parameters_create_secure_tcp(tlsOpts, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+        NSString *sniHost = [host copy];
+        params = nw_parameters_create_secure_tcp(^(nw_protocol_options_t tlsOpts) {
+            sec_protocol_options_t secOpts = nw_tls_copy_sec_protocol_options(tlsOpts);
+            if (secOpts) {
+                if (sniHost.length > 0) {
+                    sec_protocol_options_set_tls_server_name(secOpts, sniHost.UTF8String);
+                }
+                sec_protocol_options_add_tls_application_protocol(secOpts, "http/1.1");
+            }
+        }, NW_PARAMETERS_DEFAULT_CONFIGURATION);
     } else {
         params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
     }
