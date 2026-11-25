@@ -515,12 +515,17 @@ static NSDictionary *MCPWatchdogDisarm(NSDictionary *req) {
     MCPEnsureHelperdStateInit();
     NSString *token = [req[@"token"] isKindOfClass:[NSString class]] ? req[@"token"] : @"";
     BOOL wasArmed = NO;
+    NSUInteger clearedCount = 0;
     [gWatchdogLock lock];
-    if (token.length > 0) {
+    if (token.length > 0 && ![token isEqualToString:@"*"]) {
         wasArmed = (gArmedWatchdogs[token] != nil);
-        [gArmedWatchdogs removeObjectForKey:token];
+        if (wasArmed) {
+            clearedCount = 1;
+            [gArmedWatchdogs removeObjectForKey:token];
+        }
     } else {
-        wasArmed = (gArmedWatchdogs.count > 0);
+        clearedCount = gArmedWatchdogs.count;
+        wasArmed = (clearedCount > 0);
         [gArmedWatchdogs removeAllObjects];
     }
     [gWatchdogLock unlock];
@@ -528,7 +533,8 @@ static NSDictionary *MCPWatchdogDisarm(NSDictionary *req) {
         @"ok": @YES,
         @"helperd_op": @"watchdog_disarm",
         @"token": token,
-        @"was_armed": @(wasArmed)
+        @"was_armed": wasArmed ? @YES : @NO,
+        @"cleared_count": @(clearedCount)
     };
 }
 
@@ -667,6 +673,30 @@ static NSDictionary *MCPStopDetachedProcessRequest(NSDictionary *req) {
     NSString *tag = [req[@"tag"] isKindOfClass:[NSString class]] ? req[@"tag"] : @"";
     pid_t pid = [req[@"pid"] respondsToSelector:@selector(intValue)] ? (pid_t)[req[@"pid"] intValue] : 0;
 
+    if (pid <= 1 && (tag.length == 0 || [tag isEqualToString:@"*"])) {
+        NSDictionary<NSString *, NSNumber *> *allCopy = nil;
+        [gWatchdogLock lock];
+        allCopy = [gDetachedPids copy];
+        [gDetachedPids removeAllObjects];
+        [gWatchdogLock unlock];
+        NSUInteger stoppedCount = 0;
+        for (NSString *k in allCopy) {
+            pid_t p = (pid_t)[allCopy[k] intValue];
+            if (p > 1) {
+                if (kill(p, SIGTERM) == 0) stoppedCount++;
+                usleep(80 * 1000);
+                if (kill(p, 0) == 0) kill(p, SIGKILL);
+            }
+        }
+        return @{
+            @"ok": @YES,
+            @"helperd_op": @"stop_detached",
+            @"tag": tag.length ? tag : @"*",
+            @"stopped_count": @(stoppedCount),
+            @"stopped": stoppedCount > 0 ? @YES : @NO
+        };
+    }
+
     [gWatchdogLock lock];
     if (pid <= 1 && tag.length > 0 && gDetachedPids[tag]) {
         pid = (pid_t)[gDetachedPids[tag] intValue];
@@ -688,7 +718,7 @@ static NSDictionary *MCPStopDetachedProcessRequest(NSDictionary *req) {
         @"helperd_op": @"stop_detached",
         @"tag": tag,
         @"pid": @(pid),
-        @"stopped": @(stopped)
+        @"stopped": stopped ? @YES : @NO
     };
 }
 

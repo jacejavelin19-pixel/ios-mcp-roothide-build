@@ -1,6 +1,7 @@
 #import "MCPEngineManager.h"
 #import "AppManager.h"
 #import "MCPProcessUtil.h"
+#import "SystemCapabilitiesManager.h"
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
@@ -279,11 +280,16 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
     if (error) *error = nil;
     NSString *appErr = nil;
     NSDictionary *appInfo = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:&appErr];
-    NSString *bundlePath = appInfo[@"bundle_path"] ?: @"";
-    NSString *mainExec = appInfo[@"executable_path"] ?: @"";
-    if (!bundlePath.length || !mainExec.length) { if (error) *error = appErr ?: @"App not found"; return nil; }
-
     NSDictionary *session = [self loadSessionForBundleId:bundleId];
+    NSString *bundlePath = appInfo[@"bundle_path"] ?: session[@"bundle_path"] ?: @"";
+    NSString *mainExec = appInfo[@"executable_path"] ?: session[@"main_executable"] ?: @"";
+    if (!bundlePath.length || !mainExec.length) {
+        [[SystemCapabilitiesManager sharedInstance] clearAppEgressPinForBundleId:bundleId];
+        [self deleteSessionForBundleId:bundleId];
+        if (error) *error = appErr ?: @"App not found";
+        return nil;
+    }
+
     NSString *stealthName = [session[@"stealth_dylib_name"] isKindOfClass:[NSString class]] ? session[@"stealth_dylib_name"] : @"libAppleCoreSVG_";
     NSString *engineName = [session[@"engine_dylib_name"] isKindOfClass:[NSString class]] ? session[@"engine_dylib_name"] : @"libAppleMediaKit_";
 
@@ -300,13 +306,14 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
         return nil;
     }
 
-    // Clean up socket + config + the engine's own cfg inside the container tmp.
+    // Clean up socket + config + egress pin + engine cfg inside the container tmp.
     NSString *dataContainer = session[@"data_container_path"];
     NSMutableArray *cleanup = [NSMutableArray array];
     if ([session[@"socket_path"] isKindOfClass:[NSString class]]) [cleanup addObject:session[@"socket_path"]];
     if ([session[@"stealth_cfg_path"] isKindOfClass:[NSString class]]) [cleanup addObject:session[@"stealth_cfg_path"]];
     if (dataContainer.length) {
         [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcpe_cfg.json"]];
+        [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcp_egress_pin.json"]];
         [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcpcap.jsonl"]];
         [cleanup addObject:[dataContainer stringByAppendingPathComponent:@"tmp/.mcp_netcap.jsonl"]];
     }
@@ -316,6 +323,7 @@ static NSString *MCPEngineNormalizeSocket(NSString *p) {
             MCPRunRootProcess(@"/usr/libexec/ios-mcp/mcp-appmod", @[@"delete-file", p], 10.0, 16384, &o, &c, &e);
         }
     }
+    [[SystemCapabilitiesManager sharedInstance] clearAppEgressPinForBundleId:bundleId];
     [self deleteSessionForBundleId:bundleId];
 
     NSMutableDictionary *res = [([resp[@"result"] isKindOfClass:[NSDictionary class]] ? resp[@"result"] : @{}) mutableCopy];

@@ -4,7 +4,9 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Security/Security.h>
 #import <CFNetwork/CFNetwork.h>
+#import <Network/Network.h>
 #import <SystemConfiguration/SystemConfiguration.h>
+#include <poll.h>
 #import <CoreMotion/CoreMotion.h>
 #include <objc/message.h>
 #include <dlfcn.h>
@@ -83,6 +85,10 @@ static _Atomic int g_af_objc_cloak_active = 0;
 static _Atomic int g_af_thread_cloak_active = 0;
 static _Atomic int g_af_egress_mode = 0; // 0=default, 1=cellular, 2=wifi
 static _Atomic unsigned int g_af_egress_if_idx = 0;
+static _Atomic uint64_t g_af_egress_gen = 0;
+static _Atomic int g_af_egress_inline_active = 0;
+static _Atomic uint16_t g_af_egress_proxy_port = 0;
+static _Atomic int g_af_egress_proxy_listen_fd = -1;
 static char g_af_egress_if_name[32] = "pdp_ip0";
 
 static NSMutableDictionary *g_af_persona = nil;
@@ -90,6 +96,9 @@ static NSMutableArray<NSDictionary *> *g_af_bound_slots = nil;
 static NSMutableArray<NSDictionary *> *g_af_sensor_payloads = nil;
 static NSMutableArray<NSDictionary *> *g_af_attest_events = nil;
 static NSMutableDictionary *g_af_virtual_keychain = nil;
+static NSHashTable<NSURLSession *> *g_af_tracked_sessions = nil;
+static NSURLSession *g_af_pinned_shared_session = nil;
+static uint64_t g_af_pinned_shared_gen = 0;
 static CFAbsoluteTime g_af_last_touch_time = 0;
 static CFAbsoluteTime g_af_persona_start_time = 0;
 static pthread_t g_af_engine_thread = NULL;
@@ -114,6 +123,7 @@ static void MEAFInit(void) {
         g_af_sensor_payloads = [NSMutableArray array];
         g_af_attest_events = [NSMutableArray array];
         g_af_virtual_keychain = [NSMutableDictionary dictionary];
+        g_af_tracked_sessions = [NSHashTable weakObjectsHashTable];
         g_af_persona_start_time = CFAbsoluteTimeGetCurrent();
     });
 }
@@ -633,7 +643,7 @@ static int hook_af_backtrace(void **buffer, int size) {
 }
 
 static CFDictionaryRef hook_af_CFNetworkCopySystemProxySettings(void) {
-    if (atomic_load(&g_af_network_cloak_active) && MEDepth == 0) {
+    if ((atomic_load(&g_af_network_cloak_active) || atomic_load(&g_af_egress_mode) == 1) && MEDepth == 0) {
         return (__bridge_retained CFDictionaryRef)@{};
     }
     return orig_af_CFNetworkCopySystemProxySettings ? orig_af_CFNetworkCopySystemProxySettings() : (__bridge_retained CFDictionaryRef)@{};
@@ -687,23 +697,87 @@ static Boolean hook_af_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef ta
 
 typedef void *(*me_nw_params_create_fn)(void *, void *);
 typedef void *(*me_nw_params_create_plain_fn)(void);
+typedef void *(*me_nw_conn_create_fn)(void *, void *);
+typedef void *(*me_nw_params_copy_fn)(void *);
+typedef void (*me_nw_release_fn)(void *);
 typedef void (*me_nw_params_set_req_if_fn)(void *, int);
 typedef void (*me_nw_params_prohibit_if_fn)(void *, int);
+typedef void (*me_nw_params_clear_prohibit_fn)(void *);
+typedef const char *(*me_nw_endpoint_hostname_fn)(void *);
+typedef const struct sockaddr *(*me_nw_endpoint_addr_fn)(void *);
+typedef void (*me_inline_hook_fn)(void *, void *, void **);
+
 static me_nw_params_create_fn orig_af_nw_create_tcp = NULL;
 static me_nw_params_create_fn orig_af_nw_create_udp = NULL;
 static me_nw_params_create_plain_fn orig_af_nw_create_plain = NULL;
+static me_nw_conn_create_fn orig_af_nw_conn_create = NULL;
+static int (*orig_af_inline_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+static __thread unsigned s_af_egress_depth = 0;
+
+static BOOL MEAFSockaddrIsLocalOrLAN(const struct sockaddr *addr, socklen_t addrlen) {
+    if (!addr) return YES;
+    if (addr->sa_family == AF_UNIX) return YES;
+    if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
+        uint32_t ip = ntohl(((const struct sockaddr_in *)addr)->sin_addr.s_addr);
+        uint8_t a = (uint8_t)((ip >> 24) & 0xFF);
+        uint8_t b = (uint8_t)((ip >> 16) & 0xFF);
+        if (a == 127 || ip == 0 || a == 10) return YES;
+        if (a == 192 && b == 168) return YES;
+        if (a == 172 && (b >= 16 && b <= 31)) return YES;
+        if (a == 169 && b == 254) return YES;
+        return NO;
+    }
+    if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
+        const struct in6_addr *in6 = &((const struct sockaddr_in6 *)addr)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(in6) || IN6_IS_ADDR_UNSPECIFIED(in6) || IN6_IS_ADDR_LINKLOCAL(in6)) return YES;
+        return NO;
+    }
+    return NO;
+}
+
+static BOOL MEAFEndpointIsLocalOrLAN(void *endpoint) {
+    if (!endpoint) return NO;
+    static me_nw_endpoint_hostname_fn s_getHost = NULL;
+    static me_nw_endpoint_addr_fn s_getAddr = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s_getHost = (me_nw_endpoint_hostname_fn)dlsym(RTLD_DEFAULT, "nw_endpoint_get_hostname");
+        s_getAddr = (me_nw_endpoint_addr_fn)dlsym(RTLD_DEFAULT, "nw_endpoint_get_address");
+    });
+    if (s_getAddr) {
+        const struct sockaddr *sa = s_getAddr(endpoint);
+        if (sa) {
+            socklen_t slen = (sa->sa_family == AF_INET) ? sizeof(struct sockaddr_in) :
+                             ((sa->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr));
+            if (MEAFSockaddrIsLocalOrLAN(sa, slen)) return YES;
+        }
+    }
+    if (s_getHost) {
+        const char *h = s_getHost(endpoint);
+        if (h && *h) {
+            if (strcmp(h, "localhost") == 0 || strcmp(h, "127.0.0.1") == 0 || strcmp(h, "::1") == 0 ||
+                strncmp(h, "10.", 3) == 0 || strncmp(h, "192.168.", 8) == 0 || strncmp(h, "169.254.", 8) == 0) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
 
 static void MEAFApplyNetworkParametersPin(void *params) {
     int mode = atomic_load(&g_af_egress_mode);
     if (!params || mode == 0) return;
     static me_nw_params_set_req_if_fn s_setReq = NULL;
     static me_nw_params_prohibit_if_fn s_prohibit = NULL;
+    static me_nw_params_clear_prohibit_fn s_clearProhibit = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         s_setReq = (me_nw_params_set_req_if_fn)dlsym(RTLD_DEFAULT, "nw_parameters_set_required_interface_type");
         s_prohibit = (me_nw_params_prohibit_if_fn)dlsym(RTLD_DEFAULT, "nw_parameters_prohibit_interface_type");
+        s_clearProhibit = (me_nw_params_clear_prohibit_fn)dlsym(RTLD_DEFAULT, "nw_parameters_clear_prohibited_interface_types");
     });
     // nw_interface_type_wifi = 1, nw_interface_type_cellular = 2
+    if (s_clearProhibit) s_clearProhibit(params);
     if (mode == 1) {
         if (s_setReq) s_setReq(params, 2);
         if (s_prohibit) s_prohibit(params, 1);
@@ -715,20 +789,616 @@ static void MEAFApplyNetworkParametersPin(void *params) {
 
 static void *hook_af_nw_create_tcp(void *tls, void *tcp) {
     void *p = orig_af_nw_create_tcp ? orig_af_nw_create_tcp(tls, tcp) : NULL;
-    if (p && MEDepth == 0) MEAFApplyNetworkParametersPin(p);
+    if (p && s_af_egress_depth == 0) MEAFApplyNetworkParametersPin(p);
     return p;
 }
 
 static void *hook_af_nw_create_udp(void *dtls, void *udp) {
     void *p = orig_af_nw_create_udp ? orig_af_nw_create_udp(dtls, udp) : NULL;
-    if (p && MEDepth == 0) MEAFApplyNetworkParametersPin(p);
+    if (p && s_af_egress_depth == 0) MEAFApplyNetworkParametersPin(p);
     return p;
 }
 
 static void *hook_af_nw_create_plain(void) {
     void *p = orig_af_nw_create_plain ? orig_af_nw_create_plain() : NULL;
-    if (p && MEDepth == 0) MEAFApplyNetworkParametersPin(p);
+    if (p && s_af_egress_depth == 0) MEAFApplyNetworkParametersPin(p);
     return p;
+}
+
+static void *hook_af_nw_conn_create(void *endpoint, void *params) {
+    int mode = atomic_load(&g_af_egress_mode);
+    if (mode != 0 && params && s_af_egress_depth == 0 && !MEAFEndpointIsLocalOrLAN(endpoint)) {
+        static me_nw_params_copy_fn s_copyParams = NULL;
+        static me_nw_release_fn s_release = NULL;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            s_copyParams = (me_nw_params_copy_fn)dlsym(RTLD_DEFAULT, "nw_parameters_copy");
+            s_release = (me_nw_release_fn)dlsym(RTLD_DEFAULT, "nw_release");
+        });
+        s_af_egress_depth++;
+        void *cloned = s_copyParams ? s_copyParams(params) : NULL;
+        void *useParams = cloned ? cloned : params;
+        MEAFApplyNetworkParametersPin(useParams);
+        void *conn = orig_af_nw_conn_create ? orig_af_nw_conn_create(endpoint, useParams) : NULL;
+        if (cloned && s_release) s_release(cloned);
+        s_af_egress_depth--;
+        return conn;
+    }
+    return orig_af_nw_conn_create ? orig_af_nw_conn_create(endpoint, params) : NULL;
+}
+
+static dispatch_queue_t MEAFEgressProxyQueue(void) {
+    static dispatch_queue_t q = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.apple.cfnetwork.egress.io", DISPATCH_QUEUE_CONCURRENT);
+    });
+    return q;
+}
+
+static BOOL MEAFWriteAllFD(int fd, const void *buf, size_t len) {
+    const uint8_t *ptr = (const uint8_t *)buf;
+    size_t rem = len;
+    while (rem > 0) {
+        ssize_t w = send(fd, ptr, rem, 0);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return NO;
+        ptr += (size_t)w;
+        rem -= (size_t)w;
+    }
+    return YES;
+}
+
+static void MEAFEgressProxyRecvNext(int clientFD, nw_connection_t conn, NSMutableData *closedBox, void (^teardown)(void)) {
+    atomic_int *closedFlag = (atomic_int *)closedBox.mutableBytes;
+    if (atomic_load(closedFlag)) return;
+    nw_connection_receive(conn, 1, 65536, ^(dispatch_data_t content, __unused nw_content_context_t context, bool isComplete, nw_error_t error) {
+        if (atomic_load(closedFlag)) return;
+        if (content) {
+            __block BOOL writeOk = YES;
+            dispatch_data_apply(content, ^bool(__unused dispatch_data_t region, __unused size_t offset, const void *buffer, size_t size) {
+                if (size > 0 && !MEAFWriteAllFD(clientFD, buffer, size)) {
+                    writeOk = NO;
+                    return false;
+                }
+                return true;
+            });
+            if (!writeOk) {
+                teardown();
+                return;
+            }
+        }
+        if (isComplete || error) {
+            teardown();
+            return;
+        }
+        MEAFEgressProxyRecvNext(clientFD, conn, closedBox, teardown);
+    });
+}
+
+static void MEAFEgressProxyPump(int clientFD, nw_connection_t conn) {
+    dispatch_queue_t q = MEAFEgressProxyQueue();
+    NSMutableData *closedBox = [NSMutableData dataWithLength:sizeof(atomic_int)];
+    atomic_int *closedFlag = (atomic_int *)closedBox.mutableBytes;
+    atomic_init(closedFlag, 0);
+
+    void (^teardown)(void) = ^{
+        atomic_int *flag = (atomic_int *)closedBox.mutableBytes;
+        if (atomic_exchange(flag, 1) == 0) {
+            shutdown(clientFD, SHUT_RDWR);
+            close(clientFD);
+            nw_connection_cancel(conn);
+        }
+    };
+
+    // Direction 1: remote nw_connection -> local clientFD
+    MEAFEgressProxyRecvNext(clientFD, conn, closedBox, teardown);
+
+    // Direction 2: local clientFD -> remote nw_connection (blocking reader on concurrent queue)
+    dispatch_async(q, ^{
+        uint8_t buf[32768];
+        atomic_int *flag = (atomic_int *)closedBox.mutableBytes;
+        while (!atomic_load(flag)) {
+            struct pollfd pfd = {.fd = clientFD, .events = POLLIN, .revents = 0};
+            int pr = poll(&pfd, 1, 1000);
+            if (pr < 0 && errno == EINTR) continue;
+            if (pr < 0) break;
+            if (pr == 0) continue;
+            if (pfd.revents & (POLLERR | POLLNVAL)) break;
+            ssize_t n = recv(clientFD, buf, sizeof(buf), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n == 0) {
+                // Client half-closed write side; propagate FIN upstream and let remote response drain
+                nw_connection_send(conn, NULL, NW_CONNECTION_FINAL_MESSAGE_CONTEXT, true, ^(__unused nw_error_t e) {});
+                return;
+            }
+            if (n < 0) break;
+            dispatch_data_t chunk = dispatch_data_create(buf, (size_t)n, q, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+            dispatch_semaphore_t sendSem = dispatch_semaphore_create(0);
+            __block BOOL sendOk = YES;
+            nw_connection_send(conn, chunk, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(nw_error_t sendErr) {
+                if (sendErr) sendOk = NO;
+                dispatch_semaphore_signal(sendSem);
+            });
+            dispatch_semaphore_wait(sendSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)));
+            if (!sendOk) break;
+        }
+        teardown();
+    });
+}
+
+static void MEAFEgressProxyHandleClient(int clientFD) {
+    @autoreleasepool {
+        int one = 1;
+        setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        struct timeval tv = {.tv_sec = 8, .tv_usec = 0};
+        setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        NSMutableData *headerBuf = [NSMutableData dataWithCapacity:2048];
+        NSInteger headerEnd = -1;
+        uint8_t tmp[4096];
+        while (headerBuf.length < 65536) {
+            ssize_t n = recv(clientFD, tmp, sizeof(tmp), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            [headerBuf appendBytes:tmp length:(NSUInteger)n];
+            const char *bytes = (const char *)headerBuf.bytes;
+            size_t len = headerBuf.length;
+            for (size_t i = 0; i + 3 < len; i++) {
+                if (bytes[i] == '\r' && bytes[i+1] == '\n' && bytes[i+2] == '\r' && bytes[i+3] == '\n') {
+                    headerEnd = (NSInteger)(i + 4);
+                    break;
+                }
+            }
+            if (headerEnd >= 0) break;
+        }
+        if (headerEnd < 0) {
+            close(clientFD);
+            return;
+        }
+
+        NSString *hdrStr = [[NSString alloc] initWithBytes:headerBuf.bytes length:(NSUInteger)headerEnd encoding:NSISOLatin1StringEncoding] ?: @"";
+        NSArray<NSString *> *lines = [hdrStr componentsSeparatedByString:@"\r\n"];
+        if (lines.count == 0) {
+            close(clientFD);
+            return;
+        }
+        NSArray<NSString *> *parts = [lines[0] componentsSeparatedByString:@" "];
+        if (parts.count < 3) {
+            close(clientFD);
+            return;
+        }
+        NSString *method = parts[0];
+        NSString *target = parts[1];
+        NSString *version = parts[2];
+
+        BOOL isConnect = [[method uppercaseString] isEqualToString:@"CONNECT"];
+        NSString *host = nil;
+        NSString *portStr = isConnect ? @"443" : @"80";
+        NSData *initialUpstreamPayload = nil;
+
+        if (isConnect) {
+            if ([target hasPrefix:@"["]) {
+                NSRange closeB = [target rangeOfString:@"]"];
+                if (closeB.location != NSNotFound && closeB.location > 1) {
+                    host = [target substringWithRange:NSMakeRange(1, closeB.location - 1)];
+                    if (closeB.location + 2 < target.length && [target characterAtIndex:closeB.location + 1] == ':') {
+                        portStr = [target substringFromIndex:closeB.location + 2];
+                    }
+                }
+            } else {
+                NSRange colon = [target rangeOfString:@":" options:NSBackwardsSearch];
+                if (colon.location != NSNotFound) {
+                    host = [target substringToIndex:colon.location];
+                    portStr = [target substringFromIndex:colon.location + 1];
+                } else {
+                    host = target;
+                }
+            }
+        } else {
+            NSURL *u = [NSURL URLWithString:target];
+            host = u.host;
+            if (u.port) portStr = [u.port stringValue];
+            NSString *originPath = u.path.length ? u.path : @"/";
+            if (u.query.length) originPath = [originPath stringByAppendingFormat:@"?%@", u.query];
+            NSMutableString *rewritten = [NSMutableString stringWithFormat:@"%@ %@ %@\r\n", method, originPath, version];
+            for (NSUInteger i = 1; i < lines.count; i++) {
+                NSString *ln = lines[i];
+                if (!ln.length) continue;
+                NSString *low = [ln lowercaseString];
+                if ([low hasPrefix:@"proxy-connection:"]) continue;
+                if ([low hasPrefix:@"proxy-authorization:"]) continue;
+                if (!host.length && [low hasPrefix:@"host:"]) {
+                    NSString *hv = [[ln substringFromIndex:5] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSRange colon = [hv rangeOfString:@":" options:NSBackwardsSearch];
+                    if (colon.location != NSNotFound && ![hv hasPrefix:@"["]) {
+                        host = [hv substringToIndex:colon.location];
+                        portStr = [hv substringFromIndex:colon.location + 1];
+                    } else {
+                        host = hv;
+                    }
+                }
+                [rewritten appendFormat:@"%@\r\n", ln];
+            }
+            [rewritten appendString:@"\r\n"];
+            NSMutableData *outData = [[rewritten dataUsingEncoding:NSISOLatin1StringEncoding] mutableCopy];
+            if ((NSUInteger)headerEnd < headerBuf.length) {
+                [outData appendBytes:((const uint8_t *)headerBuf.bytes) + headerEnd
+                              length:headerBuf.length - (NSUInteger)headerEnd];
+            }
+            initialUpstreamPayload = outData;
+        }
+
+        if (!host.length || !portStr.length) {
+            const char *bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            MEAFWriteAllFD(clientFD, bad, strlen(bad));
+            close(clientFD);
+            return;
+        }
+
+        nw_parameters_t params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+        int mode = atomic_load(&g_af_egress_mode);
+        if (mode == 1) {
+            nw_parameters_set_required_interface_type(params, nw_interface_type_cellular);
+            nw_parameters_prohibit_interface_type(params, nw_interface_type_wifi);
+        } else if (mode == 2) {
+            nw_parameters_set_required_interface_type(params, nw_interface_type_wifi);
+            nw_parameters_prohibit_interface_type(params, nw_interface_type_cellular);
+        }
+
+        nw_endpoint_t ep = nw_endpoint_create_host(host.UTF8String, portStr.UTF8String);
+        nw_connection_t conn = nw_connection_create(ep, params);
+        dispatch_queue_t ioQueue = MEAFEgressProxyQueue();
+        nw_connection_set_queue(conn, ioQueue);
+
+        dispatch_semaphore_t readySem = dispatch_semaphore_create(0);
+        __block atomic_int signaled = ATOMIC_VAR_INIT(0);
+        __block BOOL isReady = NO;
+        nw_connection_set_state_changed_handler(conn, ^(nw_connection_state_t state, __unused nw_error_t err) {
+            if (state == nw_connection_state_ready) {
+                isReady = YES;
+                if (atomic_exchange(&signaled, 1) == 0) dispatch_semaphore_signal(readySem);
+            } else if (state == nw_connection_state_failed || state == nw_connection_state_cancelled) {
+                if (atomic_exchange(&signaled, 1) == 0) dispatch_semaphore_signal(readySem);
+            }
+        });
+        nw_connection_start(conn);
+        dispatch_semaphore_wait(readySem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)));
+
+        if (!isReady) {
+            nw_connection_cancel(conn);
+            const char *fail = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            MEAFWriteAllFD(clientFD, fail, strlen(fail));
+            close(clientFD);
+            return;
+        }
+
+        // Clear short header timeout before long-lived tunnel/streaming pump
+        struct timeval longTv = {.tv_sec = 60, .tv_usec = 0};
+        setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &longTv, sizeof(longTv));
+        setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &longTv, sizeof(longTv));
+
+        if (isConnect) {
+            const char *okResp = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            if (!MEAFWriteAllFD(clientFD, okResp, strlen(okResp))) {
+                nw_connection_cancel(conn);
+                close(clientFD);
+                return;
+            }
+            if ((NSUInteger)headerEnd < headerBuf.length) {
+                NSUInteger extraLen = headerBuf.length - (NSUInteger)headerEnd;
+                dispatch_data_t extraData = dispatch_data_create(((const uint8_t *)headerBuf.bytes) + headerEnd,
+                                                                 extraLen, ioQueue, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                nw_connection_send(conn, extraData, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(__unused nw_error_t e) {});
+            }
+        } else if (initialUpstreamPayload.length > 0) {
+            dispatch_data_t reqData = dispatch_data_create(initialUpstreamPayload.bytes,
+                                                           initialUpstreamPayload.length,
+                                                           ioQueue,
+                                                           DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+            nw_connection_send(conn, reqData, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(__unused nw_error_t e) {});
+        }
+
+        MEAFEgressProxyPump(clientFD, conn);
+    }
+}
+
+static uint16_t MEAFEgressProxyEnsureStarted(void) {
+    uint16_t existing = atomic_load(&g_af_egress_proxy_port);
+    if (existing != 0 && atomic_load(&g_af_egress_proxy_listen_fd) >= 0) {
+        return existing;
+    }
+    MEAFInit();
+    @synchronized(g_af_lock) {
+        existing = atomic_load(&g_af_egress_proxy_port);
+        if (existing != 0 && atomic_load(&g_af_egress_proxy_listen_fd) >= 0) {
+            return existing;
+        }
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = htons(0);
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+            close(fd);
+            return 0;
+        }
+        socklen_t slen = sizeof(sa);
+        if (getsockname(fd, (struct sockaddr *)&sa, &slen) != 0) {
+            close(fd);
+            return 0;
+        }
+        if (listen(fd, 64) != 0) {
+            close(fd);
+            return 0;
+        }
+        uint16_t assignedPort = ntohs(sa.sin_port);
+        atomic_store(&g_af_egress_proxy_listen_fd, fd);
+        atomic_store(&g_af_egress_proxy_port, assignedPort);
+
+        dispatch_async(MEAFEgressProxyQueue(), ^{
+            while (atomic_load(&g_af_egress_proxy_listen_fd) == fd) {
+                int cfd = accept(fd, NULL, NULL);
+                if (cfd < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                fcntl(cfd, F_SETFD, FD_CLOEXEC);
+                dispatch_async(MEAFEgressProxyQueue(), ^{
+                    MEAFEgressProxyHandleClient(cfd);
+                });
+            }
+        });
+        return assignedPort;
+    }
+}
+
+static void MEAFEgressProxyStop(void) {
+    MEAFInit();
+    @synchronized(g_af_lock) {
+        int fd = atomic_exchange(&g_af_egress_proxy_listen_fd, -1);
+        atomic_store(&g_af_egress_proxy_port, 0);
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+        }
+    }
+}
+
+static void MEAFApplySessionConfigEgressPin(NSURLSessionConfiguration *cfg) {
+    if (!cfg) return;
+    int mode = atomic_load(&g_af_egress_mode);
+    if (mode == 0) return;
+    uint16_t proxyPort = MEAFEgressProxyEnsureStarted();
+    @try {
+        if (mode == 1) {
+            cfg.allowsCellularAccess = YES;
+            if ([cfg respondsToSelector:@selector(setAllowsExpensiveNetworkAccess:)]) {
+                cfg.allowsExpensiveNetworkAccess = YES;
+            }
+            if ([cfg respondsToSelector:@selector(setAllowsConstrainedNetworkAccess:)]) {
+                cfg.allowsConstrainedNetworkAccess = YES;
+            }
+        }
+        if (proxyPort > 0) {
+            cfg.connectionProxyDictionary = @{
+                @"HTTPEnable": @1,
+                @"HTTPProxy": @"127.0.0.1",
+                @"HTTPPort": @(proxyPort),
+                @"HTTPSEnable": @1,
+                @"HTTPSProxy": @"127.0.0.1",
+                @"HTTPSPort": @(proxyPort)
+            };
+        }
+    } @catch (__unused NSException *ex) {}
+}
+
+static NSURLSessionConfiguration *(*orig_af_defaultSessionConfig)(id, SEL) = NULL;
+static NSURLSessionConfiguration *(*orig_af_ephemeralSessionConfig)(id, SEL) = NULL;
+static NSURLSessionConfiguration *(*orig_af_bgSessionConfig)(id, SEL, NSString *) = NULL;
+static NSURLSession *(*orig_af_sessionWithConfig)(id, SEL, NSURLSessionConfiguration *) = NULL;
+static NSURLSession *(*orig_af_sessionWithConfigDelegate)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *) = NULL;
+static NSURLSession *(*orig_af_sharedSession)(id, SEL) = NULL;
+
+static NSURLSessionConfiguration *swizzled_af_defaultSessionConfig(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = orig_af_defaultSessionConfig ? orig_af_defaultSessionConfig(self, _cmd) : nil;
+    if (cfg && s_af_egress_depth == 0 && atomic_load(&g_af_egress_mode) != 0) {
+        s_af_egress_depth++;
+        MEAFApplySessionConfigEgressPin(cfg);
+        s_af_egress_depth--;
+    }
+    return cfg;
+}
+
+static NSURLSessionConfiguration *swizzled_af_ephemeralSessionConfig(id self, SEL _cmd) {
+    NSURLSessionConfiguration *cfg = orig_af_ephemeralSessionConfig ? orig_af_ephemeralSessionConfig(self, _cmd) : nil;
+    if (cfg && s_af_egress_depth == 0 && atomic_load(&g_af_egress_mode) != 0) {
+        s_af_egress_depth++;
+        MEAFApplySessionConfigEgressPin(cfg);
+        s_af_egress_depth--;
+    }
+    return cfg;
+}
+
+static NSURLSessionConfiguration *swizzled_af_bgSessionConfig(id self, SEL _cmd, NSString *identifier) {
+    NSURLSessionConfiguration *cfg = orig_af_bgSessionConfig ? orig_af_bgSessionConfig(self, _cmd, identifier) : nil;
+    if (cfg && s_af_egress_depth == 0 && atomic_load(&g_af_egress_mode) != 0) {
+        s_af_egress_depth++;
+        MEAFApplySessionConfigEgressPin(cfg);
+        s_af_egress_depth--;
+    }
+    return cfg;
+}
+
+static NSURLSession *swizzled_af_sessionWithConfig(id self, SEL _cmd, NSURLSessionConfiguration *cfg) {
+    NSURLSessionConfiguration *useCfg = cfg;
+    if (useCfg && s_af_egress_depth == 0 && atomic_load(&g_af_egress_mode) != 0) {
+        s_af_egress_depth++;
+        useCfg = [useCfg copy];
+        MEAFApplySessionConfigEgressPin(useCfg);
+        s_af_egress_depth--;
+    }
+    NSURLSession *sess = orig_af_sessionWithConfig ? orig_af_sessionWithConfig(self, _cmd, useCfg) : nil;
+    if (sess && g_af_lock && g_af_tracked_sessions) {
+        @synchronized(g_af_lock) { [g_af_tracked_sessions addObject:sess]; }
+    }
+    return sess;
+}
+
+static NSURLSession *swizzled_af_sessionWithConfigDelegate(id self, SEL _cmd, NSURLSessionConfiguration *cfg, id del, NSOperationQueue *q) {
+    NSURLSessionConfiguration *useCfg = cfg;
+    if (useCfg && s_af_egress_depth == 0 && atomic_load(&g_af_egress_mode) != 0) {
+        s_af_egress_depth++;
+        useCfg = [useCfg copy];
+        MEAFApplySessionConfigEgressPin(useCfg);
+        s_af_egress_depth--;
+    }
+    NSURLSession *sess = orig_af_sessionWithConfigDelegate ? orig_af_sessionWithConfigDelegate(self, _cmd, useCfg, del, q) : nil;
+    if (sess && g_af_lock && g_af_tracked_sessions) {
+        @synchronized(g_af_lock) { [g_af_tracked_sessions addObject:sess]; }
+    }
+    return sess;
+}
+
+static NSURLSession *swizzled_af_sharedSession(id self, SEL _cmd) {
+    int mode = atomic_load(&g_af_egress_mode);
+    if (mode != 0 && s_af_egress_depth == 0 && orig_af_defaultSessionConfig && orig_af_sessionWithConfig) {
+        uint64_t curGen = atomic_load(&g_af_egress_gen);
+        MEAFInit();
+        @synchronized(g_af_lock) {
+            if (!g_af_pinned_shared_session || g_af_pinned_shared_gen != curGen) {
+                s_af_egress_depth++;
+                NSURLSessionConfiguration *cfg = orig_af_defaultSessionConfig([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+                MEAFApplySessionConfigEgressPin(cfg);
+                g_af_pinned_shared_session = orig_af_sessionWithConfig([NSURLSession class], @selector(sessionWithConfiguration:), cfg);
+                g_af_pinned_shared_gen = curGen;
+                if (g_af_pinned_shared_session && g_af_tracked_sessions) {
+                    [g_af_tracked_sessions addObject:g_af_pinned_shared_session];
+                }
+                s_af_egress_depth--;
+            }
+            if (g_af_pinned_shared_session) return g_af_pinned_shared_session;
+        }
+    }
+    return orig_af_sharedSession ? orig_af_sharedSession(self, _cmd) : nil;
+}
+
+static void MEAFInstallSessionEgressSwizzlesOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Method mDef = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+        if (mDef) {
+            orig_af_defaultSessionConfig = (typeof(orig_af_defaultSessionConfig))method_setImplementation(mDef, (IMP)swizzled_af_defaultSessionConfig);
+            MEAFRecordSwizzle(object_getClass([NSURLSessionConfiguration class]), @selector(defaultSessionConfiguration), (IMP)swizzled_af_defaultSessionConfig, (IMP)orig_af_defaultSessionConfig);
+        }
+        Method mEph = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+        if (mEph) {
+            orig_af_ephemeralSessionConfig = (typeof(orig_af_ephemeralSessionConfig))method_setImplementation(mEph, (IMP)swizzled_af_ephemeralSessionConfig);
+            MEAFRecordSwizzle(object_getClass([NSURLSessionConfiguration class]), @selector(ephemeralSessionConfiguration), (IMP)swizzled_af_ephemeralSessionConfig, (IMP)orig_af_ephemeralSessionConfig);
+        }
+        Method mBg = class_getClassMethod([NSURLSessionConfiguration class], @selector(backgroundSessionConfigurationWithIdentifier:));
+        if (mBg) {
+            orig_af_bgSessionConfig = (typeof(orig_af_bgSessionConfig))method_setImplementation(mBg, (IMP)swizzled_af_bgSessionConfig);
+            MEAFRecordSwizzle(object_getClass([NSURLSessionConfiguration class]), @selector(backgroundSessionConfigurationWithIdentifier:), (IMP)swizzled_af_bgSessionConfig, (IMP)orig_af_bgSessionConfig);
+        }
+        Method mSess = class_getClassMethod([NSURLSession class], @selector(sessionWithConfiguration:));
+        if (mSess) {
+            orig_af_sessionWithConfig = (typeof(orig_af_sessionWithConfig))method_setImplementation(mSess, (IMP)swizzled_af_sessionWithConfig);
+            MEAFRecordSwizzle(object_getClass([NSURLSession class]), @selector(sessionWithConfiguration:), (IMP)swizzled_af_sessionWithConfig, (IMP)orig_af_sessionWithConfig);
+        }
+        Method mSessDel = class_getClassMethod([NSURLSession class], @selector(sessionWithConfiguration:delegate:delegateQueue:));
+        if (mSessDel) {
+            orig_af_sessionWithConfigDelegate = (typeof(orig_af_sessionWithConfigDelegate))method_setImplementation(mSessDel, (IMP)swizzled_af_sessionWithConfigDelegate);
+            MEAFRecordSwizzle(object_getClass([NSURLSession class]), @selector(sessionWithConfiguration:delegate:delegateQueue:), (IMP)swizzled_af_sessionWithConfigDelegate, (IMP)orig_af_sessionWithConfigDelegate);
+        }
+        Method mShared = class_getClassMethod([NSURLSession class], @selector(sharedSession));
+        if (mShared) {
+            orig_af_sharedSession = (typeof(orig_af_sharedSession))method_setImplementation(mShared, (IMP)swizzled_af_sharedSession);
+            MEAFRecordSwizzle(object_getClass([NSURLSession class]), @selector(sharedSession), (IMP)swizzled_af_sharedSession, (IMP)orig_af_sharedSession);
+        }
+    });
+}
+
+static int hook_af_inline_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    if (s_af_egress_depth == 0 && addr && atomic_load(&g_af_egress_mode) != 0 && !MEAFSockaddrIsLocalOrLAN(addr, addrlen)) {
+        unsigned int pinIdx = atomic_load(&g_af_egress_if_idx);
+        if (pinIdx == 0) {
+            int mode = atomic_load(&g_af_egress_mode);
+            pinIdx = if_nametoindex(mode == 1 ? (g_af_egress_if_name[0] ? g_af_egress_if_name : "pdp_ip0") : "en0");
+            if (pinIdx != 0) atomic_store(&g_af_egress_if_idx, pinIdx);
+        }
+        if (pinIdx != 0) {
+            if (addr->sa_family == AF_INET) {
+                setsockopt(sockfd, IPPROTO_IP, IP_BOUND_IF, &pinIdx, sizeof(pinIdx));
+            } else if (addr->sa_family == AF_INET6) {
+                setsockopt(sockfd, IPPROTO_IPV6, IPV6_BOUND_IF, &pinIdx, sizeof(pinIdx));
+            }
+        }
+    }
+    return orig_af_inline_connect ? orig_af_inline_connect(sockfd, addr, addrlen) : -1;
+}
+
+static BOOL MEAFInstallInlineEgressHooksOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        me_inline_hook_fn hookFn = (me_inline_hook_fn)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        if (!hookFn) hookFn = (me_inline_hook_fn)dlsym(RTLD_DEFAULT, "EKHookFunction");
+        if (!hookFn) {
+            const char *cands[] = {
+                "/usr/lib/libellekit.dylib",
+                "/var/jb/usr/lib/libellekit.dylib",
+                NULL
+            };
+            for (int i = 0; cands[i] && !hookFn; i++) {
+                void *h = dlopen(cands[i], RTLD_NOLOAD);
+                if (!h) h = dlopen(cands[i], RTLD_NOW | RTLD_LOCAL);
+                if (h) {
+                    hookFn = (me_inline_hook_fn)dlsym(h, "MSHookFunction");
+                    if (!hookFn) hookFn = (me_inline_hook_fn)dlsym(h, "EKHookFunction");
+                }
+            }
+        }
+        if (!hookFn) {
+            NSArray<NSString *> *roots = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:NULL];
+            for (NSString *entry in roots) {
+                if (![entry hasPrefix:@".jbroot-"]) continue;
+                NSString *cand = [[@"/var/containers/Bundle/Application" stringByAppendingPathComponent:entry] stringByAppendingString:@"/usr/lib/libellekit.dylib"];
+                void *h = dlopen(cand.UTF8String, RTLD_NOLOAD);
+                if (!h) h = dlopen(cand.UTF8String, RTLD_NOW | RTLD_LOCAL);
+                if (h) {
+                    hookFn = (me_inline_hook_fn)dlsym(h, "MSHookFunction");
+                    if (!hookFn) hookFn = (me_inline_hook_fn)dlsym(h, "EKHookFunction");
+                    if (hookFn) break;
+                }
+            }
+        }
+        if (!hookFn) return;
+        BOOL hookedAny = NO;
+        void *nwConnSym = dlsym(RTLD_DEFAULT, "nw_connection_create");
+        if (!nwConnSym) {
+            void *libnw = dlopen("/usr/lib/libnetwork.dylib", RTLD_LAZY);
+            if (libnw) nwConnSym = dlsym(libnw, "nw_connection_create");
+        }
+        if (nwConnSym) {
+            hookFn(nwConnSym, (void *)hook_af_nw_conn_create, (void **)&orig_af_nw_conn_create);
+            if (orig_af_nw_conn_create) hookedAny = YES;
+        }
+        void *connectSym = dlsym(RTLD_DEFAULT, "connect");
+        if (connectSym) {
+            hookFn(connectSym, (void *)hook_af_inline_connect_impl, (void **)&orig_af_inline_connect);
+            if (orig_af_inline_connect) hookedAny = YES;
+        }
+        if (hookedAny) atomic_store(&g_af_egress_inline_active, 1);
+    });
+    return atomic_load(&g_af_egress_inline_active) != 0;
 }
 
 static unsigned int MEAFResolvePinnedInterfaceIndex(void) {
@@ -762,7 +1432,7 @@ static int hook_af_connect(int sockfd, const struct sockaddr *addr, socklen_t ad
             if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) || IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr)) isLocal = YES;
         }
     }
-    if (!isLocal && MEDepth == 0 && addr && atomic_load(&g_af_egress_mode) != 0) {
+    if (!isLocal && !MEAFSockaddrIsLocalOrLAN(addr, addrlen) && MEDepth == 0 && addr && atomic_load(&g_af_egress_mode) != 0) {
         unsigned int pinIdx = MEAFResolvePinnedInterfaceIndex();
         if (pinIdx != 0) {
             if (addr->sa_family == AF_INET) {
@@ -1990,12 +2660,149 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
         }
         atomic_store(&g_af_egress_mode, mode);
         atomic_store(&g_af_egress_if_idx, ifIdx);
+        atomic_fetch_add(&g_af_egress_gen, 1);
+
+        uint16_t proxyPort = 0;
+        if (mode != 0) {
+            proxyPort = MEAFEgressProxyEnsureStarted();
+        } else {
+            MEAFEgressProxyStop();
+        }
+        MEAFInstallSessionEgressSwizzlesOnce();
+        BOOL inlineActive = (mode != 0) ? MEAFInstallInlineEgressHooksOnce() : (atomic_load(&g_af_egress_inline_active) != 0);
         MEAFInstallGOTHooks(NULL, NULL, NULL);
+
+        // Flush existing pooled sockets and reset pinned sharedSession so change takes effect immediately
+        NSArray<NSURLSession *> *sessionsCopy = nil;
+        NSURLSession *oldShared = nil;
+        @synchronized(g_af_lock) {
+            sessionsCopy = g_af_tracked_sessions ? [g_af_tracked_sessions allObjects] : @[];
+            oldShared = g_af_pinned_shared_session;
+            g_af_pinned_shared_session = nil;
+        }
+        for (NSURLSession *s in sessionsCopy) {
+            @try { [s flushWithCompletionHandler:^{}]; } @catch (__unused NSException *e) {}
+        }
+        if (oldShared) {
+            @try { [oldShared finishTasksAndInvalidate]; } @catch (__unused NSException *e) {}
+        }
+        @try {
+            NSURLSession *origShared = orig_af_sharedSession ? orig_af_sharedSession([NSURLSession class], @selector(sharedSession)) : nil;
+            [origShared flushWithCompletionHandler:^{}];
+        } @catch (__unused NSException *e) {}
+
+        // Persist or clear per-app pin file so relaunches inherit or drop the pin cleanly
+        NSString *pinPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@".mcp_egress_pin.json"];
+        if (mode == 0) {
+            [[NSFileManager defaultManager] removeItemAtPath:pinPath error:NULL];
+        } else {
+            NSDictionary *pinDoc = @{
+                @"target": (mode == 1 ? @"cellular" : @"wifi"),
+                @"interface": g_af_egress_if_name[0] ? @(g_af_egress_if_name) : @"",
+                @"updated_at": @([[NSDate date] timeIntervalSince1970])
+            };
+            NSData *pinData = [NSJSONSerialization dataWithJSONObject:pinDoc options:0 error:NULL];
+            if (pinData) [pinData writeToFile:pinPath atomically:YES];
+        }
+
+        BOOL usesWebKit = (NSClassFromString(@"WKWebView") != Nil);
         return @{
             @"ok": @YES,
             @"target": (mode == 1 ? @"cellular" : (mode == 2 ? @"wifi" : @"default")),
             @"interface": g_af_egress_if_name[0] ? @(g_af_egress_if_name) : @"",
             @"interface_index": @(ifIdx),
+            @"inline_hooks_active": inlineActive ? @YES : @NO,
+            @"egress_proxy_port": @(proxyPort),
+            @"session_swizzles_active": @YES,
+            @"uses_webkit": usesWebKit ? @YES : @NO,
+            @"pid": @(getpid())
+        };
+    }
+
+    if ([op isEqualToString:@"engine.egress_probe"]) {
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        NSString *probeUrl = [a[@"url"] isKindOfClass:[NSString class]] && [a[@"url"] length] > 0
+            ? a[@"url"] : @"http://api.ipify.org/?format=text";
+        NSURL *u = [NSURL URLWithString:probeUrl];
+        __block NSString *observedIp = @"";
+        __block NSString *errStr = @"";
+        __block NSInteger statusCode = 0;
+
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        cfg.timeoutIntervalForRequest = 6.0;
+        cfg.timeoutIntervalForResource = 7.0;
+        NSURLSession *probeSession = [NSURLSession sessionWithConfiguration:cfg];
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        NSURLSessionDataTask *task = [probeSession dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+                statusCode = ((NSHTTPURLResponse *)resp).statusCode;
+            }
+            if (err) {
+                errStr = err.localizedDescription ?: @"request failed";
+            } else if (data.length > 0) {
+                NSString *body = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+                                  stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+                if (body.length > 0 && body.length < 128) observedIp = body;
+            }
+            dispatch_semaphore_signal(sem);
+        }];
+        [task resume];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.5 * NSEC_PER_SEC)));
+        [probeSession finishTasksAndInvalidate];
+
+        // Also test sharedSession + HTTPS CONNECT TLS tunnel so we verify both plain HTTP and TLS pinning
+        __block NSString *sharedIp = @"";
+        dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
+        NSURLSessionDataTask *task2 = [[NSURLSession sharedSession] dataTaskWithURL:u completionHandler:^(NSData *data, __unused NSURLResponse *resp, __unused NSError *err) {
+            if (data.length > 0) {
+                NSString *body = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+                                  stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+                if (body.length > 0 && body.length < 128) sharedIp = body;
+            }
+            dispatch_semaphore_signal(sem2);
+        }];
+        [task2 resume];
+        dispatch_semaphore_wait(sem2, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.5 * NSEC_PER_SEC)));
+
+        __block NSString *httpsIp = @"";
+        __block NSString *httpsErr = @"";
+        NSURL *httpsURL = [NSURL URLWithString:@"https://api.ipify.org/?format=text"];
+        NSURLSessionConfiguration *hCfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        hCfg.timeoutIntervalForRequest = 6.0;
+        hCfg.timeoutIntervalForResource = 7.0;
+        NSURLSession *httpsSess = [NSURLSession sessionWithConfiguration:hCfg];
+        dispatch_semaphore_t sem3 = dispatch_semaphore_create(0);
+        NSURLSessionDataTask *task3 = [httpsSess dataTaskWithURL:httpsURL completionHandler:^(NSData *data, __unused NSURLResponse *resp, NSError *err) {
+            if (err) {
+                httpsErr = err.localizedDescription ?: @"https failed";
+            } else if (data.length > 0) {
+                NSString *body = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+                                  stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
+                if (body.length > 0 && body.length < 128) httpsIp = body;
+            }
+            dispatch_semaphore_signal(sem3);
+        }];
+        [task3 resume];
+        dispatch_semaphore_wait(sem3, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.5 * NSEC_PER_SEC)));
+        [httpsSess finishTasksAndInvalidate];
+
+        int mode = atomic_load(&g_af_egress_mode);
+        double elapsedMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+        return @{
+            @"ok": (observedIp.length > 0 || httpsIp.length > 0) ? @YES : @NO,
+            @"egress_ip": observedIp.length ? observedIp : httpsIp,
+            @"shared_session_ip": sharedIp,
+            @"https_egress_ip": httpsIp,
+            @"https_error": httpsErr,
+            @"egress_proxy_port": @(atomic_load(&g_af_egress_proxy_port)),
+            @"status_code": @(statusCode),
+            @"target": (mode == 1 ? @"cellular" : (mode == 2 ? @"wifi" : @"default")),
+            @"interface": g_af_egress_if_name[0] ? @(g_af_egress_if_name) : @"",
+            @"interface_index": @(atomic_load(&g_af_egress_if_idx)),
+            @"inline_hooks_active": atomic_load(&g_af_egress_inline_active) ? @YES : @NO,
+            @"uses_webkit": (NSClassFromString(@"WKWebView") != Nil) ? @YES : @NO,
+            @"error": errStr,
+            @"duration_ms": @((NSInteger)llround(elapsedMs)),
             @"pid": @(getpid())
         };
     }
@@ -2037,6 +2844,26 @@ static void MEAntiFraudAutoInit(void) {
             NSDictionary *persona = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
             if ([persona isKindOfClass:[NSDictionary class]]) {
                 MEAFEnableAllLayersWithPersona(persona, NO);
+            }
+        }
+        NSString *pinPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@".mcp_egress_pin.json"];
+        NSData *pinData = [NSData dataWithContentsOfFile:pinPath];
+        if (pinData.length) {
+            NSDictionary *pinDoc = [NSJSONSerialization JSONObjectWithData:pinData options:0 error:NULL];
+            NSString *target = [pinDoc[@"target"] isKindOfClass:[NSString class]] ? [pinDoc[@"target"] lowercaseString] : @"";
+            NSString *ifName = [pinDoc[@"interface"] isKindOfClass:[NSString class]] ? pinDoc[@"interface"] : @"";
+            if ([target isEqualToString:@"cellular"] || [target isEqualToString:@"wifi"]) {
+                int mode = [target isEqualToString:@"cellular"] ? 1 : 2;
+                const char *wantIf = ifName.length ? ifName.UTF8String : (mode == 1 ? "pdp_ip0" : "en0");
+                strlcpy(g_af_egress_if_name, wantIf, sizeof(g_af_egress_if_name));
+                unsigned int idx = if_nametoindex(g_af_egress_if_name);
+                atomic_store(&g_af_egress_mode, mode);
+                atomic_store(&g_af_egress_if_idx, idx);
+                atomic_fetch_add(&g_af_egress_gen, 1);
+                MEAFEgressProxyEnsureStarted();
+                MEAFInstallSessionEgressSwizzlesOnce();
+                MEAFInstallInlineEgressHooksOnce();
+                MEAFInstallGOTHooks(NULL, NULL, NULL);
             }
         }
     }

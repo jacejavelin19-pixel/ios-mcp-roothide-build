@@ -3,8 +3,11 @@
 #ifdef MCP_ROOTHIDE
 #include <roothide.h>
 #endif
+#import <arpa/inet.h>
+#import <dlfcn.h>
 #import <errno.h>
 #import <fcntl.h>
+#import <netinet/in.h>
 #import <poll.h>
 #import <spawn.h>
 #import <string.h>
@@ -1929,6 +1932,237 @@ int main(int argc, const char *argv[]) {
             }
             NSString *rawText = [[NSString alloc] initWithData:respBuf encoding:NSUTF8StringEncoding] ?: @"";
             MCPAMEmitJSON(@{@"ok": @YES, @"result": @{@"raw": rawText}});
+            return 0;
+        }
+
+        if ([cmd isEqualToString:@"inspect-network-proxies"] || [cmd isEqualToString:@"reset-network-proxies"]) {
+            BOOL doReset = [cmd isEqualToString:@"reset-network-proxies"];
+            void *sc = dlopen("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration", RTLD_LAZY);
+            typedef CFTypeRef (*SCPreferencesCreateFn)(CFAllocatorRef, CFStringRef, CFStringRef);
+            typedef Boolean (*SCPreferencesLockFn)(CFTypeRef, Boolean);
+            typedef Boolean (*SCPreferencesUnlockFn)(CFTypeRef);
+            typedef CFPropertyListRef (*SCPreferencesGetValueFn)(CFTypeRef, CFStringRef);
+            typedef Boolean (*SCPreferencesSetValueFn)(CFTypeRef, CFStringRef, CFPropertyListRef);
+            typedef Boolean (*SCPreferencesCommitFn)(CFTypeRef);
+            typedef Boolean (*SCPreferencesApplyFn)(CFTypeRef);
+
+            SCPreferencesCreateFn scCreate = sc ? (SCPreferencesCreateFn)dlsym(sc, "SCPreferencesCreate") : NULL;
+            SCPreferencesLockFn scLock = sc ? (SCPreferencesLockFn)dlsym(sc, "SCPreferencesLock") : NULL;
+            SCPreferencesUnlockFn scUnlock = sc ? (SCPreferencesUnlockFn)dlsym(sc, "SCPreferencesUnlock") : NULL;
+            SCPreferencesGetValueFn scGet = sc ? (SCPreferencesGetValueFn)dlsym(sc, "SCPreferencesGetValue") : NULL;
+            SCPreferencesSetValueFn scSet = sc ? (SCPreferencesSetValueFn)dlsym(sc, "SCPreferencesSetValue") : NULL;
+            SCPreferencesCommitFn scCommit = sc ? (SCPreferencesCommitFn)dlsym(sc, "SCPreferencesCommitChanges") : NULL;
+            SCPreferencesApplyFn scApply = sc ? (SCPreferencesApplyFn)dlsym(sc, "SCPreferencesApplyChanges") : NULL;
+
+            NSArray<NSString *> *proxyKeys = @[
+                @"HTTPEnable", @"HTTPProxy", @"HTTPPort",
+                @"HTTPSEnable", @"HTTPSProxy", @"HTTPSPort",
+                @"SOCKSEnable", @"SOCKSProxy", @"SOCKSPort",
+                @"ProxyAutoConfigEnable", @"ProxyAutoConfigURLString", @"ProxyAutoConfigJavaScript",
+                @"ProxyAutoDiscoveryEnable",
+                @"FTPEnable", @"FTPProxy", @"FTPPort",
+                @"RTSPEnable", @"RTSPProxy", @"RTSPPort"
+            ];
+
+            BOOL (^isLocalHost)(NSString *) = ^BOOL(NSString *h) {
+                if (!h.length) return NO;
+                NSString *l = [h lowercaseString];
+                return [l isEqualToString:@"127.0.0.1"] || [l isEqualToString:@"localhost"] || [l isEqualToString:@"::1"] || [l isEqualToString:@"0.0.0.0"];
+            };
+
+            BOOL (^isLocalPortListening)(int) = ^BOOL(int port) {
+                if (port <= 0 || port > 65535) return NO;
+                int fd = socket(AF_INET, SOCK_STREAM, 0);
+                if (fd < 0) return NO;
+                int fl = fcntl(fd, F_GETFL, 0);
+                if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+                struct sockaddr_in sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sin_family = AF_INET;
+                sa.sin_port = htons((uint16_t)port);
+                inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+                int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+                BOOL alive = NO;
+                if (rc == 0) {
+                    alive = YES;
+                } else if (errno == EINPROGRESS) {
+                    struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+                    if (poll(&pfd, 1, 250) > 0 && (pfd.revents & POLLOUT)) {
+                        int soErr = 0;
+                        socklen_t soLen = sizeof(soErr);
+                        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &soLen) == 0 && soErr == 0) {
+                            alive = YES;
+                        }
+                    }
+                }
+                close(fd);
+                return alive;
+            };
+
+            NSString *plistPath = @"/var/preferences/SystemConfiguration/preferences.plist";
+            NSDictionary *servicesDict = nil;
+            NSString *currentSetId = nil;
+            NSDictionary *setsDict = nil;
+            CFTypeRef scPrefs = NULL;
+            BOOL scLocked = NO;
+            BOOL usedSCPreferences = NO;
+            BOOL committed = NO;
+            BOOL applied = NO;
+
+            if (scCreate && scGet) {
+                scPrefs = scCreate(kCFAllocatorDefault, CFSTR("com.witchan.ios-mcp"), NULL);
+                if (scPrefs) {
+                    if (doReset && scLock) {
+                        scLocked = scLock(scPrefs, true) ? YES : NO;
+                    }
+                    id rawServices = (__bridge id)scGet(scPrefs, CFSTR("NetworkServices"));
+                    id rawCurSet = (__bridge id)scGet(scPrefs, CFSTR("CurrentSet"));
+                    id rawSets = (__bridge id)scGet(scPrefs, CFSTR("Sets"));
+                    if ([rawServices isKindOfClass:[NSDictionary class]]) {
+                        servicesDict = [rawServices copy];
+                        usedSCPreferences = YES;
+                    }
+                    if ([rawCurSet isKindOfClass:[NSString class]]) {
+                        currentSetId = [rawCurSet lastPathComponent];
+                    }
+                    if ([rawSets isKindOfClass:[NSDictionary class]]) {
+                        setsDict = [rawSets copy];
+                    }
+                }
+            }
+
+            NSMutableDictionary *rawPlist = nil;
+            if (!servicesDict) {
+                rawPlist = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
+                if ([rawPlist[@"NetworkServices"] isKindOfClass:[NSDictionary class]]) {
+                    servicesDict = [rawPlist[@"NetworkServices"] copy];
+                }
+                if ([rawPlist[@"CurrentSet"] isKindOfClass:[NSString class]]) {
+                    currentSetId = [rawPlist[@"CurrentSet"] lastPathComponent];
+                }
+                if ([rawPlist[@"Sets"] isKindOfClass:[NSDictionary class]]) {
+                    setsDict = [rawPlist[@"Sets"] copy];
+                }
+            }
+
+            NSSet<NSString *> *activeServiceIds = nil;
+            if (currentSetId.length && [setsDict[currentSetId] isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *svcMap = setsDict[currentSetId][@"Network"][@"Service"];
+                if ([svcMap isKindOfClass:[NSDictionary class]]) {
+                    activeServiceIds = [NSSet setWithArray:svcMap.allKeys];
+                }
+            }
+
+            NSMutableArray<NSDictionary *> *activeProxies = [NSMutableArray array];
+            NSMutableArray<NSString *> *clearedServices = [NSMutableArray array];
+            BOOL anyDeadLocalProxy = NO;
+            NSMutableDictionary *mutServices = servicesDict ? [servicesDict mutableCopy] : [NSMutableDictionary dictionary];
+            BOOL modifiedAny = NO;
+
+            for (NSString *sid in [servicesDict allKeys]) {
+                NSDictionary *svc = servicesDict[sid];
+                if (![svc isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *proxies = [svc[@"Proxies"] isKindOfClass:[NSDictionary class]] ? svc[@"Proxies"] : nil;
+                if (!proxies.count) continue;
+                BOOL httpOn = [proxies[@"HTTPEnable"] boolValue];
+                BOOL httpsOn = [proxies[@"HTTPSEnable"] boolValue];
+                BOOL socksOn = [proxies[@"SOCKSEnable"] boolValue];
+                BOOL pacOn = [proxies[@"ProxyAutoConfigEnable"] boolValue];
+                BOOL wpadOn = [proxies[@"ProxyAutoDiscoveryEnable"] boolValue];
+                BOOL hasProxy = (httpOn || httpsOn || socksOn || pacOn || wpadOn ||
+                                 [proxies[@"HTTPProxy"] length] > 0 ||
+                                 [proxies[@"HTTPSProxy"] length] > 0 ||
+                                 [proxies[@"SOCKSProxy"] length] > 0);
+                if (!hasProxy) continue;
+
+                BOOL inCurrentSet = activeServiceIds ? [activeServiceIds containsObject:sid] : YES;
+                NSString *ifName = [svc[@"Interface"][@"DeviceName"] isKindOfClass:[NSString class]] ? svc[@"Interface"][@"DeviceName"] : @"";
+                NSString *svcName = [svc[@"UserDefinedName"] isKindOfClass:[NSString class]] ? svc[@"UserDefinedName"] : sid;
+
+                NSString *host = httpOn ? (proxies[@"HTTPProxy"] ?: @"") : (httpsOn ? (proxies[@"HTTPSProxy"] ?: @"") : (proxies[@"SOCKSProxy"] ?: @""));
+                int port = httpOn ? [proxies[@"HTTPPort"] intValue] : (httpsOn ? [proxies[@"HTTPSPort"] intValue] : [proxies[@"SOCKSPort"] intValue]);
+                BOOL deadLocal = NO;
+                if (isLocalHost(host) && port > 0) {
+                    deadLocal = !isLocalPortListening(port);
+                    if (deadLocal && inCurrentSet) anyDeadLocalProxy = YES;
+                }
+
+                [activeProxies addObject:@{
+                    @"service_id": sid,
+                    @"name": svcName,
+                    @"interface": ifName,
+                    @"in_current_set": inCurrentSet ? @YES : @NO,
+                    @"http_enabled": httpOn ? @YES : @NO,
+                    @"https_enabled": httpsOn ? @YES : @NO,
+                    @"socks_enabled": socksOn ? @YES : @NO,
+                    @"pac_enabled": pacOn ? @YES : @NO,
+                    @"proxy_host": [host isKindOfClass:[NSString class]] ? host : @"",
+                    @"proxy_port": @(port),
+                    @"dead_local_proxy": deadLocal ? @YES : @NO
+                }];
+
+                if (doReset) {
+                    NSMutableDictionary *mutSvc = [svc mutableCopy];
+                    NSMutableDictionary *mutProxies = [proxies mutableCopy];
+                    for (NSString *k in proxyKeys) {
+                        [mutProxies removeObjectForKey:k];
+                    }
+                    mutSvc[@"Proxies"] = mutProxies;
+                    mutServices[sid] = mutSvc;
+                    modifiedAny = YES;
+                    [clearedServices addObject:sid];
+                }
+            }
+
+            if (doReset && modifiedAny) {
+                if (usedSCPreferences && scPrefs && scSet && scCommit && scApply) {
+                    scSet(scPrefs, CFSTR("NetworkServices"), (__bridge CFPropertyListRef)mutServices);
+                    committed = scCommit(scPrefs) ? YES : NO;
+                    applied = scApply(scPrefs) ? YES : NO;
+                }
+                if (!committed) {
+                    NSMutableDictionary *disk = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
+                    if (disk) {
+                        disk[@"NetworkServices"] = mutServices;
+                        NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:disk
+                                                                                       format:NSPropertyListBinaryFormat_v1_0
+                                                                                      options:0
+                                                                                        error:NULL];
+                        if (plistData && [plistData writeToFile:plistPath atomically:YES]) {
+                            committed = YES;
+                        }
+                    }
+                }
+                CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                                     CFSTR("com.apple.system.config.network_change"),
+                                                     NULL, NULL, true);
+            }
+
+            if (scPrefs) {
+                if (scLocked && scUnlock) scUnlock(scPrefs);
+                CFRelease(scPrefs);
+            }
+
+            BOOL activeInCurrentSet = NO;
+            for (NSDictionary *p in activeProxies) {
+                if ([p[@"in_current_set"] boolValue]) {
+                    activeInCurrentSet = YES;
+                    break;
+                }
+            }
+
+            MCPAMEmitJSON(@{
+                @"ok": @YES,
+                @"subcommand": cmd,
+                @"used_scpreferences": usedSCPreferences ? @YES : @NO,
+                @"system_proxy_active": (doReset && committed) ? @NO : (activeInCurrentSet ? @YES : @NO),
+                @"dead_local_proxy": (doReset && committed) ? @NO : (anyDeadLocalProxy ? @YES : @NO),
+                @"proxies_found": activeProxies,
+                @"cleared_count": @(clearedServices.count),
+                @"cleared_services": clearedServices,
+                @"committed": committed ? @YES : @NO,
+                @"applied": applied ? @YES : @NO
+            });
             return 0;
         }
 

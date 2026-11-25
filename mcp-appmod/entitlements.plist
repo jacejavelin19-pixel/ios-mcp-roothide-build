@@ -30,6 +30,10 @@
 	<true/>
 	<key>get-task-allow</key>
 	<true/>
+	<key>com.apple.SystemConfiguration.SCPreferences-write-access</key>
+	<true/>
+	<key>com.apple.SystemConfiguration.SCDynamicStore-write-access</key>
+	<true/>
 	<key>platform-application</key>
 	<true/>
 	<key>task_for_pid-allow</key>

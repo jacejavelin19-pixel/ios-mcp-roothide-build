@@ -90,6 +90,19 @@ static void ios_mcp_handle_control_notification(CFNotificationCenterRef center,
         return;
     }
 
+    if (CFEqual(name, IOS_MCP_DARWIN_NOTIFICATION_RESET_NETWORK)) {
+        dispatch_async(ios_mcp_control_queue(), ^{
+            IOS_MCP_LOG(@"Received network/radio recovery reset request from Settings");
+            [[SystemCapabilitiesManager sharedInstance] resetNetworkAndRadioStateWithArgs:@{
+                @"unload_injected_engines": @YES,
+                @"reset_wan_bridge": @YES,
+                @"cycle_wifi": @NO,
+                @"reason": @"settings_recovery_button"
+            } error:NULL];
+        });
+        return;
+    }
+
     if (CFEqual(name, IOS_MCP_DARWIN_NOTIFICATION_WAN_RELOAD) ||
         CFEqual(name, CFSTR("com.apple.system.config.network_change"))) {
         static uint64_t sDebounceGen = 0;
@@ -200,6 +213,12 @@ static void ios_mcp_register_control_notifications(void) {
                                     NULL,
                                     ios_mcp_handle_control_notification,
                                     IOS_MCP_DARWIN_NOTIFICATION_WAN_RELOAD,
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(center,
+                                    NULL,
+                                    ios_mcp_handle_control_notification,
+                                    IOS_MCP_DARWIN_NOTIFICATION_RESET_NETWORK,
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(center,

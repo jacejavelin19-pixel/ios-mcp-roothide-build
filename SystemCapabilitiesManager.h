@@ -91,6 +91,9 @@
 - (NSArray<NSDictionary *> *)rotationHistory;
 - (NSDictionary *)publicTunnelStatus;
 - (void)handleNetworkChangeForTunnels;
+- (void)clearAppEgressPinForBundleId:(NSString *)bundleId;
+- (NSDictionary *)resetNetworkAndRadioStateWithArgs:(NSDictionary *)args
+                                              error:(NSString **)error;
 
 @end
 

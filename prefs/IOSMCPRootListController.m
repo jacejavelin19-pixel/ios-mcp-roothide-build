@@ -1248,7 +1248,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
     if (wifiIp.length > 0) {
         [extra appendFormat:@"\n- Wi-Fi (en0): http://%@:%u/mcp", wifiIp, (unsigned int)port];
     }
-    if (cellIpv4.length > 0) {
+    if (cellIpv4.length > 0 && ![cellIpv4 hasPrefix:@"192.0.0."]) {
         [extra appendFormat:@"\n- Cellular IPv4 (pdp_ip0): http://%@:%u/mcp", cellIpv4, (unsigned int)port];
     }
     if (cellIpv6.length > 0) {
@@ -1261,6 +1261,110 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
         [extra appendFormat:@"\n- Remote Home-PC Bridge (%@:%u -> PC Local): http://127.0.0.1:8090/mcp", bridgeHost, (unsigned int)bridgePort];
     }
     return [basePrompt stringByAppendingString:extra];
+}
+
+- (NSDictionary *)readLatestNetworkResetReceipt {
+    NSArray<NSString *> *paths = @[
+        jbroot(@"/var/mobile/Library/ios-mcp/last_network_reset.json") ?: @"",
+        @"/var/mobile/Library/ios-mcp/last_network_reset.json"
+    ];
+    for (NSString *path in paths) {
+        if (!path.length) continue;
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data.length) continue;
+        id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([parsed isKindOfClass:[NSDictionary class]]) {
+            return parsed;
+        }
+    }
+    return nil;
+}
+
+- (void)pollNetworkResetReceiptSince:(NSTimeInterval)triggerTs
+                             attempt:(NSInteger)attempt
+                           specifier:(PSSpecifier *)specifier {
+    NSDictionary *receipt = [self readLatestNetworkResetReceipt];
+    NSTimeInterval ts = [receipt[@"timestamp"] respondsToSelector:@selector(doubleValue)] ? [receipt[@"timestamp"] doubleValue] : 0.0;
+    if (receipt && ts >= (triggerTs - 1.5)) {
+        NSString *defaultLabel = IOSMCPLocalizedString(@"Reset Wi-Fi / Cellular & Kill Tasks");
+        if (specifier) {
+            specifier.name = defaultLabel;
+            [specifier setProperty:defaultLabel forKey:PSTitleKey];
+            [specifier setProperty:@YES forKey:PSEnabledKey];
+            [self reloadSpecifier:specifier animated:NO];
+        }
+        [self reloadSpecifiers];
+        [self refreshPromptText];
+        [self refreshServerStatus];
+
+        NSInteger proxiesCleared = [receipt[@"proxies_cleared_count"] integerValue];
+        NSInteger pinsCleared = [receipt[@"app_pins_cleared"] integerValue];
+        NSInteger enginesUnloaded = [receipt[@"engines_unloaded_count"] integerValue];
+        NSInteger tasksStopped = [receipt[@"watchdogs_cleared"] integerValue] + [receipt[@"detached_tasks_stopped"] integerValue];
+        NSDictionary *cell = [receipt[@"cellular"] isKindOfClass:[NSDictionary class]] ? receipt[@"cellular"] : @{};
+        BOOL wifiOn = [cell[@"wifi_enabled"] boolValue];
+        BOOL apOff = ![cell[@"airplane_mode"] boolValue];
+
+        NSString *msg = [NSString stringWithFormat:
+                         IOSMCPLocalizedString(@"Network and MCP tasks reset.\n\n- Stuck proxies cleared: %ld\n- App egress pins cleared: %ld\n- Injected app hooks unloaded: %ld\n- Background tasks/watchdogs stopped: %ld\n- Wi-Fi: %@  |  Airplane Mode: %@"),
+                         (long)proxiesCleared,
+                         (long)pinsCleared,
+                         (long)enginesUnloaded,
+                         (long)tasksStopped,
+                         wifiOn ? @"ON" : @"OFF",
+                         apOff ? @"OFF" : @"ON"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Network Reset Complete") message:msg];
+        return;
+    }
+
+    if (attempt >= 20) {
+        NSString *defaultLabel = IOSMCPLocalizedString(@"Reset Wi-Fi / Cellular & Kill Tasks");
+        if (specifier) {
+            specifier.name = defaultLabel;
+            [specifier setProperty:defaultLabel forKey:PSTitleKey];
+            [specifier setProperty:@YES forKey:PSEnabledKey];
+            [self reloadSpecifier:specifier animated:NO];
+        }
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"Reset Signal Sent")
+                         message:IOSMCPLocalizedString(@"The recovery signal was sent to SpringBoard. If networking is still unresponsive, tap Respring in the top-right corner.")];
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        [self pollNetworkResetReceiptSince:triggerTs attempt:attempt + 1 specifier:specifier];
+    });
+}
+
+- (void)resetNetworkAndTasks:(PSSpecifier *)specifier {
+    [self deselectSpecifier:specifier];
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:IOSMCPLocalizedString(@"Reset Wi-Fi / Cellular & Kill Tasks?")
+                                                                     message:IOSMCPLocalizedString(@"This clears stuck Wi-Fi HTTP/HTTPS proxies, turns Airplane Mode off, restores Wi-Fi & Cellular Data, stops WAN/rotation tasks and watchdogs, clears all per-app egress pins, and unloads lingering AI-injected app hooks.")
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    [confirm addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"Cancel")
+                                                style:UIAlertActionStyleCancel
+                                              handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [confirm addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"Reset Everything")
+                                                style:UIAlertActionStyleDestructive
+                                              handler:^(__unused UIAlertAction *action) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSTimeInterval triggerTs = [[NSDate date] timeIntervalSince1970];
+        if (specifier) {
+            NSString *busyLabel = IOSMCPLocalizedString(@"Resetting Network & Tasks...");
+            specifier.name = busyLabel;
+            [specifier setProperty:busyLabel forKey:PSTitleKey];
+            [specifier setProperty:@NO forKey:PSEnabledKey];
+            [strongSelf reloadSpecifier:specifier animated:NO];
+        }
+        [strongSelf postNotification:IOS_MCP_DARWIN_NOTIFICATION_RESET_NETWORK];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            [strongSelf pollNetworkResetReceiptSince:triggerTs attempt:0 specifier:specifier];
+        });
+    }]];
+    [self presentViewController:confirm animated:YES completion:nil];
 }
 
 - (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {

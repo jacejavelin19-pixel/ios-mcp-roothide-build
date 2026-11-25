@@ -56,8 +56,8 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"2.2.0"
-static NSString *const kMCPServerVersion = @"2.2.0";
+#define MCP_SERVER_VERSION          @"2.2.1"
+static NSString *const kMCPServerVersion = @"2.2.1";
 #define HTTP_BUF_SIZE        (1024 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
@@ -2389,7 +2389,7 @@ static int MCPConnectOutboundSocket(NSString *host,
             @"server": MCP_SERVER_NAME,
             @"version": MCP_SERVER_VERSION,
             @"port": @(listenerPort),
-            @"auth_required": @(IOSMCPApiAuthEnabled() && IOSMCPApiAuthToken().length > 0),
+            @"auth_required": (IOSMCPApiAuthEnabled() && IOSMCPApiAuthToken().length > 0) ? @YES : @NO,
             @"protocolVersion": [self negotiatedProtocolVersion],
             @"supportedProtocolVersions": MCPSupportedProtocolVersions(),
             @"network": IOSMCPNetworkInterfacesSummary(),
@@ -3080,13 +3080,15 @@ static NSString *MCPLogId(id reqId) {
 
     NSDictionary *cellCap = [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO] ?: @{};
     NSString *cellSummaryLine = [NSString stringWithFormat:
-        @"\n\nCellular & Egress IP Control (live snapshot): mode=%@, sim_present=%@, cellular_connected=%@, carrier=%@, rat=%@, airplane_mode=%@, can_switch_to_cellular=%@, can_rotate_ip=%@, recommended_rotation_method=%@. If an app or target hits a Wi-Fi IP block, call wan_cellular_controller with action='switch_egress', target='cellular', scope='app', bundle_id='<id>' (zero Wi-Fi drop via per-app pdp_ip0 binding) or scope='device'. If cellular egress gets blocked, call wan_cellular_controller with action='rotate_egress' (tries CoreTelephony PDP toggle first, then Airplane Mode with mcp-helperd failsafe watchdog and automatic reconnect) and poll action='rotation_status' if async=true.",
+        @"\n\nCellular & Egress IP Control (live snapshot): mode=%@, sim_present=%@, cellular_connected=%@, carrier=%@, rat=%@, airplane_mode=%@, system_proxy_active=%@, dead_local_proxy=%@, can_switch_to_cellular=%@, can_rotate_ip=%@, recommended_rotation_method=%@. If an app or target hits a Wi-Fi IP block, call wan_cellular_controller with action='switch_egress', target='cellular', scope='app', bundle_id='<id>' (zero Wi-Fi drop via per-app NSURLSession/NWConnection/BSD pdp_ip0 binding with live egress IP verification) or scope='device'. If cellular egress gets blocked, call wan_cellular_controller with action='rotate_egress' (tries CoreTelephony PDP toggle first, then Airplane Mode with mcp-helperd failsafe watchdog and automatic reconnect) and poll action='rotation_status' if async=true. If dead_local_proxy=true or Wi-Fi/cellular tasks are stuck, call wan_cellular_controller with action='reset_network' to clear stuck system proxies, watchdogs, tunnels, and app pins.",
         cellCap[@"active_connection_mode"] ?: @"unknown",
         [cellCap[@"sim_present"] boolValue] ? @"true" : @"false",
         [cellCap[@"cellular_connected"] boolValue] ? @"true" : @"false",
         [cellCap[@"carrier_name"] length] ? cellCap[@"carrier_name"] : @"none",
         [cellCap[@"radio_access_technology"] length] ? cellCap[@"radio_access_technology"] : @"none",
         [cellCap[@"airplane_mode"] boolValue] ? @"true" : @"false",
+        [cellCap[@"system_proxy_active"] boolValue] ? @"true" : @"false",
+        [cellCap[@"dead_local_proxy"] boolValue] ? @"true" : @"false",
         [cellCap[@"can_switch_to_cellular"] boolValue] ? @"true" : @"false",
         [cellCap[@"can_rotate_ip"] boolValue] ? @"true" : @"false",
         cellCap[@"recommended_rotation_method"] ?: @"auto"];
@@ -5388,15 +5390,19 @@ static NSString *MCPLogId(id reqId) {
         // Wi-Fi + Cellular Radio, Egress Switching, Carrier IP Rotation & WAN Controller
         @{
             @"name": @"wan_cellular_controller",
-            @"description": @"Detect cellular data availability (SIM, carrier, RAT, Airplane Mode, CGNAT, dual-stack IPv4/IPv6 egress); switch egress between Wi-Fi and Cellular (per-app pdp_ip0 pinning with zero Wi-Fi drop, or device-wide Wi-Fi toggle); toggle Airplane Mode or Cellular Data; autonomously rotate carrier cellular egress IP with before/after verification, mcp-helperd failsafe watchdog, and auto-reconnect; configure WAN reverse bridge / optional Bearer token auth; or manage standalone public HTTPS tunnels.",
+            @"description": @"Detect cellular data availability (SIM, carrier, RAT, Airplane Mode, CGNAT, stuck Wi-Fi proxy, dual-stack IPv4/IPv6 egress); switch egress between Wi-Fi and Cellular (per-app NSURLSession/NWConnection/BSD pdp_ip0 pinning with live egress IP verification and zero Wi-Fi drop, or device-wide Wi-Fi toggle); toggle Airplane Mode or Cellular Data; autonomously rotate carrier cellular egress IP with before/after verification, mcp-helperd failsafe watchdog, and auto-reconnect; run full network/radio recovery (reset_network) to clear stuck Wi-Fi proxies, watchdogs, tunnels, and app pins; configure WAN reverse bridge / optional Bearer token auth; or manage standalone public HTTPS tunnels.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"action": @{@"type": @"string", @"description": @"Operation: 'status' (default), 'connectivity_check', 'wake_cellular', 'switch_egress', 'airplane_mode', 'cellular_data', 'rotate_egress' (aliases 'rotate_ip'/'reset_ip'), 'rotation_status', 'rotation_history', 'configure_bridge', 'start_public_tunnel', or 'stop_public_tunnel'."},
-                    @"probe_egress": @{@"type": @"boolean", @"description": @"For action='status': run live dual-stack external egress IP probe (default false, uses recent cache)."},
+                    @"action": @{@"type": @"string", @"description": @"Operation: 'status' (default), 'connectivity_check', 'wake_cellular', 'switch_egress', 'airplane_mode', 'cellular_data', 'rotate_egress' (aliases 'rotate_ip'/'reset_ip'), 'rotation_status', 'rotation_history', 'configure_bridge', 'start_public_tunnel', 'stop_public_tunnel', or 'reset_network' (aliases 'recover_network'/'kill_network_tasks')."},
+                    @"probe_egress": @{@"type": @"boolean", @"description": @"For action='status': run live dual-stack external egress IP and SystemConfiguration proxy probe (default false, uses recent cache)."},
                     @"target": @{@"type": @"string", @"description": @"For action='switch_egress': 'cellular', 'wifi', or 'default'."},
                     @"scope": @{@"type": @"string", @"description": @"For action='switch_egress': 'app' (zero-drop per-app pdp_ip0 binding via libmcpengine) or 'device' (system Wi-Fi toggle with cellular pre-flight safety check)."},
                     @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID for scope='app' cellular pinning."},
+                    @"verify": @{@"type": @"boolean", @"description": @"For action='switch_egress' scope='app': run in-app NSURLSession egress IP probe after pinning to confirm traffic matches target (default true)."},
+                    @"unload_injected_engines": @{@"type": @"boolean", @"description": @"For action='reset_network': also unload all lingering AI-injected app engine dylibs (default false via MCP, true from Settings recovery button)."},
+                    @"reset_wan_bridge": @{@"type": @"boolean", @"description": @"For action='reset_network': also disable remote WAN bridge preferences."},
+                    @"cycle_wifi": @{@"type": @"boolean", @"description": @"For action='reset_network': briefly power-cycle Wi-Fi after clearing stuck proxies (default false)."},
                     @"auto_restore_wifi_sec": @{@"type": @"number", @"description": @"Optional mcp-helperd failsafe deadline (5..300s) to auto-restore Wi-Fi after device-wide cellular switch."},
                     @"state": @{@"type": @"string", @"description": @"For action='airplane_mode' or 'cellular_data': 'on', 'off', 'toggle', or 'status'."},
                     @"keep_wifi": @{@"type": @"boolean", @"description": @"For action='airplane_mode': keep/re-enable Wi-Fi while Airplane Mode is ON."},

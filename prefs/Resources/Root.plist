@@ -30,6 +30,26 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>id</key>
+			<string>networkRecoveryGroup</string>
+			<key>label</key>
+			<string>Network &amp; Task Recovery</string>
+			<key>footerText</key>
+			<string>Clears stuck Wi-Fi proxies, disables Airplane Mode, restores Wi-Fi and Cellular Data, stops WAN/rotation tasks and watchdogs, removes all per-app egress pins, and unloads lingering AI-injected app hooks.</string>
+		</dict>
+		<dict>
+			<key>action</key>
+			<string>resetNetworkAndTasks:</string>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>id</key>
+			<string>resetNetworkRecoveryButton</string>
+			<key>label</key>
+			<string>Reset Wi-Fi / Cellular &amp; Kill Tasks</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>id</key>
 			<string>httpPortGroup</string>
 			<key>label</key>
 			<string>HTTP Port</string>

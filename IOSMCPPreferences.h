@@ -28,6 +28,7 @@
 #define IOS_MCP_DARWIN_NOTIFICATION_START CFSTR("com.witchan.ios-mcp.control/start")
 #define IOS_MCP_DARWIN_NOTIFICATION_STOP CFSTR("com.witchan.ios-mcp.control/stop")
 #define IOS_MCP_DARWIN_NOTIFICATION_WAN_RELOAD CFSTR("com.witchan.ios-mcp.control/wan-reload")
+#define IOS_MCP_DARWIN_NOTIFICATION_RESET_NETWORK CFSTR("com.witchan.ios-mcp.control/reset-network")
 
 // Fast lock-protected, stat()-mtime-cached preferences dictionary reader.
 // Eliminates synchronous CFPreferencesAppSynchronize IPC on SpringBoard's main thread
@@ -240,8 +241,10 @@ static inline BOOL IOSMCPIsCGNATOrPrivateIPv4(NSString *ip) {
     uint32_t h = ntohl(addr.s_addr);
     uint8_t a = (uint8_t)((h >> 24) & 0xFF);
     uint8_t b = (uint8_t)((h >> 16) & 0xFF);
-    // RFC6598 CGNAT 100.64.0.0/10, RFC1918 10/8, 172.16/12, 192.168/16
+    uint8_t c = (uint8_t)((h >> 8) & 0xFF);
+    // RFC6598 CGNAT 100.64.0.0/10, RFC7335 464XLAT/DS-Lite 192.0.0.0/24, RFC1918 10/8, 172.16/12, 192.168/16
     if (a == 100 && (b & 0xC0) == 64) return YES;
+    if (a == 192 && b == 0 && c == 0) return YES;
     if (a == 10) return YES;
     if (a == 172 && (b >= 16 && b <= 31)) return YES;
     if (a == 192 && b == 168) return YES;
@@ -302,7 +305,7 @@ static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void)
                 }
                 if (family == AF_INET && (!cellularIPv4 || [ifName isEqualToString:@"pdp_ip0"])) cellularIPv4 = address;
                 else if (family == AF_INET6 && (!cellularIPv6 || [ifName isEqualToString:@"pdp_ip0"])) cellularIPv6 = address;
-            } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ipsec"] || [ifName hasPrefix:@"ppp"]) {
+            } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ppp"]) {
                 if (family == AF_INET && !vpnTailscaleIPv4) vpnTailscaleIPv4 = address;
                 else if (family == AF_INET6 && !vpnTailscaleIPv6) vpnTailscaleIPv6 = address;
             } else if ([ifName hasPrefix:@"en"] && family == AF_INET && !usbIPv4) {
@@ -316,7 +319,9 @@ static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void)
     NSMutableArray<NSString *> *urls = [NSMutableArray array];
     if (wifiIPv4.length) [urls addObject:[NSString stringWithFormat:@"http://%@:%u/mcp", wifiIPv4, (unsigned int)port]];
     if (vpnTailscaleIPv4.length) [urls addObject:[NSString stringWithFormat:@"http://%@:%u/mcp", vpnTailscaleIPv4, (unsigned int)port]];
-    if (cellularIPv4.length) [urls addObject:[NSString stringWithFormat:@"http://%@:%u/mcp", cellularIPv4, (unsigned int)port]];
+    if (cellularIPv4.length && ![cellularIPv4 hasPrefix:@"192.0.0."]) {
+        [urls addObject:[NSString stringWithFormat:@"http://%@:%u/mcp", cellularIPv4, (unsigned int)port]];
+    }
     if (cellularIPv6.length) [urls addObject:[NSString stringWithFormat:@"http://[%@]:%u/mcp", cellularIPv6, (unsigned int)port]];
     if (wifiIPv6.length) [urls addObject:[NSString stringWithFormat:@"http://[%@]:%u/mcp", wifiIPv6, (unsigned int)port]];
 
@@ -325,15 +330,15 @@ static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void)
     BOOL behindCGNAT = (cellularIPv4.length > 0 && IOSMCPIsCGNATOrPrivateIPv4(cellularIPv4));
 
     return @{
-        @"wifi_connected": @(wifiConnected),
+        @"wifi_connected": wifiConnected ? @YES : @NO,
         @"wifi_ipv4": wifiIPv4 ?: @"",
         @"wifi_ipv6": wifiIPv6 ?: @"",
-        @"cellular_connected": @(cellularConnected),
+        @"cellular_connected": cellularConnected ? @YES : @NO,
         @"cellular_interface": cellularIfName ?: @"pdp_ip0",
         @"cellular_ipv4": cellularIPv4 ?: @"",
         @"cellular_ipv6": cellularIPv6 ?: @"",
         @"cellular_interfaces": cellularInterfaces,
-        @"behind_cgnat": @(behindCGNAT),
+        @"behind_cgnat": behindCGNAT ? @YES : @NO,
         @"vpn_tailscale_ipv4": vpnTailscaleIPv4 ?: @"",
         @"vpn_tailscale_ipv6": vpnTailscaleIPv6 ?: @"",
         @"usb_ipv4": usbIPv4 ?: @"",

@@ -117,6 +117,8 @@ static NSDictionary<NSString *, NSDictionary *> *MCPBuildContainerManifest(NSStr
     NSLock *_radioStateLock;
     NSDictionary *_cachedEgressProbe;
     NSTimeInterval _cachedEgressProbeAt;
+    NSDictionary *_cachedProxyProbe;
+    NSTimeInterval _cachedProxyProbeAt;
     NSMutableDictionary<NSString *, NSDictionary *> *_rotationJobs;
 }
 
@@ -2237,7 +2239,7 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
 
     int family = ipv6 ? AF_INET6 : AF_INET;
     const char *targetIP = ipv6 ? "2606:4700:4700::1111" : "1.1.1.1";
-    const char *hostHeader = ipv6 ? "[2606:4700:4700::1111]" : "1.1.1.1";
+    const char *hostHeader = "cp.cloudflare.com";
 
     NSString *externalIp = @"";
     NSString *colo = @"";
@@ -2289,8 +2291,13 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
                              "GET /cdn-cgi/trace HTTP/1.1\r\nHost: %s\r\nUser-Agent: ios-mcp/2.2\r\nConnection: close\r\n\r\n",
                              hostHeader);
                     send(sock, reqBuf, strlen(reqBuf), 0);
-                    char buf[2048];
-                    ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+                    char buf[4096];
+                    ssize_t n = 0;
+                    while (n < (ssize_t)(sizeof(buf) - 1)) {
+                        ssize_t r = recv(sock, buf + n, sizeof(buf) - 1 - (size_t)n, 0);
+                        if (r <= 0) break;
+                        n += r;
+                    }
                     if (n > 0) {
                         buf[n] = '\0';
                         NSString *raw = [NSString stringWithUTF8String:buf] ?: @"";
@@ -2373,6 +2380,26 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
         @"latency_ms": @(round(ms * 10.0) / 10.0),
         @"error": errMsg ?: @""
     };
+}
+
+static NSDictionary *MCPRunAppmodNetworkOp(NSString *subcommand) {
+    NSString *appmodPath = MCPResolvedJailbreakPath(@"/usr/libexec/ios-mcp/mcp-appmod");
+    if (!MCPIsExecutableFile(appmodPath)) appmodPath = @"/usr/libexec/ios-mcp/mcp-appmod";
+    int status = -1;
+    NSString *out = MCPReadCommandOutput(@[@"mcp-root", appmodPath, subcommand ?: @"inspect-network-proxies"], 10.0, &status);
+    if (!out.length) return @{@"ok": @NO, @"exit_code": @(status)};
+    NSData *d = [out dataUsingEncoding:NSUTF8StringEncoding];
+    id parsed = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
+    if ([parsed isKindOfClass:[NSDictionary class]]) return parsed;
+    // Scan last JSON line if stdout had leading messages
+    for (NSString *line in [[out componentsSeparatedByString:@"\n"] reverseObjectEnumerator]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([t hasPrefix:@"{"]) {
+            id obj = [NSJSONSerialization JSONObjectWithData:[t dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+            if ([obj isKindOfClass:[NSDictionary class]]) return obj;
+        }
+    }
+    return @{@"ok": @NO, @"exit_code": @(status), @"raw": out};
 }
 
 - (NSDictionary *)cellularRadioSnapshotWithEgressProbe:(BOOL)probeEgress {
@@ -2506,7 +2533,27 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
     BOOL wifiConnected = [net[@"wifi_connected"] boolValue];
     NSString *recommendedMethod = wifiConnected ? @"cellular_data_toggle" : @"airplane_full";
 
+    NSDictionary *proxyInfo = nil;
+    [_radioStateLock lock];
+    NSTimeInterval proxyAge = _cachedProxyProbeAt > 0 ? ([[NSDate date] timeIntervalSince1970] - _cachedProxyProbeAt) : 1e9;
+    if (!probeEgress && _cachedProxyProbe && proxyAge < 30.0) {
+        proxyInfo = _cachedProxyProbe;
+    }
+    [_radioStateLock unlock];
+    if (!proxyInfo && (probeEgress || proxyAge >= 30.0)) {
+        proxyInfo = MCPRunAppmodNetworkOp(@"inspect-network-proxies");
+        [_radioStateLock lock];
+        _cachedProxyProbe = proxyInfo;
+        _cachedProxyProbeAt = [[NSDate date] timeIntervalSince1970];
+        [_radioStateLock unlock];
+    }
+    BOOL sysProxyActive = [proxyInfo[@"system_proxy_active"] boolValue];
+    BOOL deadLocalProxy = [proxyInfo[@"dead_local_proxy"] boolValue];
+
     return @{
+        @"system_proxy_active": sysProxyActive ? @YES : @NO,
+        @"dead_local_proxy": deadLocalProxy ? @YES : @NO,
+        @"system_proxies": [proxyInfo[@"proxies_found"] isKindOfClass:[NSArray class]] ? proxyInfo[@"proxies_found"] : @[],
         @"has_cellular_hardware": @(hasCellularHardware),
         @"sim_present": @(simPresent),
         @"cellular_data_enabled": @(effectiveCellEnabled),
@@ -2867,6 +2914,150 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
     return finalResult;
 }
 
+- (void)clearAppEgressPinForBundleId:(NSString *)bundleId {
+    if (!bundleId.length) return;
+    [_radioStateLock lock];
+    [_appEgressPins removeObjectForKey:bundleId];
+    [_radioStateLock unlock];
+    NSString *pinDir = [MCPStateDirPath() stringByAppendingPathComponent:@"egress-pins"];
+    NSString *pinFile = [pinDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.json", bundleId]];
+    [[NSFileManager defaultManager] removeItemAtPath:pinFile error:NULL];
+    NSDictionary *appInfo = [[AppManager sharedInstance] appInfoForBundleId:bundleId error:NULL];
+    NSString *dataContainer = appInfo[@"data_container"] ?: appInfo[@"data_container_path"];
+    if (dataContainer.length > 0) {
+        NSString *appPin = [[dataContainer stringByAppendingPathComponent:@"tmp"] stringByAppendingPathComponent:@".mcp_egress_pin.json"];
+        [[NSFileManager defaultManager] removeItemAtPath:appPin error:NULL];
+    }
+}
+
+- (NSDictionary *)resetNetworkAndRadioStateWithArgs:(NSDictionary *)args
+                                              error:(NSString **)error {
+    if (error) *error = nil;
+    BOOL unloadEngines = [args[@"unload_injected_engines"] boolValue];
+    BOOL resetWanBridge = [args[@"reset_wan_bridge"] boolValue];
+    BOOL cycleWifi = [args[@"cycle_wifi"] boolValue];
+    NSString *reason = [args[@"reason"] isKindOfClass:[NSString class]] ? args[@"reason"] : @"manual_reset";
+
+    // 1. Disarm all helperd watchdogs and stop all detached background tasks/tunnels
+    NSDictionary *wdResp = MCPHelperDaemonSendControlRequest(@{@"helperd_op": @"watchdog_disarm", @"token": @"*"}, 4.0, NULL) ?: @{};
+    NSDictionary *detResp = MCPHelperDaemonSendControlRequest(@{@"helperd_op": @"stop_detached", @"tag": @"*"}, 4.0, NULL) ?: @{};
+    NSString *statusJsonPath = [MCPWorkDirPath() stringByAppendingPathComponent:@"wan_status.json"];
+    MCPWriteJSONFile(@{
+        @"active": @NO,
+        @"auto_restart": @NO,
+        @"public_url": @"",
+        @"public_tunnel_url": @"",
+        @"updated_at": @([[NSDate date] timeIntervalSince1970])
+    }, statusJsonPath);
+
+    // 2. Optionally disable WAN bridge preferences when doing a full emergency reset
+    if (resetWanBridge) {
+        NSString *prefsPath = @(IOS_MCP_PREFERENCES_PLIST_PATH);
+        CFStringRef prefsDomain = (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN;
+        NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:prefsPath] ?: [NSMutableDictionary dictionary];
+        prefs[IOS_MCP_WAN_BRIDGE_ENABLED_KEY] = @NO;
+        prefs[IOS_MCP_PREFER_CELLULAR_KEY] = @NO;
+        CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_WAN_BRIDGE_ENABLED_KEY, kCFBooleanFalse, prefsDomain);
+        CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_PREFER_CELLULAR_KEY, kCFBooleanFalse, prefsDomain);
+        [prefs writeToFile:prefsPath atomically:YES];
+        CFPreferencesAppSynchronize(prefsDomain);
+        [[MCPServer sharedInstance] handleNetworkOrWanConfigurationChange];
+    }
+
+    // 3. Clear all stuck SystemConfiguration HTTP/HTTPS/SOCKS/PAC proxies as root
+    NSDictionary *proxyReset = MCPRunAppmodNetworkOp(@"reset-network-proxies");
+
+    // 4. Restore radios: Airplane Mode OFF, Wi-Fi ON, Cellular Data ON
+    BOOL apSet = MCPSetAirplaneModeState(NO);
+    BOOL cellSet = MCPSetCellularDataEnabled(YES);
+    BOOL wifiSet = NO;
+    if (cycleWifi) {
+        MCPSetWiFiEnabledState(NO);
+        usleep(600 * 1000);
+        wifiSet = MCPSetWiFiEnabledState(YES);
+        usleep(800 * 1000);
+    } else {
+        wifiSet = MCPSetWiFiEnabledState(YES);
+    }
+
+    // 5. Clear all per-app egress pins (live engines + disk + tracked map)
+    NSMutableSet<NSString *> *pinnedBundles = [NSMutableSet set];
+    [_radioStateLock lock];
+    [pinnedBundles addObjectsFromArray:_appEgressPins.allKeys];
+    [_appEgressPins removeAllObjects];
+    [_rotationJobs removeAllObjects];
+    _cachedEgressProbe = nil;
+    _cachedEgressProbeAt = 0;
+    _cachedProxyProbe = nil;
+    _cachedProxyProbeAt = 0;
+    [_radioStateLock unlock];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *pinDir = [MCPStateDirPath() stringByAppendingPathComponent:@"egress-pins"];
+    for (NSString *fn in [fm contentsOfDirectoryAtPath:pinDir error:NULL] ?: @[]) {
+        if ([fn hasSuffix:@".json"]) {
+            [pinnedBundles addObject:[fn substringToIndex:fn.length - 5]];
+            [fm removeItemAtPath:[pinDir stringByAppendingPathComponent:fn] error:NULL];
+        }
+    }
+    NSString *sessionsDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/ios-mcp/engine-sessions");
+    NSMutableArray<NSString *> *sessionBundles = [NSMutableArray array];
+    for (NSString *fn in [fm contentsOfDirectoryAtPath:sessionsDir error:NULL] ?: @[]) {
+        if ([fn hasSuffix:@".json"]) {
+            NSString *bid = [fn substringToIndex:fn.length - 5];
+            [sessionBundles addObject:bid];
+            [pinnedBundles addObject:bid];
+        }
+    }
+
+    NSUInteger clearedLivePins = 0;
+    for (NSString *bid in pinnedBundles) {
+        [self clearAppEgressPinForBundleId:bid];
+        NSDictionary *unpin = [[MCPEngineManager sharedInstance] sendAntiFraudOp:@"engine.egress_pin"
+                                                                     forBundleId:bid
+                                                                            args:@{@"target": @"default", @"interface": @""}
+                                                                           error:NULL];
+        if (unpin) clearedLivePins++;
+    }
+
+    // 6. Optionally unload all lingering AI-injected engines so apps return to stock state
+    NSMutableArray<NSString *> *unloadedEngines = [NSMutableArray array];
+    if (unloadEngines) {
+        for (NSString *bid in sessionBundles) {
+            NSDictionary *rem = [[MCPEngineManager sharedInstance] removeEngineForBundleId:bid error:NULL];
+            if (rem) [unloadedEngines addObject:bid];
+        }
+    }
+
+    // 7. Reset ip_rotation_state.json to idle and write reset receipt for Settings UI
+    MCPWriteJSONFile(@{@"status": @"idle", @"reset_at": @([[NSDate date] timeIntervalSince1970])},
+                     [MCPStateDirPath() stringByAppendingPathComponent:@"ip_rotation_state.json"]);
+
+    NSDictionary *postSnap = [self cellularRadioSnapshotWithEgressProbe:NO];
+    NSDictionary *report = @{
+        @"ok": @YES,
+        @"action": @"reset_network",
+        @"reason": reason,
+        @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+        @"proxies_cleared_count": proxyReset[@"cleared_count"] ?: @0,
+        @"proxy_reset": proxyReset ?: @{},
+        @"watchdogs_cleared": wdResp[@"cleared_count"] ?: @0,
+        @"detached_tasks_stopped": detResp[@"stopped_count"] ?: @0,
+        @"airplane_mode_off_applied": apSet ? @YES : @NO,
+        @"wifi_on_applied": wifiSet ? @YES : @NO,
+        @"cellular_data_on_applied": cellSet ? @YES : @NO,
+        @"app_pins_cleared": @(pinnedBundles.count),
+        @"live_engines_unpinned": @(clearedLivePins),
+        @"engines_unloaded_count": @(unloadedEngines.count),
+        @"engines_unloaded": unloadedEngines,
+        @"wan_bridge_reset": resetWanBridge ? @YES : @NO,
+        @"cellular": postSnap
+    };
+    MCPWriteJSONFile(report, [MCPStateDirPath() stringByAppendingPathComponent:@"last_network_reset.json"]);
+    [[MCPServer sharedInstance] publishSSEEvent:@"network_reset" payload:report];
+    return report;
+}
+
 - (NSDictionary *)wanCellularControllerWithArgs:(NSDictionary *)args
                                           error:(NSString **)error {
     if (error) *error = nil;
@@ -2874,9 +3065,24 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
     NSString *workDir = MCPWorkDirPath();
     NSString *statusJsonPath = [workDir stringByAppendingPathComponent:@"wan_status.json"];
 
+    if ([action isEqualToString:@"reset_network"] || [action isEqualToString:@"recover_network"] || [action isEqualToString:@"kill_network_tasks"]) {
+        return [self resetNetworkAndRadioStateWithArgs:args error:error];
+    }
+
     if ([action isEqualToString:@"status"]) {
         BOOL probe = [args[@"probe_egress"] boolValue];
         [_radioStateLock lock];
+        NSMutableArray<NSString *> *deadBundles = [NSMutableArray array];
+        for (NSString *bid in _appEgressPins) {
+            NSDictionary *entry = _appEgressPins[bid];
+            int pidVal = [entry[@"pid"] respondsToSelector:@selector(intValue)] ? [entry[@"pid"] intValue] : 0;
+            if (pidVal > 1 && kill((pid_t)pidVal, 0) != 0 && errno == ESRCH) {
+                [deadBundles addObject:bid];
+            }
+        }
+        for (NSString *bid in deadBundles) {
+            [_appEgressPins removeObjectForKey:bid];
+        }
         NSDictionary *pinsCopy = [_appEgressPins copy];
         [_radioStateLock unlock];
         return @{
@@ -2915,19 +3121,34 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
         }
         BOOL want = [state isEqualToString:@"toggle"] ? !cur : ([state isEqualToString:@"on"] || [state isEqualToString:@"true"] || [state isEqualToString:@"1"]);
         BOOL wasWifi = MCPGetWiFiEnabledState(NULL, NULL);
+        if (want && keepWifi && wasWifi) {
+            MCPHelperDaemonSendControlRequest(@{
+                @"helperd_op": @"watchdog_arm",
+                @"token": @"ap-keep-wifi",
+                @"action": @"wifi_on",
+                @"restore_wifi": @YES,
+                @"deadline_sec": @12.0
+            }, 3.0, NULL);
+        }
         BOOL applied = MCPSetAirplaneModeState(want);
         if (applied && want && keepWifi && wasWifi) {
-            usleep(350 * 1000);
+            usleep(250 * 1000);
             MCPSetWiFiEnabledState(YES);
+            usleep(450 * 1000);
+            if (!MCPGetWiFiEnabledState(NULL, NULL)) {
+                MCPSetWiFiEnabledState(YES);
+            }
+            MCPHelperDaemonSendControlRequest(@{@"helperd_op": @"watchdog_disarm", @"token": @"ap-keep-wifi"}, 3.0, NULL);
         }
         usleep(250 * 1000);
         BOOL after = MCPGetAirplaneModeState(&apAvail);
         return @{
-            @"ok": @(applied),
+            @"ok": applied ? @YES : @NO,
             @"action": @"airplane_mode",
-            @"requested": @(want),
-            @"airplane_mode": @(after),
-            @"keep_wifi": @(keepWifi)
+            @"requested": want ? @YES : @NO,
+            @"airplane_mode": after ? @YES : @NO,
+            @"keep_wifi": keepWifi ? @YES : @NO,
+            @"wifi_enabled": MCPGetWiFiEnabledState(NULL, NULL) ? @YES : @NO
         };
     }
 
@@ -2973,19 +3194,63 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
                 if (error) *error = opErr ?: @"Failed to apply per-app egress pin via libmcpengine";
                 return nil;
             }
+            NSString *pinDir = [MCPStateDirPath() stringByAppendingPathComponent:@"egress-pins"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:pinDir withIntermediateDirectories:YES attributes:nil error:NULL];
+            NSString *pinFile = [pinDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.json", bundleId]];
             [_radioStateLock lock];
-            if ([target isEqualToString:@"default"]) [_appEgressPins removeObjectForKey:bundleId];
-            else _appEgressPins[bundleId] = res;
+            if ([target isEqualToString:@"default"]) {
+                [_appEgressPins removeObjectForKey:bundleId];
+                [[NSFileManager defaultManager] removeItemAtPath:pinFile error:NULL];
+            } else {
+                _appEgressPins[bundleId] = res;
+                MCPWriteJSONFile(res, pinFile);
+            }
             [_radioStateLock unlock];
-            return @{
+
+            BOOL doVerify = (args[@"verify"] == nil) ? ![target isEqualToString:@"default"] : [args[@"verify"] boolValue];
+            NSDictionary *probeRes = nil;
+            BOOL egressMatches = NO;
+            NSString *verifiedIp = @"";
+            if (doVerify) {
+                probeRes = [[MCPEngineManager sharedInstance] sendAntiFraudOp:@"engine.egress_probe"
+                                                                  forBundleId:bundleId
+                                                                         args:@{}
+                                                                        error:NULL];
+                verifiedIp = [probeRes[@"egress_ip"] isKindOfClass:[NSString class]] ? probeRes[@"egress_ip"] : @"";
+                NSString *wifiIp = [snap[@"wifi_egress_ip"] isKindOfClass:[NSString class]] ? snap[@"wifi_egress_ip"] : @"";
+                NSString *cellIp4 = [snap[@"cellular_egress_ipv4"] isKindOfClass:[NSString class]] ? snap[@"cellular_egress_ipv4"] : @"";
+                NSString *cellIp6 = [snap[@"cellular_egress_ipv6"] isKindOfClass:[NSString class]] ? snap[@"cellular_egress_ipv6"] : @"";
+                if (verifiedIp.length > 0) {
+                    if ([target isEqualToString:@"cellular"]) {
+                        // Carrier CGNAT may assign a different pool IP per flow, so cellular matches if it equals cellIp OR differs from wifiIp
+                        egressMatches = ([verifiedIp isEqualToString:cellIp4] || [verifiedIp isEqualToString:cellIp6] ||
+                                         (wifiIp.length > 0 && ![verifiedIp isEqualToString:wifiIp]));
+                    } else if ([target isEqualToString:@"wifi"]) {
+                        egressMatches = (wifiIp.length > 0 && [verifiedIp isEqualToString:wifiIp]);
+                    } else {
+                        egressMatches = YES;
+                    }
+                }
+            }
+
+            BOOL usesWebKit = [res[@"uses_webkit"] boolValue];
+            NSMutableDictionary *outDict = [NSMutableDictionary dictionaryWithDictionary:@{
                 @"ok": @YES,
                 @"action": @"switch_egress",
                 @"scope": @"app",
                 @"bundle_id": bundleId,
                 @"target": target,
                 @"pin": res,
+                @"verified_app_egress_ip": verifiedIp,
+                @"egress_matches_target": doVerify ? (egressMatches ? @YES : @NO) : @YES,
+                @"uses_webkit": usesWebKit ? @YES : @NO,
                 @"cellular": snap
-            };
+            }];
+            if (probeRes) outDict[@"app_egress_probe"] = probeRes;
+            if (usesWebKit && [target isEqualToString:@"cellular"]) {
+                outDict[@"webkit_note"] = @"Target app links WKWebView; NSURLSession/NWConnection/BSD traffic in the app process is pinned to cellular, while WKWebView tab loads run in com.apple.WebKit.Networking XPC. For browser webviews use scope='device' with auto_restore_wifi_sec.";
+            }
+            return outDict;
         }
 
         // Device-wide Wi-Fi toggle with strict cellular pre-flight safety guard
@@ -3006,14 +3271,32 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
                     @"deadline_sec": @(MIN(autoRestoreSec, 300.0))
                 }, 4.0, NULL);
             }
+            BOOL runAsync = (args[@"async"] != nil) ? [args[@"async"] boolValue] : [snap[@"wifi_connected"] boolValue];
+            if (runAsync) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(350 * NSEC_PER_MSEC)),
+                               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    MCPSetWiFiEnabledState(NO);
+                    [[MCPServer sharedInstance] handleNetworkOrWanConfigurationChange];
+                });
+                return @{
+                    @"ok": @YES,
+                    @"action": @"switch_egress",
+                    @"scope": @"device",
+                    @"target": @"cellular",
+                    @"scheduled": @YES,
+                    @"wifi_enabled": @YES,
+                    @"auto_restore_wifi_sec": @(autoRestoreSec),
+                    @"cellular": snap
+                };
+            }
             BOOL switched = MCPSetWiFiEnabledState(NO);
             [[MCPServer sharedInstance] handleNetworkOrWanConfigurationChange];
             return @{
-                @"ok": @(switched),
+                @"ok": switched ? @YES : @NO,
                 @"action": @"switch_egress",
                 @"scope": @"device",
                 @"target": @"cellular",
-                @"wifi_enabled": @(MCPGetWiFiEnabledState(NULL, NULL)),
+                @"wifi_enabled": MCPGetWiFiEnabledState(NULL, NULL) ? @YES : @NO,
                 @"auto_restore_wifi_sec": @(autoRestoreSec),
                 @"cellular": snap
             };
@@ -3208,7 +3491,7 @@ static NSDictionary *MCPProbeExternalIPOnInterface(NSString *ifName, BOOL ipv6) 
         };
     }
 
-    if (error) *error = [NSString stringWithFormat:@"Unsupported wan_cellular_controller action '%@' (expected: status, connectivity_check, wake_cellular, switch_egress, airplane_mode, cellular_data, rotate_egress, rotation_status, rotation_history, configure_bridge, start_public_tunnel, stop_public_tunnel)", action];
+    if (error) *error = [NSString stringWithFormat:@"Unsupported wan_cellular_controller action '%@' (expected: status, connectivity_check, wake_cellular, switch_egress, airplane_mode, cellular_data, rotate_egress, rotation_status, rotation_history, configure_bridge, start_public_tunnel, stop_public_tunnel, reset_network)", action];
     return nil;
 }
 
