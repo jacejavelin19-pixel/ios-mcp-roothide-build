@@ -219,6 +219,74 @@ static BOOL MCPRunProcessViaHelperDaemon(NSString *launchPath,
     return YES;
 }
 
+NSDictionary *MCPHelperDaemonSendControlRequest(NSDictionary *request,
+                                                NSTimeInterval timeout,
+                                                NSString **errorMessage) {
+    if (errorMessage) *errorMessage = nil;
+    if (![request isKindOfClass:[NSDictionary class]]) {
+        if (errorMessage) *errorMessage = @"Invalid helperd control request";
+        return nil;
+    }
+
+    NSData *reqData = [NSJSONSerialization dataWithJSONObject:request options:0 error:nil];
+    if (!reqData || reqData.length == 0 || reqData.length > 4 * 1024 * 1024) {
+        if (errorMessage) *errorMessage = @"Failed to serialize helperd control request";
+        return nil;
+    }
+
+    NSTimeInterval effectiveTimeout = MAX(timeout, 2.0);
+    int sock = MCPConnectHelperDaemon();
+    for (int retry = 0; sock < 0 && retry < 10; retry++) {
+        usleep(150 * 1000);
+        sock = MCPConnectHelperDaemon();
+    }
+    if (sock < 0) {
+        if (errorMessage) *errorMessage = @"mcp-helperd is unreachable";
+        return nil;
+    }
+
+    struct timeval tv = {.tv_sec = (int)ceil(effectiveTimeout) + 2, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    uint32_t netReqLen = htonl((uint32_t)reqData.length);
+    if (!MCPWriteAllSocket(sock, &netReqLen, sizeof(netReqLen)) ||
+        !MCPWriteAllSocket(sock, reqData.bytes, reqData.length)) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Failed to send control request to mcp-helperd";
+        return nil;
+    }
+
+    uint32_t netRespLen = 0;
+    if (!MCPReadExactSocket(sock, &netRespLen, sizeof(netRespLen))) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Timed out waiting for mcp-helperd control response";
+        return nil;
+    }
+
+    uint32_t respLen = ntohl(netRespLen);
+    if (respLen == 0 || respLen > 8 * 1024 * 1024) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Invalid control response length from mcp-helperd";
+        return nil;
+    }
+
+    NSMutableData *respBytes = [NSMutableData dataWithLength:respLen];
+    if (!respBytes || !MCPReadExactSocket(sock, respBytes.mutableBytes, respLen)) {
+        close(sock);
+        if (errorMessage) *errorMessage = @"Failed to read control response from mcp-helperd";
+        return nil;
+    }
+    close(sock);
+
+    NSDictionary *resp = [NSJSONSerialization JSONObjectWithData:respBytes options:0 error:nil];
+    if (![resp isKindOfClass:[NSDictionary class]]) {
+        if (errorMessage) *errorMessage = @"Malformed JSON control response from mcp-helperd";
+        return nil;
+    }
+    return resp;
+}
+
 static char **MCPCreateCStringArray(NSArray<NSString *> *strings) {
     NSUInteger count = strings.count;
     char **array = calloc(count + 1, sizeof(char *));

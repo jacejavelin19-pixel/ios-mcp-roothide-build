@@ -15,11 +15,11 @@ latest_package_after() {
 choose_scheme() {
   while true; do
     print ""
-    print "请选择构建方案:"
+    print "Select build scheme:"
     print "  1) rootful"
     print "  2) rootless"
     print "  3) roothide"
-    read 'choice?输入编号: '
+    read 'choice?: '
 
     case "$choice" in
       1|rootful|ROOTFUL)
@@ -38,7 +38,7 @@ choose_scheme() {
         return
         ;;
       *)
-        print "无效输入，请重新选择。"
+        print ""
         ;;
     esac
   done
@@ -47,10 +47,10 @@ choose_scheme() {
 choose_package_type() {
   while true; do
     print ""
-    print "请选择包类型:"
-    print "  1) 正式包"
-    print "  2) 测试包"
-    read 'choice?输入编号: '
+    print ":"
+    print "  1) "
+    print "  2) "
+    read 'choice?: '
 
     case "$choice" in
       1|release|final)
@@ -64,7 +64,7 @@ choose_package_type() {
         return
         ;;
       *)
-        print "无效输入，请重新选择。"
+        print ""
         ;;
     esac
   done
@@ -72,7 +72,7 @@ choose_package_type() {
 
 build_subprojects() {
   print ""
-  print "==> 编译子项目..."
+  print "==> ..."
   local scheme_env=()
   if [[ -n "$BUILD_SCHEME" ]]; then
     scheme_env=(THEOS_PACKAGE_SCHEME="$BUILD_SCHEME")
@@ -107,7 +107,7 @@ build_selected_package() {
   touch "$stamp_file"
 
   print ""
-  print "==> 开始构建: ${BUILD_SCHEME_LABEL} / ${BUILD_TYPE_LABEL}"
+  print "==> : ${BUILD_SCHEME_LABEL} / ${BUILD_TYPE_LABEL}"
   make clean >/dev/null
   build_subprojects
   if [[ "$BUILD_TYPE_LABEL" == "debug" ]]; then
@@ -123,12 +123,12 @@ build_selected_package() {
   rm -f "$stamp_file"
 
   if [[ -z "$deb" ]]; then
-    print -u2 "未在 ${ROOT_DIR}/packages 中找到本次构建产物。"
+    print -u2 " ${ROOT_DIR}/packages "
     exit 1
   fi
 
   print ""
-  print "构建完成:"
+  print "Build complete:"
   print "  ${deb}"
 }
 

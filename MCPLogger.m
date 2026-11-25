@@ -48,7 +48,7 @@ static NSString *MCPLoggerSanitizedMessage(NSString *message) {
     return clean;
 }
 
-// 直接读取偏好（每次都会访问 CFPreferences，成本较高）。
+    // Internal helper note
 static BOOL MCPReadDebugLoggingPreference(void) {
     CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)IOS_MCP_DEBUG_LOGGING_PREFERENCE_KEY,
                                                         (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
@@ -70,8 +70,8 @@ static BOOL MCPReadDebugLoggingPreference(void) {
     return enabled;
 }
 
-// 带短 TTL 缓存的开关查询：日志在热路径（HID/AX 等）会被高频调用，关闭时若每次都读
-// CFPreferences 反而影响性能。缓存最多 2 秒，切换开关后最迟约 2 秒生效。
+    // Internal helper note
+    // Internal helper note
 static const CFTimeInterval kMCPDebugLoggingCacheTTL = 2.0;
 static BOOL sMCPDebugLoggingCached = NO;
 static CFAbsoluteTime sMCPDebugLoggingCacheTime = 0;

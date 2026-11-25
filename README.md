@@ -1,8 +1,8 @@
-# iOS MCP (`com.witchan.ios-mcp` `v2.1.1`)
+# iOS MCP (`com.witchan.ios-mcp` `v2.2.0`)
 
 **Sovereign Model Context Protocol (MCP) Server for Autonomous iOS Device Control, Stealth In-Process Instrumentation, Zero-Injection FairPlay Decryption, On-Device ARM64e Decompilation, Anti-Fraud Persona Cloaking, and `MuffinStore` Version Control.**
 
-[![Version](https://img.shields.io/badge/version-2.1.1-blue.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](#)
 [![Architectures](https://img.shields.io/badge/arch-arm64%20%7C%20arm64e-success.svg)](#)
 [![Jailbreaks](https://img.shields.io/badge/jailbreak-RootHide%20%7C%20Rootless%20%7C%20Rootful-purple.svg)](#)
 [![MCP Protocol](https://img.shields.io/badge/MCP-2025--11--25-orange.svg)](#)
@@ -11,7 +11,7 @@
 
 ## 1. Overview & System Architecture
 
-`ios-mcp` (`v2.1.1`) embeds a high-privilege JSON-RPC 2.0 Model Context Protocol server directly into `SpringBoard` (`:8090/mcp`), backed by a modular suite of out-of-process Mach/root helper binaries and a custom Frida-free in-process instrumentation engine (`libmcpengine.dylib`).
+`ios-mcp` (`v2.2.0`) embeds a high-privilege JSON-RPC 2.0 Model Context Protocol server directly into `SpringBoard` (`:8090/mcp`), backed by a modular suite of out-of-process Mach/root helper binaries and a custom Frida-free in-process instrumentation engine (`libmcpengine.dylib`).
 
 Every subsystem is engineered for **iOS 15.0 – 18.5+ (`arm64` Rootless & `arm64e` RootHide)** under strict `pmap_cs`, PAC (Pointer Authentication), and TPRO (`__DATA_CONST` / `__AUTH_CONST` hardware write-protection) enforcement:
 
@@ -20,7 +20,7 @@ Every subsystem is engineered for **iOS 15.0 – 18.5+ (`arm64` Rootless & `arm6
 - **Zero In-App TCP Listeners**: Communication between `SpringBoard` and injected target apps uses a sandbox-local Unix domain socket (`<DataContainer>/tmp/.mcpe.sock`).
 
 ```text
-ios-mcp (v2.1.1 Master Architecture — 194 Tools Across 9 Subsystems)
+ios-mcp (v2.2.0 Master Architecture — 194 Tools Across 9 Subsystems)
 ├── 01. CORE DAEMON & PRIVILEGE LAYER
 │   ├── ios-mcp.dylib (SpringBoard resident HTTP/JSON-RPC MCP Server :8090)
 │   ├── mcp-helperd (KeepAlive LaunchDaemon -> /var/mobile/Library/Caches/ios-mcp-work/.helperd.sock)
@@ -73,7 +73,7 @@ ios-mcp (v2.1.1 Master Architecture — 194 Tools Across 9 Subsystems)
 ## 2. Quick-Start & AI Agent Setup
 
 ### Instant AI Agent Onboarding (`prompt.txt`)
-Copy the contents of [`prompt.txt`](./prompt.txt) in the repository root into your AI coding agent (Claude Code, Cursor, Codex, Grok, or custom MCP client) to give it complete operational knowledge of all `v2.1.1` tools and standard workflows.
+Copy the contents of [`prompt.txt`](./prompt.txt) in the repository root into your AI coding agent (Claude Code, Cursor, Codex, Grok, or custom MCP client) to give it complete operational knowledge of all `v2.2.0` tools and standard workflows.
 
 ### MCP Server Registration
 ```json
@@ -95,14 +95,14 @@ iproxy 18090 8090
 | Endpoint | Method | Description |
 | :--- | :---: | :--- |
 | `/mcp` | `POST` | JSON-RPC 2.0 MCP endpoint (`initialize`, `tools/list`, `tools/call`, `ping`). |
-| `/health` | `GET` | Liveness and version check (`{"status":"ok","server":"ios-mcp","version":"2.1.1",...}`). |
+| `/health` | `GET` | Liveness and version check (`{"status":"ok","server":"ios-mcp","version":"2.2.0",...}`). |
 | `/stream.mjpeg` | `GET` | Real-time multipart MJPEG screen stream (`?fps=15&quality=0.65&max_frames=300`). |
 | `/upload_file` | `POST` | Streams large binary uploads (`.ipa`, `.tipa`, `.deb`, media) to `/var/mobile/Library/Caches/ios-mcp-uploads/`. |
 | `/download_file` | `GET` | Streams arbitrary device files (`?path=/tmp/decrypted.ipa`) with root fallback. |
 
 ---
 
-## 3. Consolidated Tool Reference (`v2.1.1`)
+## 3. Consolidated Tool Reference (`v2.2.0`)
 
 | Subsystem | Tools |
 | :--- | :--- |
@@ -122,8 +122,8 @@ iproxy 18090 8090
 
 ### Automated CI Build (`roothide-tweak-build.yml`)
 Pushing to `chore-roothide-toolchain` runs the GitHub Actions pipeline on `macos-15` using RootHide Theos + iPhoneOS 16.5 SDK, compiling all helpers, standalone Apple-SDK payloads (`arm64` + `arm64e`), and packaging both:
-- `packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm64.deb` (Rootless)
-- `packages/com.witchan.ios-mcp_2.1.1_iphoneos-arm64e.deb` (RootHide)
+- `packages/com.witchan.ios-mcp_2.2.0_iphoneos-arm64.deb` (Rootless)
+- `packages/com.witchan.ios-mcp_2.2.0_iphoneos-arm64e.deb` (RootHide)
 
 ### Local Build (`./build.sh`)
 ```bash

@@ -86,5 +86,11 @@
 - (NSDictionary *)wanCellularControllerWithArgs:(NSDictionary *)args
                                           error:(NSString **)error;
 
+- (NSDictionary *)cellularRadioSnapshotWithEgressProbe:(BOOL)probeEgress;
+- (NSDictionary *)latestRotationState;
+- (NSArray<NSDictionary *> *)rotationHistory;
+- (NSDictionary *)publicTunnelStatus;
+- (void)handleNetworkChangeForTunnels;
+
 @end
 

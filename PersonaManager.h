@@ -8,6 +8,12 @@
                                            overrides:(NSDictionary *)overrides
                                                error:(NSString **)error;
 
+- (NSDictionary *)ensureEngineAndSendOp:(NSString *)op
+                            forBundleId:(NSString *)bundleId
+                                   args:(NSDictionary *)args
+                             autoInject:(BOOL)autoInject
+                                  error:(NSString **)error;
+
 - (NSDictionary *)stealthSyscallShieldForBundleId:(NSString *)bundleId
                                              args:(NSDictionary *)args
                                             error:(NSString **)error;

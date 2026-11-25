@@ -125,7 +125,7 @@
         usleep(200 * 1000);
     }
 
-    NSString *workCache = @"/var/mobile/Library/Caches/ios-mcp-work";
+    NSString *workCache = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
     [[NSFileManager defaultManager] createDirectoryAtPath:workCache withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *patchFile = [workCache stringByAppendingPathComponent:
                            [NSString stringWithFormat:@"ent-patch-%@.json", [NSUUID UUID].UUIDString]];

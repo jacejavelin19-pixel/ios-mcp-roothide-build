@@ -20,7 +20,10 @@
 #define IOS_MCP_WAN_BRIDGE_ENABLED_KEY @"wanBridgeEnabled"
 #define IOS_MCP_WAN_BRIDGE_HOST_KEY @"wanBridgeHost"
 #define IOS_MCP_WAN_BRIDGE_PORT_KEY @"wanBridgePort"
+#define IOS_MCP_WAN_BRIDGE_SECRET_KEY @"wanBridgeSecret"
 #define IOS_MCP_PREFER_CELLULAR_KEY @"preferCellularWan"
+#define IOS_MCP_API_AUTH_ENABLED_KEY @"apiAuthEnabled"
+#define IOS_MCP_API_AUTH_TOKEN_KEY @"apiAuthToken"
 #define IOS_MCP_DEFAULT_WAN_BRIDGE_PORT 8091
 #define IOS_MCP_DARWIN_NOTIFICATION_START CFSTR("com.witchan.ios-mcp.control/start")
 #define IOS_MCP_DARWIN_NOTIFICATION_STOP CFSTR("com.witchan.ios-mcp.control/stop")
@@ -112,6 +115,19 @@ static inline BOOL IOSMCPPreferCellularWan(void) {
     return IOSMCPBoolPreference(IOS_MCP_PREFER_CELLULAR_KEY, NO);
 }
 
+static inline BOOL IOSMCPApiAuthEnabled(void) {
+    return IOSMCPBoolPreference(IOS_MCP_API_AUTH_ENABLED_KEY, NO);
+}
+
+static inline NSString *IOSMCPApiAuthToken(void) {
+    return IOSMCPStringPreference(IOS_MCP_API_AUTH_TOKEN_KEY, @"");
+}
+
+static inline NSString *IOSMCPWanBridgeSecret(void) {
+    NSString *sec = IOSMCPStringPreference(IOS_MCP_WAN_BRIDGE_SECRET_KEY, @"");
+    return sec.length > 0 ? sec : IOSMCPApiAuthToken();
+}
+
 static inline NSString *IOSMCPConfiguredToolsTier(void) {
     const char *envTier = getenv("IOS_MCP_TOOLS");
     if (envTier && envTier[0]) {
@@ -158,13 +174,21 @@ static inline uint16_t IOSMCPConfiguredPort(void) {
 static inline NSString *IOSMCPWanBridgeHost(void) {
     NSString *raw = IOSMCPStringPreference(IOS_MCP_WAN_BRIDGE_HOST_KEY, @"");
     if (!raw.length) return @"";
-    // Allow "host:port" shorthand in the host field
-    NSRange colon = [raw rangeOfString:@":" options:NSBackwardsSearch];
-    if (colon.location != NSNotFound && ![raw hasPrefix:@"["]) {
-        NSString *portPart = [raw substringFromIndex:colon.location + 1];
+    // Bracketed IPv6 literal: "[2607:...]:8091" or "[2607:...]"
+    if ([raw hasPrefix:@"["]) {
+        NSRange closeBracket = [raw rangeOfString:@"]"];
+        if (closeBracket.location != NSNotFound && closeBracket.location > 1) {
+            return [raw substringWithRange:NSMakeRange(1, closeBracket.location - 1)];
+        }
+    }
+    // Allow "host:port" shorthand for IPv4 / hostnames (avoid splitting raw IPv6 with multiple colons)
+    NSRange firstColon = [raw rangeOfString:@":"];
+    NSRange lastColon = [raw rangeOfString:@":" options:NSBackwardsSearch];
+    if (firstColon.location != NSNotFound && firstColon.location == lastColon.location) {
+        NSString *portPart = [raw substringFromIndex:lastColon.location + 1];
         uint16_t parsedPort = 0;
         if (IOSMCPParsePortValue(portPart, &parsedPort)) {
-            return [raw substringToIndex:colon.location];
+            return [raw substringToIndex:lastColon.location];
         }
     }
     return raw;
@@ -180,12 +204,25 @@ static inline BOOL IOSMCPWanBridgeEnabled(void) {
 
 static inline uint16_t IOSMCPWanBridgePort(void) {
     NSString *rawHost = IOSMCPStringPreference(IOS_MCP_WAN_BRIDGE_HOST_KEY, @"");
-    NSRange colon = [rawHost rangeOfString:@":" options:NSBackwardsSearch];
-    if (colon.location != NSNotFound && ![rawHost hasPrefix:@"["]) {
-        NSString *portPart = [rawHost substringFromIndex:colon.location + 1];
-        uint16_t inlinePort = 0;
-        if (IOSMCPParsePortValue(portPart, &inlinePort)) {
-            return inlinePort;
+    if ([rawHost hasPrefix:@"["]) {
+        NSRange closeBracket = [rawHost rangeOfString:@"]"];
+        if (closeBracket.location != NSNotFound && closeBracket.location + 2 < rawHost.length &&
+            [rawHost characterAtIndex:closeBracket.location + 1] == ':') {
+            NSString *portPart = [rawHost substringFromIndex:closeBracket.location + 2];
+            uint16_t inlinePort = 0;
+            if (IOSMCPParsePortValue(portPart, &inlinePort)) {
+                return inlinePort;
+            }
+        }
+    } else {
+        NSRange firstColon = [rawHost rangeOfString:@":"];
+        NSRange lastColon = [rawHost rangeOfString:@":" options:NSBackwardsSearch];
+        if (firstColon.location != NSNotFound && firstColon.location == lastColon.location) {
+            NSString *portPart = [rawHost substringFromIndex:lastColon.location + 1];
+            uint16_t inlinePort = 0;
+            if (IOSMCPParsePortValue(portPart, &inlinePort)) {
+                return inlinePort;
+            }
         }
     }
     uint16_t port = IOS_MCP_DEFAULT_WAN_BRIDGE_PORT;
@@ -194,6 +231,21 @@ static inline uint16_t IOSMCPWanBridgePort(void) {
         IOSMCPParsePortValue(value, &port);
     }
     return port;
+}
+
+static inline BOOL IOSMCPIsCGNATOrPrivateIPv4(NSString *ip) {
+    if (!ip.length) return NO;
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip.UTF8String, &addr) != 1) return NO;
+    uint32_t h = ntohl(addr.s_addr);
+    uint8_t a = (uint8_t)((h >> 24) & 0xFF);
+    uint8_t b = (uint8_t)((h >> 16) & 0xFF);
+    // RFC6598 CGNAT 100.64.0.0/10, RFC1918 10/8, 172.16/12, 192.168/16
+    if (a == 100 && (b & 0xC0) == 64) return YES;
+    if (a == 10) return YES;
+    if (a == 172 && (b >= 16 && b <= 31)) return YES;
+    if (a == 192 && b == 168) return YES;
+    return NO;
 }
 
 static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void) {
@@ -207,6 +259,7 @@ static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void)
     NSString *vpnTailscaleIPv6 = nil;
     NSString *usbIPv4 = nil;
     NSMutableArray<NSDictionary *> *allInterfaces = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *cellularInterfaces = [NSMutableArray array];
 
     if (getifaddrs(&interfaces) == 0) {
         for (struct ifaddrs *interface = interfaces; interface; interface = interface->ifa_next) {
@@ -230,19 +283,25 @@ static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void)
             NSString *address = [NSString stringWithUTF8String:addrBuf];
             if (!address.length || [address hasPrefix:@"169.254."]) continue;
 
-            [allInterfaces addObject:@{
+            NSDictionary *ifEntry = @{
                 @"interface": ifName,
                 @"family": (family == AF_INET) ? @"IPv4" : @"IPv6",
                 @"address": address
-            }];
+            };
+            [allInterfaces addObject:ifEntry];
 
             if ([ifName isEqualToString:@"en0"]) {
                 if (family == AF_INET && !wifiIPv4) wifiIPv4 = address;
                 else if (family == AF_INET6 && !wifiIPv6) wifiIPv6 = address;
             } else if ([ifName hasPrefix:@"pdp_ip"]) {
-                if (!cellularIfName) cellularIfName = ifName;
-                if (family == AF_INET && !cellularIPv4) cellularIPv4 = address;
-                else if (family == AF_INET6 && !cellularIPv6) cellularIPv6 = address;
+                [cellularInterfaces addObject:ifEntry];
+                // Prefer pdp_ip0 as the primary internet PDP interface when present
+                BOOL preferThisIf = (!cellularIfName || [ifName isEqualToString:@"pdp_ip0"]);
+                if (preferThisIf) {
+                    cellularIfName = ifName;
+                }
+                if (family == AF_INET && (!cellularIPv4 || [ifName isEqualToString:@"pdp_ip0"])) cellularIPv4 = address;
+                else if (family == AF_INET6 && (!cellularIPv6 || [ifName isEqualToString:@"pdp_ip0"])) cellularIPv6 = address;
             } else if ([ifName hasPrefix:@"utun"] || [ifName hasPrefix:@"ipsec"] || [ifName hasPrefix:@"ppp"]) {
                 if (family == AF_INET && !vpnTailscaleIPv4) vpnTailscaleIPv4 = address;
                 else if (family == AF_INET6 && !vpnTailscaleIPv6) vpnTailscaleIPv6 = address;
@@ -261,17 +320,25 @@ static inline NSDictionary<NSString *, id> *IOSMCPNetworkInterfacesSummary(void)
     if (cellularIPv6.length) [urls addObject:[NSString stringWithFormat:@"http://[%@]:%u/mcp", cellularIPv6, (unsigned int)port]];
     if (wifiIPv6.length) [urls addObject:[NSString stringWithFormat:@"http://[%@]:%u/mcp", wifiIPv6, (unsigned int)port]];
 
+    BOOL wifiConnected = (wifiIPv4.length > 0 || wifiIPv6.length > 0);
+    BOOL cellularConnected = (cellularIPv4.length > 0 || cellularIPv6.length > 0);
+    BOOL behindCGNAT = (cellularIPv4.length > 0 && IOSMCPIsCGNATOrPrivateIPv4(cellularIPv4));
+
     return @{
+        @"wifi_connected": @(wifiConnected),
         @"wifi_ipv4": wifiIPv4 ?: @"",
         @"wifi_ipv6": wifiIPv6 ?: @"",
+        @"cellular_connected": @(cellularConnected),
         @"cellular_interface": cellularIfName ?: @"pdp_ip0",
         @"cellular_ipv4": cellularIPv4 ?: @"",
         @"cellular_ipv6": cellularIPv6 ?: @"",
+        @"cellular_interfaces": cellularInterfaces,
+        @"behind_cgnat": @(behindCGNAT),
         @"vpn_tailscale_ipv4": vpnTailscaleIPv4 ?: @"",
         @"vpn_tailscale_ipv6": vpnTailscaleIPv6 ?: @"",
         @"usb_ipv4": usbIPv4 ?: @"",
-        @"active_connection_mode": (wifiIPv4.length ? (cellularIPv4.length || cellularIPv6.length ? @"wifi+cellular" : @"wifi")
-                                                    : ((cellularIPv4.length || cellularIPv6.length) ? @"cellular" : @"loopback")),
+        @"active_connection_mode": (wifiConnected ? (cellularConnected ? @"wifi+cellular" : @"wifi")
+                                                  : (cellularConnected ? @"cellular" : @"loopback")),
         @"endpoints": urls,
         @"interfaces": allInterfaces
     };

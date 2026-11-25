@@ -301,8 +301,12 @@ static int validate_chmod_arguments(int argc, char *argv[]) {
 }
 
 static int validate_launchctl_arguments(int argc, char *argv[]) {
+    if (argc == 4 && strcmp(argv[2], "reboot") == 0 && strcmp(argv[3], "userspace") == 0) {
+        return 1;
+    }
+
     if (argc != 5) {
-        fprintf(stderr, "launchctl usage is restricted to kickstart -k approved accessibility services\n");
+        fprintf(stderr, "launchctl usage is restricted to reboot userspace or kickstart -k approved services\n");
         return 0;
     }
 
@@ -358,12 +362,15 @@ static int validate_id_arguments(int argc, char *argv[]) {
 }
 
 static int validate_jbctl_arguments(int argc, char *argv[]) {
-    // Only the non-destructive trustcache operations are permitted:
+    // Allow userspace reboot and non-destructive trustcache operations:
+    //   jbctl reboot_userspace
     //   jbctl trustcache add <absolute macho path>
     //   jbctl trustcache info
-    // Never clear/update (would drop every jailbreak cdhash or reboot).
+    if (argc == 3 && strcmp(argv[2], "reboot_userspace") == 0) {
+        return 1;
+    }
     if (argc < 3 || strcmp(argv[2], "trustcache") != 0) {
-        fprintf(stderr, "jbctl usage is restricted to trustcache add/info\n");
+        fprintf(stderr, "jbctl usage is restricted to reboot_userspace or trustcache add/info\n");
         return 0;
     }
     if (argc == 4 && strcmp(argv[3], "add") == 0) {

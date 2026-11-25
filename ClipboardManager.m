@@ -393,8 +393,8 @@ static NSDictionary *MCP_ReadGeneralPasteboardDirectly(void) {
         return ok;
     }
 
-    // 与 readClipboard 同理：写入也跨进程到 pasteboardd，
-    // 不要在 SpringBoard 主线程上同步等待。复用后台串行队列并加超时保护。
+    // Internal helper note
+    // Internal helper note
     __block BOOL ok = NO;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
 

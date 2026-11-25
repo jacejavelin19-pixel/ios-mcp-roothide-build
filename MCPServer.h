@@ -12,6 +12,8 @@
 - (void)stop;
 - (void)handleNetworkOrWanConfigurationChange;
 - (NSDictionary *)wanBridgeStatusSummary;
+- (void)broadcastWanBridgeControlLine:(NSString *)line;
+- (void)publishSSEEvent:(NSString *)eventType payload:(NSDictionary *)payload;
 
 @end
 

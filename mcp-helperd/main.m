@@ -4,10 +4,13 @@
 #endif
 #import <arpa/inet.h>
 #import <dispatch/dispatch.h>
+#import <dlfcn.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <mach-o/dyld.h>
 #import <netinet/in.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <poll.h>
 #import <signal.h>
 #import <spawn.h>
@@ -404,6 +407,291 @@ static NSDictionary *MCPRunSyncProcessRequest(NSDictionary *req) {
     };
 }
 
+static NSLock *gWatchdogLock = nil;
+static NSMutableDictionary<NSString *, NSDictionary *> *gArmedWatchdogs = nil;
+static NSMutableDictionary<NSString *, NSNumber *> *gDetachedPids = nil;
+
+static void MCPEnsureHelperdStateInit(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gWatchdogLock = [[NSLock alloc] init];
+        gArmedWatchdogs = [NSMutableDictionary dictionary];
+        gDetachedPids = [NSMutableDictionary dictionary];
+    });
+}
+
+static BOOL MCPHelperdSetAirplaneModeOff(void) {
+    dlopen("/System/Library/PrivateFrameworks/AppSupport.framework/AppSupport", RTLD_LAZY);
+    Class rpCls = objc_getClass("RadiosPreferences");
+    if (!rpCls) return NO;
+    id rp = [[rpCls alloc] init];
+    if (!rp) return NO;
+    SEL setSel = NSSelectorFromString(@"setAirplaneMode:");
+    SEL syncSel = NSSelectorFromString(@"synchronize");
+    if ([rp respondsToSelector:setSel]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(rp, setSel, NO);
+        if ([rp respondsToSelector:syncSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(rp, syncSel);
+        }
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL MCPHelperdSetWiFiPowerOn(void) {
+    void *mw = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_LAZY);
+    if (!mw) return NO;
+    typedef void *(*WiFiClientCreateFn)(CFAllocatorRef);
+    typedef void (*WiFiClientSetPropFn)(void *, CFStringRef, CFTypeRef);
+    WiFiClientCreateFn createFn = (WiFiClientCreateFn)dlsym(mw, "WiFiManagerClientCreate");
+    WiFiClientSetPropFn setPropFn = (WiFiClientSetPropFn)dlsym(mw, "WiFiManagerClientSetProperty");
+    if (!createFn || !setPropFn) return NO;
+    void *client = createFn(kCFAllocatorDefault);
+    if (!client) return NO;
+    setPropFn(client, CFSTR("AllowEnable"), kCFBooleanTrue);
+    CFRelease(client);
+    return YES;
+}
+
+static NSDictionary *MCPWatchdogArm(NSDictionary *req) {
+    MCPEnsureHelperdStateInit();
+    NSString *token = [req[@"token"] isKindOfClass:[NSString class]] && [req[@"token"] length] > 0
+        ? req[@"token"]
+        : [[NSUUID UUID] UUIDString];
+    NSString *action = [req[@"action"] isKindOfClass:[NSString class]] && [req[@"action"] length] > 0
+        ? [req[@"action"] lowercaseString]
+        : @"airplane_off";
+    double deadlineSec = [req[@"deadline_sec"] respondsToSelector:@selector(doubleValue)]
+        ? [req[@"deadline_sec"] doubleValue]
+        : 25.0;
+    if (deadlineSec < 5.0) deadlineSec = 5.0;
+    if (deadlineSec > 300.0) deadlineSec = 300.0;
+    BOOL restoreWifi = [req[@"restore_wifi"] respondsToSelector:@selector(boolValue)]
+        ? [req[@"restore_wifi"] boolValue]
+        : NO;
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSDictionary *entry = @{
+        @"token": token,
+        @"action": action,
+        @"restore_wifi": @(restoreWifi),
+        @"armed_at": @(now),
+        @"deadline_at": @(now + deadlineSec),
+        @"deadline_sec": @(deadlineSec)
+    };
+
+    [gWatchdogLock lock];
+    gArmedWatchdogs[token] = entry;
+    [gWatchdogLock unlock];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(deadlineSec * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [gWatchdogLock lock];
+        NSDictionary *stillArmed = gArmedWatchdogs[token];
+        if (stillArmed) {
+            [gArmedWatchdogs removeObjectForKey:token];
+        }
+        [gWatchdogLock unlock];
+
+        if (!stillArmed) return;
+        if ([action isEqualToString:@"airplane_off"] || [action isEqualToString:@"radio_recover"]) {
+            MCPHelperdSetAirplaneModeOff();
+        }
+        if (restoreWifi || [action isEqualToString:@"wifi_on"] || [action isEqualToString:@"radio_recover"]) {
+            MCPHelperdSetWiFiPowerOn();
+        }
+    });
+
+    return @{
+        @"ok": @YES,
+        @"helperd_op": @"watchdog_arm",
+        @"token": token,
+        @"action": action,
+        @"deadline_sec": @(deadlineSec)
+    };
+}
+
+static NSDictionary *MCPWatchdogDisarm(NSDictionary *req) {
+    MCPEnsureHelperdStateInit();
+    NSString *token = [req[@"token"] isKindOfClass:[NSString class]] ? req[@"token"] : @"";
+    BOOL wasArmed = NO;
+    [gWatchdogLock lock];
+    if (token.length > 0) {
+        wasArmed = (gArmedWatchdogs[token] != nil);
+        [gArmedWatchdogs removeObjectForKey:token];
+    } else {
+        wasArmed = (gArmedWatchdogs.count > 0);
+        [gArmedWatchdogs removeAllObjects];
+    }
+    [gWatchdogLock unlock];
+    return @{
+        @"ok": @YES,
+        @"helperd_op": @"watchdog_disarm",
+        @"token": token,
+        @"was_armed": @(wasArmed)
+    };
+}
+
+static NSDictionary *MCPWatchdogStatus(void) {
+    MCPEnsureHelperdStateInit();
+    [gWatchdogLock lock];
+    NSArray *items = [gArmedWatchdogs.allValues copy];
+    [gWatchdogLock unlock];
+    return @{
+        @"ok": @YES,
+        @"helperd_op": @"watchdog_status",
+        @"armed_count": @(items.count),
+        @"watchdogs": items ?: @[]
+    };
+}
+
+static NSDictionary *MCPSpawnDetachedProcessRequest(NSDictionary *req) {
+    MCPEnsureHelperdStateInit();
+    NSString *launchPath = [req[@"launch_path"] isKindOfClass:[NSString class]] ? req[@"launch_path"] : @"";
+    NSArray *arguments = [req[@"arguments"] isKindOfClass:[NSArray class]] ? req[@"arguments"] : @[];
+    NSDictionary *envOverrides = [req[@"environment"] isKindOfClass:[NSDictionary class]] ? req[@"environment"] : nil;
+    NSString *logPath = [req[@"log_path"] isKindOfClass:[NSString class]] ? req[@"log_path"] : @"/dev/null";
+    NSString *tag = [req[@"tag"] isKindOfClass:[NSString class]] && [req[@"tag"] length] > 0 ? req[@"tag"] : @"detached";
+
+    if (!launchPath.length) {
+        return @{@"ok": @NO, @"error": @"Empty launch_path"};
+    }
+
+    // Stop any previous process registered under the same tag
+    [gWatchdogLock lock];
+    NSNumber *oldPidNum = gDetachedPids[tag];
+    if (oldPidNum) [gDetachedPids removeObjectForKey:tag];
+    [gWatchdogLock unlock];
+    if (oldPidNum && oldPidNum.intValue > 1) {
+        pid_t oldPid = (pid_t)oldPidNum.intValue;
+        kill(oldPid, SIGTERM);
+        usleep(120 * 1000);
+        kill(oldPid, SIGKILL);
+        int st = 0;
+        waitpid(oldPid, &st, WNOHANG);
+    }
+
+    int logFD = open(logPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (logFD < 0) logFD = open("/dev/null", O_WRONLY);
+    if (logFD >= 0) MCPKeepFDAboveStdio(&logFD);
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (logFD >= 0) {
+        posix_spawn_file_actions_adddup2(&actions, logFD, STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, logFD, STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, logFD);
+    }
+
+    NSMutableArray<NSString *> *argvStrings = [NSMutableArray arrayWithObject:launchPath.lastPathComponent ?: launchPath];
+    for (id item in arguments) {
+        if ([item isKindOfClass:[NSString class]]) [argvStrings addObject:item];
+        else if ([item respondsToSelector:@selector(description)]) [argvStrings addObject:[item description]];
+    }
+    char **argv = MCPCreateCStringArray(argvStrings);
+    if (!argv) {
+        if (logFD >= 0) close(logFD);
+        posix_spawn_file_actions_destroy(&actions);
+        return @{@"ok": @NO, @"error": @"Failed to allocate argv"};
+    }
+
+    char **envp = environ;
+    NSUInteger envCount = 0;
+    NSDictionary<NSString *, NSString *> *baseEnv = [[NSProcessInfo processInfo] environment] ?: @{};
+    if ([envOverrides isKindOfClass:[NSDictionary class]] && envOverrides.count > 0) {
+        NSMutableDictionary<NSString *, NSString *> *merged = [NSMutableDictionary dictionaryWithDictionary:baseEnv];
+        [envOverrides enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+            if ([key isKindOfClass:[NSString class]] && [obj isKindOfClass:[NSString class]]) {
+                merged[key] = obj;
+            }
+        }];
+        NSMutableArray<NSString *> *envStrings = [NSMutableArray arrayWithCapacity:merged.count];
+        [merged enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *val, BOOL *stop) {
+            [envStrings addObject:[NSString stringWithFormat:@"%@=%@", key, val ?: @""]];
+        }];
+        envCount = envStrings.count;
+        envp = MCPCreateCStringArray(envStrings);
+    }
+
+    pid_t pid = 0;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    short flags = 0;
+    if (posix_spawnattr_getflags(&attr, &flags) == 0) {
+        flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+        posix_spawnattr_setflags(&attr, flags);
+    }
+#endif
+    int spawnStatus = posix_spawn(&pid, launchPath.fileSystemRepresentation, &actions, &attr, argv, envp);
+    posix_spawnattr_destroy(&attr);
+    MCPFreeCStringArray(argv, argvStrings.count);
+    if (envCount > 0 && envp != environ) MCPFreeCStringArray(envp, envCount);
+    posix_spawn_file_actions_destroy(&actions);
+    if (logFD >= 0) close(logFD);
+
+    if (spawnStatus != 0 || pid <= 0) {
+        return @{
+            @"ok": @NO,
+            @"error": [NSString stringWithFormat:@"posix_spawn detached failed for %@: %s", launchPath, strerror(spawnStatus)]
+        };
+    }
+
+    [gWatchdogLock lock];
+    gDetachedPids[tag] = @(pid);
+    [gWatchdogLock unlock];
+
+    // Reap asynchronously when child exits so no zombies accumulate
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        [gWatchdogLock lock];
+        if ([gDetachedPids[tag] intValue] == (int)pid) {
+            [gDetachedPids removeObjectForKey:tag];
+        }
+        [gWatchdogLock unlock];
+    });
+
+    return @{
+        @"ok": @YES,
+        @"helperd_op": @"spawn_detached",
+        @"tag": tag,
+        @"pid": @(pid),
+        @"log_path": logPath
+    };
+}
+
+static NSDictionary *MCPStopDetachedProcessRequest(NSDictionary *req) {
+    MCPEnsureHelperdStateInit();
+    NSString *tag = [req[@"tag"] isKindOfClass:[NSString class]] ? req[@"tag"] : @"";
+    pid_t pid = [req[@"pid"] respondsToSelector:@selector(intValue)] ? (pid_t)[req[@"pid"] intValue] : 0;
+
+    [gWatchdogLock lock];
+    if (pid <= 1 && tag.length > 0 && gDetachedPids[tag]) {
+        pid = (pid_t)[gDetachedPids[tag] intValue];
+    }
+    if (tag.length > 0) [gDetachedPids removeObjectForKey:tag];
+    [gWatchdogLock unlock];
+
+    BOOL stopped = NO;
+    if (pid > 1) {
+        if (kill(pid, SIGTERM) == 0) stopped = YES;
+        usleep(120 * 1000);
+        if (kill(pid, 0) == 0) {
+            kill(pid, SIGKILL);
+            stopped = YES;
+        }
+    }
+    return @{
+        @"ok": @YES,
+        @"helperd_op": @"stop_detached",
+        @"tag": tag,
+        @"pid": @(pid),
+        @"stopped": @(stopped)
+    };
+}
+
 static void MCPHandleClientConnection(int clientFD) {
     @autoreleasepool {
         int yes = 1;
@@ -433,7 +721,20 @@ static void MCPHandleClientConnection(int clientFD) {
         NSDictionary *req = [NSJSONSerialization JSONObjectWithData:reqData options:0 error:nil];
         NSDictionary *resp = nil;
         if ([req isKindOfClass:[NSDictionary class]]) {
-            resp = MCPRunSyncProcessRequest(req);
+            NSString *op = [req[@"helperd_op"] isKindOfClass:[NSString class]] ? req[@"helperd_op"] : nil;
+            if ([op isEqualToString:@"watchdog_arm"]) {
+                resp = MCPWatchdogArm(req);
+            } else if ([op isEqualToString:@"watchdog_disarm"]) {
+                resp = MCPWatchdogDisarm(req);
+            } else if ([op isEqualToString:@"watchdog_status"]) {
+                resp = MCPWatchdogStatus();
+            } else if ([op isEqualToString:@"spawn_detached"]) {
+                resp = MCPSpawnDetachedProcessRequest(req);
+            } else if ([op isEqualToString:@"stop_detached"]) {
+                resp = MCPStopDetachedProcessRequest(req);
+            } else {
+                resp = MCPRunSyncProcessRequest(req);
+            }
         } else {
             resp = @{@"ok": @NO, @"exit_code": @(-1), @"error": @"Malformed helperd request JSON"};
         }

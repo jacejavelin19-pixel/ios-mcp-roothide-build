@@ -1,20 +1,12 @@
 #!/usr/bin/env node
 /**
- * iOS MCP Wi-Fi + Cellular WAN Reverse Bridge & Multi-Path Router (Home PC Daemon)
+ * iOS MCP Wi-Fi + Cellular WAN Reverse Bridge & Multi-Path Router (Host Daemon)
  *
- * Ensures the iPhone's MCP server remains reachable from your home computer whether:
- *   1. The phone is at school / away on Cellular Data (pdp_ip0 behind carrier CGNAT)
- *      or restricted school Wi-Fi -> Phone connects outbound to this daemon's
- *      reverse bridge port (default TCP 8091) using the MCP-HELLO / MCP-REQ protocol.
- *   2. The phone is on Home Wi-Fi (10.0.x.x / 192.168.x.x) or Tailscale/VPN (100.x.y.z)
- *      -> Daemon automatically routes via the reverse bridge pool OR falls back to direct
- *      Wi-Fi / Tailscale / Cellular IPv6 endpoints transparently.
+ * Keeps the iPhone's MCP server reachable across Wi-Fi, Cellular (pdp_ip0 behind CGNAT),
+ * Tailscale/VPN, and live Cellular Egress IP Rotations (MCP-ROTATING reconnect queue).
  *
- * Usage on Home PC:
- *   node scripts/mcp-wan-bridge.mjs --http-port 8090 --bridge-port 8091 --phone-ip 127.0.0.1
- *
- * Point your MCP client (Claude Code, Cursor, Codex, Antigravity) to:
- *   http://127.0.0.1:8090/mcp
+ * Usage:
+ *   node scripts/mcp-wan-bridge.mjs --http-port 8090 --bridge-port 8091 [--bridge-secret <secret>]
  */
 
 import net from "node:net";
@@ -31,6 +23,8 @@ function parseArgs(argv) {
     phoneIp: process.env.IOS_MCP_PHONE_IP || "",
     phonePort: Number(process.env.IOS_MCP_PHONE_PORT || 8090),
     tailscaleIp: process.env.IOS_MCP_TAILSCALE_IP || "",
+    bridgeSecret: process.env.IOS_MCP_BRIDGE_SECRET || process.env.IOS_MCP_AUTH_TOKEN || "",
+    rotateWaitMs: Number(process.env.IOS_MCP_ROTATE_WAIT_MS || 30000),
     stateFile: path.join(os.homedir(), ".ios-mcp-wan-state.json"),
   };
 
@@ -43,6 +37,8 @@ function parseArgs(argv) {
     else if (a === "--phone-ip" && argv[i + 1]) opts.phoneIp = argv[++i];
     else if (a === "--phone-port" && argv[i + 1]) opts.phonePort = Number(argv[++i]);
     else if (a === "--tailscale-ip" && argv[i + 1]) opts.tailscaleIp = argv[++i];
+    else if ((a === "--bridge-secret" || a === "--token") && argv[i + 1]) opts.bridgeSecret = argv[++i];
+    else if (a === "--rotate-wait-ms" && argv[i + 1]) opts.rotateWaitMs = Number(argv[++i]);
     else if (a === "--state-file" && argv[i + 1]) opts.stateFile = argv[++i];
   }
   return opts;
@@ -51,13 +47,20 @@ function parseArgs(argv) {
 const opts = parseArgs(process.argv);
 
 const pool = [];
+const pendingWaiters = [];
+let rotatingUntilMs = 0;
+let lastRotationNotice = null;
+
 let lastPhoneHello = {
   wifi_ip: opts.phoneIp || "",
+  wifi_ipv4: opts.phoneIp || "",
   cellular_ipv4: "",
   cellular_ipv6: "",
   vpn_ip: opts.tailscaleIp || "",
+  vpn_tailscale_ipv4: opts.tailscaleIp || "",
   port: opts.phonePort || 8090,
   bound_if: "unknown",
+  bound_interface: "unknown",
   remoteAddress: "",
   lastSeenAt: 0,
 };
@@ -66,6 +69,8 @@ let metrics = {
   totalRequests: 0,
   routedViaReverseBridge: 0,
   routedViaDirectSocket: 0,
+  queuedDuringRotation: 0,
+  rejectedBadSecret: 0,
   failedRequests: 0,
   totalBridgeHandshakes: 0,
 };
@@ -74,8 +79,14 @@ try {
   if (fs.existsSync(opts.stateFile)) {
     const saved = JSON.parse(fs.readFileSync(opts.stateFile, "utf8"));
     lastPhoneHello = { ...lastPhoneHello, ...saved };
-    if (opts.phoneIp) lastPhoneHello.wifi_ip = opts.phoneIp;
-    if (opts.tailscaleIp) lastPhoneHello.vpn_ip = opts.tailscaleIp;
+    if (opts.phoneIp) {
+      lastPhoneHello.wifi_ip = opts.phoneIp;
+      lastPhoneHello.wifi_ipv4 = opts.phoneIp;
+    }
+    if (opts.tailscaleIp) {
+      lastPhoneHello.vpn_ip = opts.tailscaleIp;
+      lastPhoneHello.vpn_tailscale_ipv4 = opts.tailscaleIp;
+    }
   }
 } catch {}
 
@@ -106,9 +117,43 @@ function removeSocketFromPool(sock) {
   }
 }
 
+function acquireReverseBridgeSocket() {
+  while (pool.length > 0) {
+    const entry = pool.shift();
+    if (entry && entry.socket && !entry.socket.destroyed && entry.socket.writable && entry.socket.readable) {
+      entry.detachHandshakeListeners();
+      return entry.socket;
+    }
+  }
+  return null;
+}
+
+function wakePendingWaiters() {
+  while (pendingWaiters.length > 0 && pool.length > 0) {
+    const sock = acquireReverseBridgeSocket();
+    if (!sock) break;
+    const waiter = pendingWaiters.shift();
+    clearTimeout(waiter.timer);
+    waiter.resolve(sock);
+  }
+}
+
+function waitForReverseBridgeSocket(timeoutMs) {
+  const immediate = acquireReverseBridgeSocket();
+  if (immediate) return Promise.resolve(immediate);
+  return new Promise((resolve) => {
+    const waiter = { resolve, timer: null };
+    waiter.timer = setTimeout(() => {
+      const idx = pendingWaiters.indexOf(waiter);
+      if (idx !== -1) pendingWaiters.splice(idx, 1);
+      resolve(null);
+    }, timeoutMs);
+    pendingWaiters.push(waiter);
+  });
+}
+
 /**
  * 1. Reverse Bridge Listener (TCP 8091)
- * Accepts persistent outbound connections from the iPhone over Cellular (pdp_ip0) or Wi-Fi (en0).
  */
 const bridgeServer = net.createServer({ allowHalfOpen: false }, (socket) => {
   socket.setNoDelay(true);
@@ -133,16 +178,31 @@ const bridgeServer = net.createServer({ allowHalfOpen: false }, (socket) => {
           meta = JSON.parse(jsonPart);
         } catch {}
 
+        if (opts.bridgeSecret && meta.bridge_secret !== opts.bridgeSecret) {
+          metrics.rejectedBadSecret++;
+          socket.destroy();
+          return;
+        }
+
+        const wifiIp = meta.wifi_ipv4 || meta.wifi_ip || opts.phoneIp || "";
+        const vpnIp = meta.vpn_tailscale_ipv4 || meta.vpn_ip || opts.tailscaleIp || "";
+        const boundIf = meta.bound_interface || meta.bound_if || "net";
+
         lastPhoneHello = {
           ...lastPhoneHello,
           ...meta,
+          wifi_ip: wifiIp,
+          wifi_ipv4: wifiIp,
+          vpn_ip: vpnIp,
+          vpn_tailscale_ipv4: vpnIp,
+          bound_if: boundIf,
+          bound_interface: boundIf,
           remoteAddress: socket.remoteAddress || "",
           lastSeenAt: Date.now(),
         };
-        if (opts.phoneIp && !meta.wifi_ip) {
-          lastPhoneHello.wifi_ip = opts.phoneIp;
-        }
+        delete lastPhoneHello.bridge_secret;
         saveLastPhoneState();
+        rotatingUntilMs = 0;
 
         if (!handshakeDone) {
           handshakeDone = true;
@@ -158,9 +218,20 @@ const bridgeServer = net.createServer({ allowHalfOpen: false }, (socket) => {
             },
           });
           console.log(
-            `[wan-bridge] iPhone connected via ${meta.bound_if || "net"} (remote=${socket.remoteAddress}, wifi=${meta.wifi_ip || "-"}, cell4=${meta.cellular_ipv4 || "-"}, cell6=${meta.cellular_ipv6 || "-"}, pool=${pool.length})`
+            `[wan-bridge] iPhone connected via ${boundIf} (remote=${socket.remoteAddress}, wifi=${wifiIp || "-"}, cell4=${meta.cellular_ipv4 || "-"}, cell6=${meta.cellular_ipv6 || "-"}, pool=${pool.length})`
           );
+          wakePendingWaiters();
         }
+      } else if (line.startsWith("MCP-ROTATING")) {
+        const jsonPart = line.slice("MCP-ROTATING".length).trim();
+        let notice = {};
+        try {
+          notice = jsonPart ? JSON.parse(jsonPart) : {};
+        } catch {}
+        const holdMs = Math.max(Number(notice.hold_sec || 6) * 1000 + 15000, opts.rotateWaitMs);
+        rotatingUntilMs = Date.now() + holdMs;
+        lastRotationNotice = { ...notice, receivedAt: Date.now() };
+        console.log(`[wan-bridge] iPhone rotating cellular egress IP (job=${notice.job_id || "-"}, queuing requests up to ${Math.round(holdMs / 1000)}s)`);
       } else if (line === "MCP-PING") {
         lastPhoneHello.lastSeenAt = Date.now();
         const entry = pool.find((e) => e.socket === socket);
@@ -189,30 +260,6 @@ bridgeServer.listen(opts.bridgePort, opts.bridgeHost, () => {
   console.log(`[wan-bridge] Listening for iPhone reverse cellular/WAN connections on ${opts.bridgeHost}:${opts.bridgePort}`);
 });
 
-/**
- * Pop a healthy idle reverse-bridge socket from the iPhone pool.
- */
-function acquireReverseBridgeSocket() {
-  while (pool.length > 0) {
-    const entry = pool.shift();
-    if (
-      entry &&
-      entry.socket &&
-      !entry.socket.destroyed &&
-      entry.socket.writable &&
-      entry.socket.readable
-    ) {
-      entry.detachHandshakeListeners();
-      return entry.socket;
-    }
-  }
-  return null;
-}
-
-/**
- * Candidate direct endpoints when the reverse bridge pool is empty
- * (e.g., phone is on local home Wi-Fi 10.0.x.x or Tailscale VPN).
- */
 function getDirectCandidates() {
   const port = Number(lastPhoneHello.port || opts.phonePort || 8090);
   const candidates = [];
@@ -225,9 +272,9 @@ function getDirectCandidates() {
   };
 
   add(opts.phoneIp, "cli_phone_ip");
-  add(lastPhoneHello.wifi_ip, "wifi_en0");
+  add(lastPhoneHello.wifi_ipv4 || lastPhoneHello.wifi_ip, "wifi_en0");
   add(opts.tailscaleIp, "cli_tailscale_ip");
-  add(lastPhoneHello.vpn_ip, "vpn_tailscale_utun");
+  add(lastPhoneHello.vpn_tailscale_ipv4 || lastPhoneHello.vpn_ip, "vpn_tailscale_utun");
   add(lastPhoneHello.cellular_ipv6, "cellular_ipv6_pdp_ip0");
   add(lastPhoneHello.cellular_ipv4, "cellular_ipv4_pdp_ip0");
   return candidates;
@@ -263,7 +310,7 @@ function connectDirectCandidate(candidates, index = 0) {
 }
 
 /**
- * 2. Local Home-PC MCP HTTP Endpoint / Transparent Proxy (TCP 8090)
+ * 2. Local Host MCP HTTP Endpoint / Transparent Proxy (TCP 8090)
  */
 const httpProxyServer = net.createServer((clientSocket) => {
   clientSocket.setNoDelay(true);
@@ -291,6 +338,10 @@ const httpProxyServer = net.createServer((clientSocket) => {
           ok: true,
           daemon: "ios-mcp-wan-bridge",
           reverse_pool_idle: pool.length,
+          pending_waiters: pendingWaiters.length,
+          rotating: Date.now() < rotatingUntilMs,
+          last_rotation_notice: lastRotationNotice,
+          bridge_secret_required: Boolean(opts.bridgeSecret),
           last_phone_hello: lastPhoneHello,
           direct_candidates: getDirectCandidates(),
           host_interfaces: getLocalHostAddresses(),
@@ -309,8 +360,15 @@ const httpProxyServer = net.createServer((clientSocket) => {
       return;
     }
 
-    // Route 1: Use an active Reverse Bridge socket from the iPhone (Cellular pdp_ip0 or remote Wi-Fi)
-    const revSocket = acquireReverseBridgeSocket();
+    // Route 1: Reverse bridge pool (wait up to rotateWaitMs if iPhone announced MCP-ROTATING or 1.5s for pool replenishment)
+    let revSocket = acquireReverseBridgeSocket();
+    if (!revSocket && (Date.now() < rotatingUntilMs || metrics.totalBridgeHandshakes > 0)) {
+      const isRot = Date.now() < rotatingUntilMs;
+      if (isRot) metrics.queuedDuringRotation++;
+      const waitBudget = isRot ? Math.max(5000, rotatingUntilMs - Date.now()) : 1500;
+      revSocket = await waitForReverseBridgeSocket(Math.min(waitBudget, opts.rotateWaitMs));
+    }
+
     if (revSocket) {
       metrics.routedViaReverseBridge++;
       try {
@@ -334,7 +392,7 @@ const httpProxyServer = net.createServer((clientSocket) => {
       }
     }
 
-    // Route 2: Direct multi-interface fallback (Home Wi-Fi 10.0.x.x / Tailscale / Cellular IPv6)
+    // Route 2: Direct multi-interface fallback (Home Wi-Fi / Tailscale / Cellular IPv6)
     try {
       const { socket: directSock } = await connectDirectCandidate(getDirectCandidates());
       metrics.routedViaDirectSocket++;
@@ -357,8 +415,9 @@ const httpProxyServer = net.createServer((clientSocket) => {
         error: "iPhone unreachable on both Cellular Reverse Bridge and Direct Wi-Fi/VPN",
         detail: err.message,
         reverse_pool_idle: pool.length,
+        rotating: Date.now() < rotatingUntilMs,
         last_phone_hello: lastPhoneHello,
-        hint: "Ensure 'wanBridgeHost' in iPhone Settings -> iOS MCP points to this computer's IP/hostname:8091, or pass --phone-ip <10.0.x.x> when on home Wi-Fi.",
+        hint: "Configure wanBridgeHost via wan_cellular_controller or iPhone Settings -> iOS MCP -> Home PC Host, or pass --phone-ip when on LAN.",
       });
       const resp =
         `HTTP/1.1 502 Bad Gateway\r\n` +
@@ -381,7 +440,7 @@ httpProxyServer.listen(opts.httpPort, opts.httpHost, () => {
   console.log(`[wan-bridge] Bridge status endpoint: http://${opts.httpHost}:${opts.httpPort}/bridge_status`);
   const addrs = getLocalHostAddresses();
   if (addrs.length > 0) {
-    console.log(`[wan-bridge] Configure iPhone Settings -> iOS MCP -> '家里电脑地址' (wanBridgeHost) with one of:`);
+    console.log(`[wan-bridge] Configure iPhone Settings -> iOS MCP -> Home PC Host (wanBridgeHost) with one of:`);
     for (const a of addrs) {
       const formatted = a.family === "IPv6" ? `[${a.address}]:${opts.bridgePort}` : `${a.address}:${opts.bridgePort}`;
       console.log(`             - ${formatted} (${a.interface})`);

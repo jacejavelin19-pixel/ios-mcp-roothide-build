@@ -17,6 +17,7 @@ function parseArgs(argv) {
     url: process.env.IOS_MCP_URL || "http://127.0.0.1:8090/mcp",
     client: "all",
     name: "ios-mcp",
+    token: process.env.IOS_MCP_AUTH_TOKEN || "",
     dryRun: false,
   };
   for (let i = 2; i < argv.length; i++) {
@@ -28,6 +29,8 @@ function parseArgs(argv) {
       opts.url = `http://${host}:${port}/mcp`;
     } else if (a === "--port" && argv[i + 1]) {
       opts.port = argv[++i];
+    } else if (a === "--token" && argv[i + 1]) {
+      opts.token = argv[++i];
     } else if (a === "--client" && argv[i + 1]) opts.client = argv[++i].toLowerCase();
     else if (a === "--name" && argv[i + 1]) opts.name = argv[++i];
     else if (a === "--dry-run") opts.dryRun = true;
@@ -74,7 +77,7 @@ function updateTomlConfig(filePath, serverName, url, dryRun = false) {
   return { clientFile: filePath, updated: !dryRun, entry: { url } };
 }
 
-function updateJsonConfig(filePath, target, serverName, url, dryRun = false) {
+function updateJsonConfig(filePath, target, serverName, url, dryRun = false, token = "") {
   let obj = {};
   if (fs.existsSync(filePath)) {
     try {
@@ -83,33 +86,39 @@ function updateJsonConfig(filePath, target, serverName, url, dryRun = false) {
       obj = {};
     }
   }
+  const authHeaders = token ? { Authorization: `Bearer ${token}` } : undefined;
   let entry;
   if (target === "opencode") {
     if (!obj.mcp || typeof obj.mcp !== "object") obj.mcp = {};
+    const cfg = { type: "remote", url, oauth: false, ...(authHeaders ? { headers: authHeaders } : {}) };
     if (obj.mcp.servers && typeof obj.mcp.servers === "object") {
-      obj.mcp.servers[serverName] = { type: "remote", url, oauth: false };
+      obj.mcp.servers[serverName] = cfg;
       entry = obj.mcp.servers[serverName];
     } else {
-      obj.mcp[serverName] = { type: "remote", url, oauth: false };
+      obj.mcp[serverName] = cfg;
       entry = obj.mcp[serverName];
     }
   } else if (target === "claude" && process.platform === "win32") {
     if (!obj.mcpServers || typeof obj.mcpServers !== "object") obj.mcpServers = {};
+    const args = [
+      "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js",
+      "-y",
+      "mcp-remote",
+      url,
+      "--allow-http",
+    ];
+    if (token) args.push("--header", `Authorization: Bearer ${token}`);
     obj.mcpServers[serverName] = {
       command: "C:\\Program Files\\nodejs\\node.exe",
-      args: [
-        "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js",
-        "-y",
-        "mcp-remote",
-        url,
-        "--allow-http",
-      ],
+      args,
     };
     entry = obj.mcpServers[serverName];
   } else {
     const rootKey = target === "vscode" ? "servers" : "mcpServers";
     if (!obj[rootKey] || typeof obj[rootKey] !== "object") obj[rootKey] = {};
-    obj[rootKey][serverName] = target === "antigravity" ? { url } : { type: "streamable-http", url };
+    obj[rootKey][serverName] = target === "antigravity"
+      ? { url, ...(authHeaders ? { headers: authHeaders } : {}) }
+      : { type: "streamable-http", url, ...(authHeaders ? { headers: authHeaders } : {}) };
     entry = obj[rootKey][serverName];
   }
   if (!dryRun) {
@@ -137,7 +146,7 @@ function main() {
     const res =
       target === "codex"
         ? updateTomlConfig(filePath, opts.name, opts.url, opts.dryRun)
-        : updateJsonConfig(filePath, target, opts.name, opts.url, opts.dryRun);
+        : updateJsonConfig(filePath, target, opts.name, opts.url, opts.dryRun, opts.token);
     results.push({ client: target, ...res });
   }
   console.log(JSON.stringify({ ok: true, url: opts.url, results }, null, 2));

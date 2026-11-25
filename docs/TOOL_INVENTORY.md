@@ -1,4 +1,4 @@
-# iOS MCP (`com.witchan.ios-mcp` `v2.1.1`) — Generated Tool Inventory
+# iOS MCP (`com.witchan.ios-mcp` `v2.2.0`) — Generated Tool Inventory
 
 > Auto-generated from `MCPServer.m` by `scripts/generate_tool_docs.py`. Do not edit by hand.
 

@@ -1147,7 +1147,18 @@ static void mcp_stealth_init(void) {
         if (!pData) {
             NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
             if (bid.length) {
-                pData = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"/var/mobile/Library/ios-mcp/spoof/%@.json", bid]];
+                NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/ios-mcp/spoof/%@.json", bid];
+                pData = [NSData dataWithContentsOfFile:rel];
+                if (!pData) {
+                    NSArray<NSString *> *roots = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:NULL];
+                    for (NSString *entry in roots) {
+                        if ([entry hasPrefix:@".jbroot-"]) {
+                            NSString *cand = [[@"/var/containers/Bundle/Application" stringByAppendingPathComponent:entry] stringByAppendingString:rel];
+                            pData = [NSData dataWithContentsOfFile:cand];
+                            if (pData) break;
+                        }
+                    }
+                }
             }
         }
         if (pData) {

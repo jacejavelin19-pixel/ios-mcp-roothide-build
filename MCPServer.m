@@ -56,9 +56,9 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"2.1.1"
-static NSString *const kMCPServerVersion = @"2.1.1";
-#define HTTP_BUF_SIZE        (256 * 1024)
+#define MCP_SERVER_VERSION          @"2.2.0"
+static NSString *const kMCPServerVersion = @"2.2.0";
+#define HTTP_BUF_SIZE        (1024 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
 #define MCP_MAX_UPLOAD_BYTES (500LL * 1024LL * 1024LL)
@@ -644,6 +644,15 @@ static NSDictionary<NSString *, NSString *> *MCPToolAliasMap(void) {
             @"net_replay_request": @"replay_request_native",
             @"net_tls_cloak": @"tls_ja3_ja4_http2_cloak",
             @"net_wan_cellular": @"wan_cellular_controller",
+            @"cellular_rotate_ip": @"wan_cellular_controller",
+            @"net_enable": @"start_capture",
+            @"net_disable": @"stop_capture",
+            @"net_dump": @"get_captured_requests",
+            @"engine_decode_protobuf": @"decode_protobuf",
+            @"engine_replay_request": @"replay_request_native",
+            @"engine_trace_crypto": @"trace_crypto_primitives",
+            @"engine_get_crypto_events": @"get_crypto_events",
+            @"engine_hook_quic_http3": @"hook_quic_http3",
             @"crypto_trace": @"trace_crypto_primitives",
             @"crypto_get_events": @"get_crypto_events",
             // Memory & Reverse Engineering
@@ -1213,7 +1222,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 - (void)spawnWanBridgeWorker;
 @end
 
-#define MCP_WAN_BRIDGE_POOL_SIZE 1
+#define MCP_WAN_BRIDGE_POOL_SIZE 3
 
 @implementation MCPServer {
     uint16_t _port;
@@ -1243,6 +1252,9 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
     NSString *_wanBridgeLastTargetFingerprint;
     NSTimeInterval _wanBridgeLastConnectedAt;
     dispatch_source_t _wanBridgeTimer;
+    NSObject *_sseLock;
+    NSMutableSet<NSNumber *> *_sseClientSockets;
+    NSNetService *_bonjourService;
 }
 
 + (instancetype)sharedInstance {
@@ -1272,6 +1284,8 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
         _wanBridgeLastBoundInterface = @"";
         _wanBridgeLastError = @"";
         _wanBridgeLastTargetFingerprint = @"";
+        _sseLock = [[NSObject alloc] init];
+        _sseClientSockets = [NSMutableSet set];
         NSString *sessFile = [MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work") stringByAppendingPathComponent:@".mcp_session_id"];
         NSString *savedSess = [[NSString stringWithContentsOfFile:sessFile encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (savedSess.length > 0) {
@@ -1530,6 +1544,24 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
 
     dispatch_resume(source);
     MCP_LOG(@"MCP server started on port %d (dual-stack Wi-Fi + Cellular)", port);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_bonjourService) {
+            [self->_bonjourService stop];
+            self->_bonjourService = nil;
+        }
+        NSNetService *svc = [[NSNetService alloc] initWithDomain:@"local."
+                                                            type:@"_ios-mcp._tcp."
+                                                            name:@""
+                                                            port:(int)port];
+        NSDictionary *txt = @{
+            @"version": [MCP_SERVER_VERSION dataUsingEncoding:NSUTF8StringEncoding],
+            @"path": [@"/mcp" dataUsingEncoding:NSUTF8StringEncoding],
+            @"auth": [(IOSMCPApiAuthEnabled() ? @"bearer" : @"none") dataUsingEncoding:NSUTF8StringEncoding]
+        };
+        [svc setTXTRecordData:[NSNetService dataFromTXTRecordDictionary:txt]];
+        [svc publish];
+        self->_bonjourService = svc;
+    });
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [self maintainWanBridgePool];
     });
@@ -1670,8 +1702,18 @@ static int MCPConnectOutboundSocket(NSString *host,
     BOOL enabled = IOSMCPWanBridgeEnabled();
     BOOL preferCell = IOSMCPPreferCellularWan();
     NSString *statusFile = [MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work") stringByAppendingPathComponent:@"wan_status.json"];
-    NSDictionary *diskStatus = [NSDictionary dictionaryWithContentsOfFile:statusFile] ?: @{};
-    NSString *publicTunnelUrl = [diskStatus[@"public_tunnel_url"] isKindOfClass:[NSString class]] ? diskStatus[@"public_tunnel_url"] : @"";
+    NSData *statusData = [NSData dataWithContentsOfFile:statusFile];
+    NSDictionary *diskStatus = nil;
+    if (statusData.length > 0) {
+        id parsed = [NSJSONSerialization JSONObjectWithData:statusData options:0 error:NULL];
+        if ([parsed isKindOfClass:[NSDictionary class]]) diskStatus = parsed;
+    }
+    NSString *publicTunnelUrl = @"";
+    if ([diskStatus[@"public_url"] isKindOfClass:[NSString class]] && [diskStatus[@"public_url"] length] > 0) {
+        publicTunnelUrl = diskStatus[@"public_url"];
+    } else if ([diskStatus[@"public_tunnel_url"] isKindOfClass:[NSString class]]) {
+        publicTunnelUrl = diskStatus[@"public_tunnel_url"];
+    }
 
     NSUInteger idleCount = 0;
     NSInteger connecting = 0;
@@ -1703,6 +1745,46 @@ static int MCPConnectOutboundSocket(NSString *host,
         @"last_error": lastErr,
         @"public_tunnel_url": publicTunnelUrl
     };
+}
+
+- (void)broadcastWanBridgeControlLine:(NSString *)line {
+    if (!line.length) return;
+    NSData *bytes = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (!bytes.length) return;
+    NSArray<NSNumber *> *fds = nil;
+    @synchronized (_wanBridgeLock) {
+        fds = [_wanBridgeIdleSockets allObjects];
+    }
+    for (NSNumber *n in fds) {
+        MCPWriteAllToFD(n.intValue, bytes.bytes, bytes.length);
+    }
+}
+
+- (void)publishSSEEvent:(NSString *)eventType payload:(NSDictionary *)payload {
+    if (!eventType.length) return;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:(payload ?: @{}) options:0 error:NULL];
+    NSString *jsonStr = json ? [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] : @"{}";
+    NSString *frame = [NSString stringWithFormat:@"event: %@\ndata: %@\n\n", eventType, jsonStr ?: @"{}"];
+    NSData *bytes = [frame dataUsingEncoding:NSUTF8StringEncoding];
+    if (!bytes.length) return;
+
+    NSArray<NSNumber *> *fds = nil;
+    @synchronized (_sseLock) {
+        fds = [_sseClientSockets allObjects];
+    }
+    NSMutableArray<NSNumber *> *dead = [NSMutableArray array];
+    for (NSNumber *n in fds) {
+        if (!MCPWriteAllToFD(n.intValue, bytes.bytes, bytes.length)) {
+            [dead addObject:n];
+        }
+    }
+    if (dead.count > 0) {
+        @synchronized (_sseLock) {
+            for (NSNumber *n in dead) {
+                [_sseClientSockets removeObject:n];
+            }
+        }
+    }
 }
 
 - (void)maintainWanBridgePool {
@@ -1752,17 +1834,25 @@ static int MCPConnectOutboundSocket(NSString *host,
     }
 
     NSDictionary *net = IOSMCPNetworkInterfacesSummary();
-    NSDictionary *helloPayload = @{
+    NSString *bridgeSecret = IOSMCPWanBridgeSecret();
+    NSMutableDictionary *helloPayload = [NSMutableDictionary dictionaryWithDictionary:@{
         @"version": MCP_SERVER_VERSION,
         @"port": @(self.port ?: IOSMCPConfiguredPort()),
         @"mode": net[@"active_connection_mode"] ?: @"unknown",
         @"wifi_ipv4": net[@"wifi_ipv4"] ?: @"",
+        @"wifi_ip": net[@"wifi_ipv4"] ?: @"",
+        @"cellular_connected": net[@"cellular_connected"] ?: @NO,
         @"cellular_ipv4": net[@"cellular_ipv4"] ?: @"",
         @"cellular_ipv6": net[@"cellular_ipv6"] ?: @"",
         @"vpn_tailscale_ipv4": net[@"vpn_tailscale_ipv4"] ?: @"",
+        @"vpn_ip": net[@"vpn_tailscale_ipv4"] ?: @"",
         @"bound_interface": usedIf ?: @"default",
+        @"bound_if": usedIf ?: @"default",
         @"session_id": [self currentSessionId]
-    };
+    }];
+    if (bridgeSecret.length > 0) {
+        helloPayload[@"bridge_secret"] = bridgeSecret;
+    }
     NSData *helloJson = [NSJSONSerialization dataWithJSONObject:helloPayload options:0 error:nil];
     NSString *helloStr = [[NSString alloc] initWithData:helloJson encoding:NSUTF8StringEncoding] ?: @"{}";
     NSString *helloLine = [NSString stringWithFormat:@"MCP-HELLO %@\n", helloStr];
@@ -1928,6 +2018,18 @@ static int MCPConnectOutboundSocket(NSString *host,
         uint64_t generation = _listenerGeneration;
         if (socket >= 0) close(socket);
         [self listenerDidCloseSocketLocked:socket generation:generation];
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_bonjourService) {
+            [self->_bonjourService stop];
+            self->_bonjourService = nil;
+        }
+    });
+    @synchronized (_sseLock) {
+        for (NSNumber *n in _sseClientSockets) {
+            shutdown(n.intValue, SHUT_RDWR);
+        }
+        [_sseClientSockets removeAllObjects];
     }
     MCP_LOG(@"MCP server stopping");
 }
@@ -2144,6 +2246,30 @@ static int MCPConnectOutboundSocket(NSString *host,
         [self setNegotiatedProtocolVersion:protocolVersionHeader];
     }
 
+    // Optional API Bearer Token authentication (configured via MCP wan_cellular_controller; /health remains readable without leaking token)
+    if (IOSMCPApiAuthEnabled() && IOSMCPApiAuthToken().length > 0 && ![basePath isEqualToString:@"/health"]) {
+        NSString *expectedTok = IOSMCPApiAuthToken();
+        NSString *authHdr = headers[@"authorization"] ?: @"";
+        NSString *providedTok = @"";
+        if ([authHdr.lowercaseString hasPrefix:@"bearer "] && authHdr.length > 7) {
+            providedTok = [[authHdr substringFromIndex:7] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+        if (!providedTok.length) {
+            NSURLComponents *ac = [NSURLComponents componentsWithString:path];
+            for (NSURLQueryItem *qi in ac.queryItems) {
+                if ([qi.name isEqualToString:@"token"] && qi.value.length > 0) {
+                    providedTok = qi.value;
+                    break;
+                }
+            }
+        }
+        if (![providedTok isEqualToString:expectedTok]) {
+            [self sendErrorResponse:clientSocket status:401 message:@"Unauthorized: valid Bearer token required" requestLogId:requestLogId];
+            free(buffer);
+            return;
+        }
+    }
+
     // Route request
     if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/mcp"]) {
         NSString *expect = [headers[@"expect"] lowercaseString] ?: @"";
@@ -2221,16 +2347,56 @@ static int MCPConnectOutboundSocket(NSString *host,
             else if ([item.name isEqualToString:@"max_frames"] && item.value.length > 0) maxFrames = [item.value integerValue];
         }
         [[ScreenStreamer sharedInstance] streamMJPEGToSocket:clientSocket fps:fps quality:quality maxFrames:maxFrames];
+    } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/events"]) {
+        NSString *sseHdr = @"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+        NSData *hdrBytes = [sseHdr dataUsingEncoding:NSUTF8StringEncoding];
+        if ([self writeAll:clientSocket data:hdrBytes requestLogId:requestLogId]) {
+            @synchronized (_sseLock) {
+                [_sseClientSockets addObject:@(clientSocket)];
+            }
+            NSDictionary *initSnap = @{
+                @"cellular": [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO],
+                @"public_tunnel": [[SystemCapabilitiesManager sharedInstance] publicTunnelStatus],
+                @"rotation_state": [[SystemCapabilitiesManager sharedInstance] latestRotationState]
+            };
+            NSData *initJson = [NSJSONSerialization dataWithJSONObject:initSnap options:0 error:NULL];
+            NSString *initFrame = [NSString stringWithFormat:@"event: connected\ndata: %@\n\n",
+                                   initJson ? [[NSString alloc] initWithData:initJson encoding:NSUTF8StringEncoding] : @"{}"];
+            MCPWriteAllToFD(clientSocket, initFrame.UTF8String, strlen(initFrame.UTF8String));
+            struct pollfd pfd = {.fd = clientSocket, .events = POLLIN, .revents = 0};
+            for (int tick = 0; tick < 60 && self.isRunning; tick++) {
+                int pr = poll(&pfd, 1, 15000);
+                if (pr < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (pr == 0) {
+                    static const char kPing[] = ": keepalive\n\n";
+                    if (!MCPWriteAllToFD(clientSocket, kPing, sizeof(kPing) - 1)) break;
+                    continue;
+                }
+                char tmpB[64];
+                if (read(clientSocket, tmpB, sizeof(tmpB)) <= 0) break;
+            }
+            @synchronized (_sseLock) {
+                [_sseClientSockets removeObject:@(clientSocket)];
+            }
+        }
     } else if ([method isEqualToString:@"GET"] && [basePath isEqualToString:@"/health"]) {
+        NSDictionary *cellSnap = [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO];
         NSDictionary *health = @{
             @"status": @"ok",
             @"server": MCP_SERVER_NAME,
             @"version": MCP_SERVER_VERSION,
             @"port": @(listenerPort),
+            @"auth_required": @(IOSMCPApiAuthEnabled() && IOSMCPApiAuthToken().length > 0),
             @"protocolVersion": [self negotiatedProtocolVersion],
             @"supportedProtocolVersions": MCPSupportedProtocolVersions(),
             @"network": IOSMCPNetworkInterfacesSummary(),
-            @"wan_bridge": [self wanBridgeStatusSummary]
+            @"cellular": cellSnap ?: @{},
+            @"wan_bridge": [self wanBridgeStatusSummary],
+            @"public_tunnel": [[SystemCapabilitiesManager sharedInstance] publicTunnelStatus],
+            @"rotation_state": [[SystemCapabilitiesManager sharedInstance] latestRotationState]
         };
         [self sendJSONResponse:clientSocket status:200 body:health requestLogId:nil];
     } else {
@@ -2748,8 +2914,8 @@ static NSString *MCPLogId(id reqId) {
         }
         NSDictionary *response = [self routeMCPRequest:request];
 
-        // 区分四种结果：notification / result(成功) / tool_error(isError 软失败，含锁屏拦截) /
-        // error(JSON-RPC 协议错误)，并记录失败原因，便于排查。成功结果不记内容以保护隐私。
+    // Internal server helper comment
+    // Internal server helper comment
         NSString *responseKind = @"notification";
         NSString *detail = @"";
         if ([response[@"error"] isKindOfClass:[NSDictionary class]]) {
@@ -2763,9 +2929,9 @@ static NSString *MCPLogId(id reqId) {
             if ([result[@"isError"] respondsToSelector:@selector(boolValue)] && [result[@"isError"] boolValue]) {
                 responseKind = @"tool_error";
                 NSString *errText = MCPFirstResultText(result);
-                // run_command 实际执行失败时，结果文本里含命令输出，已由独立的 run_command 日志行
-                // 记录 exitCode，这里不重复记录输出，避免把命令输出写进可分享日志；但锁屏拦截等
-                // 未真正执行的情况（不含 exitCode 字段）仍要记录原因。
+    // Internal server helper comment
+    // Internal server helper comment
+    // Internal server helper comment
                 if ([toolName isEqualToString:@"run_command"] &&
                     MCPRunCommandResultTextHasExitCode(errText)) {
                     detail = @" errorText=<see run_command line>";
@@ -2847,6 +3013,55 @@ static NSString *MCPLogId(id reqId) {
         return [self handleToolsList:reqId params:params];
     } else if ([method isEqualToString:@"tools/call"]) {
         return [self handleToolsCall:reqId params:params];
+    } else if ([method isEqualToString:@"resources/list"]) {
+        return @{
+            @"jsonrpc": @"2.0",
+            @"id": reqId ?: [NSNull null],
+            @"result": @{
+                @"resources": @[
+                    @{@"uri": @"ios://device/network", @"name": @"Device Network Interfaces", @"mimeType": @"application/json", @"description": @"Live Wi-Fi, Cellular (pdp_ip*), VPN/Tailscale, and CGNAT interface summary"},
+                    @{@"uri": @"ios://device/cellular", @"name": @"Cellular Radio & Egress Capabilities", @"mimeType": @"application/json", @"description": @"Live SIM, carrier, RAT, Airplane Mode, cellular egress reachability, and IP rotation capabilities"},
+                    @{@"uri": @"ios://device/rotation-history", @"name": @"Cellular Egress IP Rotation History", @"mimeType": @"application/json", @"description": @"Last 50 carrier egress IP rotations and active rotation job state"},
+                    @{@"uri": @"ios://device/health", @"name": @"iOS MCP Server Health", @"mimeType": @"application/json", @"description": @"Server version, port, WAN bridge status, and standalone public tunnel state"}
+                ]
+            }
+        };
+    } else if ([method isEqualToString:@"resources/read"]) {
+        NSString *uri = [params[@"uri"] isKindOfClass:[NSString class]] ? params[@"uri"] : @"";
+        NSDictionary *payload = nil;
+        if ([uri isEqualToString:@"ios://device/network"]) {
+            payload = IOSMCPNetworkInterfacesSummary();
+        } else if ([uri isEqualToString:@"ios://device/cellular"]) {
+            payload = [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO];
+        } else if ([uri isEqualToString:@"ios://device/rotation-history"]) {
+            payload = @{
+                @"latest": [[SystemCapabilitiesManager sharedInstance] latestRotationState],
+                @"history": [[SystemCapabilitiesManager sharedInstance] rotationHistory]
+            };
+        } else if ([uri isEqualToString:@"ios://device/health"]) {
+            payload = @{
+                @"status": @"ok",
+                @"version": MCP_SERVER_VERSION,
+                @"port": @(self.port ?: IOSMCPConfiguredPort()),
+                @"network": IOSMCPNetworkInterfacesSummary(),
+                @"cellular": [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO],
+                @"wan_bridge": [self wanBridgeStatusSummary],
+                @"public_tunnel": [[SystemCapabilitiesManager sharedInstance] publicTunnelStatus]
+            };
+        } else {
+            return [self mcpError:reqId code:-32602 message:[NSString stringWithFormat:@"Unknown resource URI: %@", uri]];
+        }
+        NSData *j = [NSJSONSerialization dataWithJSONObject:(payload ?: @{}) options:NSJSONWritingPrettyPrinted error:NULL];
+        NSString *txt = j ? [[NSString alloc] initWithData:j encoding:NSUTF8StringEncoding] : @"{}";
+        return @{
+            @"jsonrpc": @"2.0",
+            @"id": reqId ?: [NSNull null],
+            @"result": @{
+                @"contents": @[
+                    @{@"uri": uri, @"mimeType": @"application/json", @"text": txt ?: @"{}"}
+                ]
+            }
+        };
     } else {
         return @{
             @"jsonrpc": @"2.0",
@@ -2863,13 +3078,28 @@ static NSString *MCPLogId(id reqId) {
     NSString *negotiatedProtocolVersion = MCPNegotiateProtocolVersion(clientProtocolVersion);
     [self setNegotiatedProtocolVersion:negotiatedProtocolVersion];
 
+    NSDictionary *cellCap = [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO] ?: @{};
+    NSString *cellSummaryLine = [NSString stringWithFormat:
+        @"\n\nCellular & Egress IP Control (live snapshot): mode=%@, sim_present=%@, cellular_connected=%@, carrier=%@, rat=%@, airplane_mode=%@, can_switch_to_cellular=%@, can_rotate_ip=%@, recommended_rotation_method=%@. If an app or target hits a Wi-Fi IP block, call wan_cellular_controller with action='switch_egress', target='cellular', scope='app', bundle_id='<id>' (zero Wi-Fi drop via per-app pdp_ip0 binding) or scope='device'. If cellular egress gets blocked, call wan_cellular_controller with action='rotate_egress' (tries CoreTelephony PDP toggle first, then Airplane Mode with mcp-helperd failsafe watchdog and automatic reconnect) and poll action='rotation_status' if async=true.",
+        cellCap[@"active_connection_mode"] ?: @"unknown",
+        [cellCap[@"sim_present"] boolValue] ? @"true" : @"false",
+        [cellCap[@"cellular_connected"] boolValue] ? @"true" : @"false",
+        [cellCap[@"carrier_name"] length] ? cellCap[@"carrier_name"] : @"none",
+        [cellCap[@"radio_access_technology"] length] ? cellCap[@"radio_access_technology"] : @"none",
+        [cellCap[@"airplane_mode"] boolValue] ? @"true" : @"false",
+        [cellCap[@"can_switch_to_cellular"] boolValue] ? @"true" : @"false",
+        [cellCap[@"can_rotate_ip"] boolValue] ? @"true" : @"false",
+        cellCap[@"recommended_rotation_method"] ?: @"auto"];
+
+    NSString *baseInstructions = @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. There is a single coordinate space: screenshots are returned at point size (one image pixel = one screen point), and get_ui_elements/tap_element/ocr_screen also report points, so coordinates from any of them are passed to the touch tools unchanged — never divide by the Retina scale. drag_and_drop accepts either fromX/fromY/toX/toY for a straight drag, or points for a path where the first point is pressed and the last point is released. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is image/jpeg. The image is point-sized, so coordinates measured on it are valid tap_screen coordinates directly.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an IPA, TIPA or DEB from the computer, first upload raw file bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file). The upload response returns a device path under /var/mobile/Library/Caches/ios-mcp-uploads; pass that path to install_app. To install an IPA, TIPA or DEB already on the phone, call install_app directly with its device path. TIPA files use the same IPA install flow. Unsigned or fakesigned IPAs are supported. DEB installs use dpkg and restart SpringBoard after installation succeeds. To uninstall an app, use list_apps to find the bundle_id, then call uninstall_app. To uninstall a DEB package, call uninstall_app with package_id; DEB removal uses dpkg and restarts SpringBoard after success.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:<server-port>/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off.";
     return @{
         @"jsonrpc": @"2.0",
         @"id": reqId ?: [NSNull null],
         @"result": @{
             @"protocolVersion": negotiatedProtocolVersion,
             @"capabilities": @{
-                @"tools": @{@"listChanged": @NO}
+                @"tools": @{@"listChanged": @NO},
+                @"resources": @{@"listChanged": @NO}
             },
             @"serverInfo": @{
                 @"name": MCP_SERVER_NAME,
@@ -2881,9 +3111,10 @@ static NSString *MCPLogId(id reqId) {
                     @"negotiatedVersion": negotiatedProtocolVersion,
                     @"supportedVersions": MCPSupportedProtocolVersions(),
                     @"httpHeader": @"MCP-Protocol-Version"
-                }
+                },
+                @"networkCapabilities": cellCap
             },
-            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. There is a single coordinate space: screenshots are returned at point size (one image pixel = one screen point), and get_ui_elements/tap_element/ocr_screen also report points, so coordinates from any of them are passed to the touch tools unchanged — never divide by the Retina scale. drag_and_drop accepts either fromX/fromY/toX/toY for a straight drag, or points for a path where the first point is pressed and the last point is released. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is image/jpeg. The image is point-sized, so coordinates measured on it are valid tap_screen coordinates directly.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an IPA, TIPA or DEB from the computer, first upload raw file bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file). The upload response returns a device path under /var/mobile/Library/Caches/ios-mcp-uploads; pass that path to install_app. To install an IPA, TIPA or DEB already on the phone, call install_app directly with its device path. TIPA files use the same IPA install flow. Unsigned or fakesigned IPAs are supported. DEB installs use dpkg and restart SpringBoard after installation succeeds. To uninstall an app, use list_apps to find the bundle_id, then call uninstall_app. To uninstall a DEB package, call uninstall_app with package_id; DEB removal uses dpkg and restarts SpringBoard after success.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:<server-port>/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
+            @"instructions": [baseInstructions stringByAppendingString:cellSummaryLine]
         }
     };
 }
@@ -4691,30 +4922,7 @@ static NSString *MCPLogId(id reqId) {
             }
         },
         // Step 2: Missing engine_* schemas
-        @{
-            @"name": @"engine_trace_crypto",
-            @"description": @"Start in-process libmcpengine crypto primitive tracing (CCCrypt, CCHmac,CCKeyDerivationPBKDF, SecKeyRawSign/Verify) for a running app.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        @{
-            @"name": @"engine_get_crypto_events",
-            @"description": @"Fetch captured in-process libmcpengine crypto events (keys, IVs, plaintexts, HMAC inputs) for a running app.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"clear": @{@"type": @"boolean", @"description": @"Clear buffered crypto events after reading (default false)."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        @{
+@{
             @"name": @"engine_stop_crypto",
             @"description": @"Stop in-process libmcpengine crypto primitive tracing for a running app.",
             @"inputSchema": @{
@@ -4725,49 +4933,7 @@ static NSString *MCPLogId(id reqId) {
                 @"required": @[@"bundle_id"]
             }
         },
-        @{
-            @"name": @"engine_hook_quic_http3",
-            @"description": @"Configure in-process libmcpengine QUIC / HTTP/3 UDP 443 control or nw_parameters_set_quic_enabled hook for a running app.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"disable_quic": @{@"type": @"boolean", @"description": @"Force HTTP/2 fallback by blocking UDP/443 QUIC handshakes (default true)."},
-                    @"enable": @{@"type": @"boolean", @"description": @"Enable or disable the QUIC hook (default true)."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        @{
-            @"name": @"engine_decode_protobuf",
-            @"description": @"Decode raw Protobuf wire-format payload (hex or base64) inside libmcpengine into recursive field trees.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"hex": @{@"type": @"string", @"description": @"Hex-encoded protobuf payload."},
-                    @"base64": @{@"type": @"string", @"description": @"Base64-encoded protobuf payload."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        @{
-            @"name": @"engine_replay_request",
-            @"description": @"Replay an HTTP/HTTPS request from inside the target app's own NSURLSession / BoringSSL TLS stack via libmcpengine.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"url": @{@"type": @"string", @"description": @"Request URL."},
-                    @"method": @{@"type": @"string", @"description": @"HTTP method (default GET)."},
-                    @"headers": @{@"type": @"object", @"description": @"Optional HTTP header dictionary."},
-                    @"body": @{@"type": @"string", @"description": @"Optional UTF-8 request body."},
-                    @"body_base64": @{@"type": @"string", @"description": @"Optional base64 request body."}
-                },
-                @"required": @[@"bundle_id", @"url"]
-            }
-        },
-        // Step 3: Safety & Ergonomics tools
+// Step 3: Safety & Ergonomics tools
         @{
             @"name": @"wait_until_texts",
             @"description": @"Poll accessibility UI elements (and optionally OCR) until any or all specified text strings appear on screen.",
@@ -5184,33 +5350,7 @@ static NSString *MCPLogId(id reqId) {
                 }
             }
         },
-        @{
-            @"name": @"net_enable",
-            @"description": @"Enable in-process network request capture for a target app (alias of start_capture).",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"clear_existing": @{@"type": @"boolean", @"description": @"Clear existing capture log first (default true)."},
-                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch target app if needed (default true)."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        @{
-            @"name": @"net_disable",
-            @"description": @"Disable network request capture for a target app (alias of stop_capture).",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"clear_logs": @{@"type": @"boolean", @"description": @"Delete captured log file (default false)."},
-                    @"relaunch": @{@"type": @"boolean", @"description": @"Relaunch target app (default false)."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        @{
+@{
             @"name": @"net_clear",
             @"description": @"Truncate and clear captured network requests for a target app without detaching the capture dylib.",
             @"inputSchema": @{
@@ -5232,22 +5372,7 @@ static NSString *MCPLogId(id reqId) {
                 @"required": @[@"bundle_id"]
             }
         },
-        @{
-            @"name": @"net_dump",
-            @"description": @"Retrieve captured HTTP/HTTPS requests for a target app with automatic sensitive header/token redaction and inline body folding.",
-            @"inputSchema": @{
-                @"type": @"object",
-                @"properties": @{
-                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID."},
-                    @"limit": @{@"type": @"number", @"description": @"Maximum requests to return (default 100)."},
-                    @"url_filter": @{@"type": @"string", @"description": @"Optional URL substring filter."},
-                    @"clear": @{@"type": @"boolean", @"description": @"Clear log after reading (default false)."},
-                    @"redact": @{@"type": @"boolean", @"description": @"Redact sensitive Authorization/Cookie/token values (default follows Preferences, true)."}
-                },
-                @"required": @[@"bundle_id"]
-            }
-        },
-        // Step 6: Tool Tiering & Catalog Discovery
+// Step 6: Tool Tiering & Catalog Discovery
         @{
             @"name": @"probe_help",
             @"description": @"Discover all ios-mcp tools grouped by tier ('core', 'advanced', 'debug'), view normalized <subsystem>_<verb> aliases, or search tools by keyword.",
@@ -5260,19 +5385,37 @@ static NSString *MCPLogId(id reqId) {
                 }
             }
         },
-        // Wi-Fi + Cellular WAN Reachability & Reverse Bridge Controller
+        // Wi-Fi + Cellular Radio, Egress Switching, Carrier IP Rotation & WAN Controller
         @{
             @"name": @"wan_cellular_controller",
-            @"description": @"Inspect Wi-Fi (en0), Cellular Data (pdp_ip0..4 IPv4/IPv6), and Tailscale/VPN (utun*) interfaces; configure the outbound Cellular/Wi-Fi WAN Reverse Bridge to keep the iPhone reachable from a remote computer (e.g. phone on cellular data at school, computer at home); force-wake cellular radio via IP_BOUND_IF; or start/stop an outbound public HTTPS tunnel.",
+            @"description": @"Detect cellular data availability (SIM, carrier, RAT, Airplane Mode, CGNAT, dual-stack IPv4/IPv6 egress); switch egress between Wi-Fi and Cellular (per-app pdp_ip0 pinning with zero Wi-Fi drop, or device-wide Wi-Fi toggle); toggle Airplane Mode or Cellular Data; autonomously rotate carrier cellular egress IP with before/after verification, mcp-helperd failsafe watchdog, and auto-reconnect; configure WAN reverse bridge / optional Bearer token auth; or manage standalone public HTTPS tunnels.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"action": @{@"type": @"string", @"description": @"Operation: 'status' (default), 'configure_bridge', 'wake_cellular', 'start_public_tunnel', or 'stop_public_tunnel'."},
-                    @"enabled": @{@"type": @"boolean", @"description": @"Enable or disable the outbound WAN reverse bridge (for configure_bridge)."},
-                    @"bridge_host": @{@"type": @"string", @"description": @"Home computer public IP, DDNS hostname, or Tailscale IP (optionally host:port) for outbound reverse bridge."},
-                    @"bridge_port": @{@"type": @"number", @"description": @"Home computer reverse bridge TCP port (default 8091)."},
-                    @"prefer_cellular": @{@"type": @"boolean", @"description": @"Bind outbound bridge sockets directly to cellular data interface (pdp_ip0 via IP_BOUND_IF) even when Wi-Fi is connected."},
-                    @"provider": @{@"type": @"string", @"description": @"Tunnel provider for start_public_tunnel: 'auto', 'cloudflared', or 'ssh' (localhost.run)."}
+                    @"action": @{@"type": @"string", @"description": @"Operation: 'status' (default), 'connectivity_check', 'wake_cellular', 'switch_egress', 'airplane_mode', 'cellular_data', 'rotate_egress' (aliases 'rotate_ip'/'reset_ip'), 'rotation_status', 'rotation_history', 'configure_bridge', 'start_public_tunnel', or 'stop_public_tunnel'."},
+                    @"probe_egress": @{@"type": @"boolean", @"description": @"For action='status': run live dual-stack external egress IP probe (default false, uses recent cache)."},
+                    @"target": @{@"type": @"string", @"description": @"For action='switch_egress': 'cellular', 'wifi', or 'default'."},
+                    @"scope": @{@"type": @"string", @"description": @"For action='switch_egress': 'app' (zero-drop per-app pdp_ip0 binding via libmcpengine) or 'device' (system Wi-Fi toggle with cellular pre-flight safety check)."},
+                    @"bundle_id": @{@"type": @"string", @"description": @"Target app bundle ID for scope='app' cellular pinning."},
+                    @"auto_restore_wifi_sec": @{@"type": @"number", @"description": @"Optional mcp-helperd failsafe deadline (5..300s) to auto-restore Wi-Fi after device-wide cellular switch."},
+                    @"state": @{@"type": @"string", @"description": @"For action='airplane_mode' or 'cellular_data': 'on', 'off', 'toggle', or 'status'."},
+                    @"keep_wifi": @{@"type": @"boolean", @"description": @"For action='airplane_mode': keep/re-enable Wi-Fi while Airplane Mode is ON."},
+                    @"method": @{@"type": @"string", @"description": @"For action='rotate_egress': 'auto' (default: cellular_data_toggle first then escalate), 'cellular_data_toggle', 'airplane_preserve_wifi', or 'airplane_full'."},
+                    @"hold_seconds": @{@"type": @"number", @"description": @"Radio hold duration in seconds during rotation (default 4, range 2..30)."},
+                    @"require_ip_change": @{@"type": @"boolean", @"description": @"Retry/escalate if carrier reassigns the same IP (default true)."},
+                    @"max_retries": @{@"type": @"number", @"description": @"Maximum rotation retry attempts (default 2, max 5)."},
+                    @"async": @{@"type": @"boolean", @"description": @"Return immediately with job_id before radio teardown (auto-true on cellular-only connections)."},
+                    @"job_id": @{@"type": @"string", @"description": @"Job ID for action='rotation_status'."},
+                    @"sync_persona_geo": @{@"type": @"string", @"description": @"Optional bundle_id whose PersonaManager carrier/MCC/MNC/country should sync after rotation."},
+                    @"webhook_url": @{@"type": @"string", @"description": @"Optional HTTP(S) webhook URL to POST rotation result after reconnect."},
+                    @"enabled": @{@"type": @"boolean", @"description": @"Enable or disable outbound WAN reverse bridge (for configure_bridge)."},
+                    @"bridge_host": @{@"type": @"string", @"description": @"Host IP/DDNS/IPv6 [addr]:port for outbound reverse bridge."},
+                    @"bridge_port": @{@"type": @"number", @"description": @"Reverse bridge TCP port (default 8091)."},
+                    @"bridge_secret": @{@"type": @"string", @"description": @"Optional shared secret for reverse bridge authentication."},
+                    @"prefer_cellular": @{@"type": @"boolean", @"description": @"Bind outbound bridge sockets directly to pdp_ip0 via IP_BOUND_IF."},
+                    @"api_auth_enabled": @{@"type": @"boolean", @"description": @"Enable optional HTTP Bearer token authentication on /mcp and file/stream endpoints."},
+                    @"api_auth_token": @{@"type": @"string", @"description": @"Bearer token secret when api_auth_enabled=true."},
+                    @"provider": @{@"type": @"string", @"description": @"Tunnel provider for start_public_tunnel: 'auto', 'cloudflared', or 'ssh'."}
                 }
             }
         }
@@ -6944,9 +7087,12 @@ static NSString *MCPLogId(id reqId) {
         // Uptime
         result[@"uptimeSeconds"] = @([NSProcessInfo processInfo].systemUptime);
 
-        // Wi-Fi + Cellular + VPN Network Interfaces & WAN Bridge Status
+        // Wi-Fi + Cellular + VPN Network Interfaces, Radio Telemetry & WAN Bridge Status
         result[@"network"] = IOSMCPNetworkInterfacesSummary();
+        result[@"cellular"] = [[SystemCapabilitiesManager sharedInstance] cellularRadioSnapshotWithEgressProbe:NO];
         result[@"wanBridge"] = [self wanBridgeStatusSummary];
+        result[@"publicTunnel"] = [[SystemCapabilitiesManager sharedInstance] publicTunnelStatus];
+        result[@"rotationState"] = [[SystemCapabilitiesManager sharedInstance] latestRotationState];
 
         info = [result copy];
     };
@@ -6992,7 +7138,7 @@ static NSString *MCPLogId(id reqId) {
                                   &exitCode,
                                   &runError);
 
-    // 记录非敏感的执行结果（不记录命令本身/输出内容），便于排查失败与超时。
+    // Internal server helper comment
     BOOL timedOut = !finished && [runError hasPrefix:@"Command timed out"];
     [MCPLogger log:@"run_command finished=%@ timedOut=%@ exitCode=%d timeoutSec=%d outputBytes=%lu",
      finished ? @"yes" : @"no",
@@ -8849,17 +8995,20 @@ static BOOL MCPParseMemoryAddress(NSString *text, uint64_t *address) {
     if (delayMs > 5000.0) delayMs = 5000.0;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSString *mcpRoot = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
-        NSString *sh = MCPResolvedJailbreakPath(@"/bin/sh");
-        NSString *cmd = [mode isEqualToString:@"full"]
-            ? @"reboot || /sbin/reboot"
-            : @"(launchctl reboot userspace || ldrestart || sbreload)";
         NSString *out = nil, *err = nil;
         int rc = -1;
-        if ([[NSFileManager defaultManager] isExecutableFileAtPath:mcpRoot]) {
-            MCPRunProcess(mcpRoot, @[sh, @"-c", cmd], MCPJailbreakEnvironment(), 10, 4096, &out, &rc, &err);
+        if ([mode isEqualToString:@"full"]) {
+            NSString *sh = MCPResolvedJailbreakPath(@"/bin/sh");
+            MCPRunProcess(sh, @[@"-c", @"reboot || /sbin/reboot"], MCPJailbreakEnvironment(), 10, 4096, &out, &rc, &err);
         } else {
-            MCPRunProcess(sh, @[@"-c", cmd], MCPJailbreakEnvironment(), 10, 4096, &out, &rc, &err);
+            BOOL ok = MCPRunRootProcess(@"/basebin/jbctl", @[@"reboot_userspace"], 10.0, 4096, &out, &rc, &err);
+            if (!ok || rc != 0) {
+                ok = MCPRunRootProcess(@"/bin/launchctl", @[@"reboot", @"userspace"], 10.0, 4096, &out, &rc, &err);
+            }
+            if (!ok || rc != 0) {
+                NSString *sh = MCPResolvedJailbreakPath(@"/bin/sh");
+                MCPRunProcess(sh, @[@"-c", @"(sbreload || killall -9 SpringBoard) >/dev/null 2>&1"], MCPJailbreakEnvironment(), 8.0, 4096, &out, &rc, &err);
+            }
         }
     });
 

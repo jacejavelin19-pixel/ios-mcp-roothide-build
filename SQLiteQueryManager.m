@@ -52,7 +52,7 @@
                                   &truncated,
                                   &exitCode,
                                   &runErr) && exitCode == 0 && rootBytes.length > 0 && !truncated) {
-            NSString *workDir = @"/var/mobile/Library/Caches/ios-mcp-work";
+            NSString *workDir = MCPResolvedJailbreakPath(@"/var/mobile/Library/Caches/ios-mcp-work");
             [[NSFileManager defaultManager] createDirectoryAtPath:workDir withIntermediateDirectories:YES attributes:nil error:nil];
             tempCopy = [workDir stringByAppendingPathComponent:[NSString stringWithFormat:@"sqlite-%@.db", [NSUUID UUID].UUIDString]];
             if ([rootBytes writeToFile:tempCopy options:NSDataWritingAtomic error:nil]) {

@@ -81,6 +81,9 @@ static _Atomic int g_af_attest_active = 0;
 static _Atomic int g_af_env_sync_active = 0;
 static _Atomic int g_af_objc_cloak_active = 0;
 static _Atomic int g_af_thread_cloak_active = 0;
+static _Atomic int g_af_egress_mode = 0; // 0=default, 1=cellular, 2=wifi
+static _Atomic unsigned int g_af_egress_if_idx = 0;
+static char g_af_egress_if_name[32] = "pdp_ip0";
 
 static NSMutableDictionary *g_af_persona = nil;
 static NSMutableArray<NSDictionary *> *g_af_bound_slots = nil;
@@ -682,10 +685,72 @@ static Boolean hook_af_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef ta
     return ok;
 }
 
+typedef void *(*me_nw_params_create_fn)(void *, void *);
+typedef void *(*me_nw_params_create_plain_fn)(void);
+typedef void (*me_nw_params_set_req_if_fn)(void *, int);
+typedef void (*me_nw_params_prohibit_if_fn)(void *, int);
+static me_nw_params_create_fn orig_af_nw_create_tcp = NULL;
+static me_nw_params_create_fn orig_af_nw_create_udp = NULL;
+static me_nw_params_create_plain_fn orig_af_nw_create_plain = NULL;
+
+static void MEAFApplyNetworkParametersPin(void *params) {
+    int mode = atomic_load(&g_af_egress_mode);
+    if (!params || mode == 0) return;
+    static me_nw_params_set_req_if_fn s_setReq = NULL;
+    static me_nw_params_prohibit_if_fn s_prohibit = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s_setReq = (me_nw_params_set_req_if_fn)dlsym(RTLD_DEFAULT, "nw_parameters_set_required_interface_type");
+        s_prohibit = (me_nw_params_prohibit_if_fn)dlsym(RTLD_DEFAULT, "nw_parameters_prohibit_interface_type");
+    });
+    // nw_interface_type_wifi = 1, nw_interface_type_cellular = 2
+    if (mode == 1) {
+        if (s_setReq) s_setReq(params, 2);
+        if (s_prohibit) s_prohibit(params, 1);
+    } else if (mode == 2) {
+        if (s_setReq) s_setReq(params, 1);
+        if (s_prohibit) s_prohibit(params, 2);
+    }
+}
+
+static void *hook_af_nw_create_tcp(void *tls, void *tcp) {
+    void *p = orig_af_nw_create_tcp ? orig_af_nw_create_tcp(tls, tcp) : NULL;
+    if (p && MEDepth == 0) MEAFApplyNetworkParametersPin(p);
+    return p;
+}
+
+static void *hook_af_nw_create_udp(void *dtls, void *udp) {
+    void *p = orig_af_nw_create_udp ? orig_af_nw_create_udp(dtls, udp) : NULL;
+    if (p && MEDepth == 0) MEAFApplyNetworkParametersPin(p);
+    return p;
+}
+
+static void *hook_af_nw_create_plain(void) {
+    void *p = orig_af_nw_create_plain ? orig_af_nw_create_plain() : NULL;
+    if (p && MEDepth == 0) MEAFApplyNetworkParametersPin(p);
+    return p;
+}
+
+static unsigned int MEAFResolvePinnedInterfaceIndex(void) {
+    int mode = atomic_load(&g_af_egress_mode);
+    if (mode == 0) return 0;
+    unsigned int idx = atomic_load(&g_af_egress_if_idx);
+    if (idx != 0) return idx;
+    if (mode == 1) {
+        idx = if_nametoindex(g_af_egress_if_name[0] ? g_af_egress_if_name : "pdp_ip0");
+        if (idx == 0) idx = if_nametoindex("pdp_ip0");
+        if (idx == 0) idx = if_nametoindex("pdp_ip1");
+    } else if (mode == 2) {
+        idx = if_nametoindex("en0");
+    }
+    if (idx != 0) atomic_store(&g_af_egress_if_idx, idx);
+    return idx;
+}
+
 static int hook_af_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if ((atomic_load(&g_af_risk_neutralizer_active) || atomic_load(&g_af_shield_active)) && MEDepth == 0 && addr) {
-        uint16_t port = 0;
-        BOOL isLocal = NO;
+    BOOL isLocal = NO;
+    uint16_t port = 0;
+    if (addr) {
         if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
             const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
             port = ntohs(sin->sin_port);
@@ -696,6 +761,18 @@ static int hook_af_connect(int sockfd, const struct sockaddr *addr, socklen_t ad
             port = ntohs(sin6->sin6_port);
             if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr) || IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr)) isLocal = YES;
         }
+    }
+    if (!isLocal && MEDepth == 0 && addr && atomic_load(&g_af_egress_mode) != 0) {
+        unsigned int pinIdx = MEAFResolvePinnedInterfaceIndex();
+        if (pinIdx != 0) {
+            if (addr->sa_family == AF_INET) {
+                setsockopt(sockfd, IPPROTO_IP, IP_BOUND_IF, &pinIdx, sizeof(pinIdx));
+            } else if (addr->sa_family == AF_INET6) {
+                setsockopt(sockfd, IPPROTO_IPV6, IPV6_BOUND_IF, &pinIdx, sizeof(pinIdx));
+            }
+        }
+    }
+    if ((atomic_load(&g_af_risk_neutralizer_active) || atomic_load(&g_af_shield_active)) && MEDepth == 0 && addr) {
         if (isLocal && (port == 22 || port == 27042 || port == 27043 || port == 23946 ||
                         port == 8090 || port == 1234 || port == 4444 || port == 8080 || port == 8888 || port == 9090)) {
             errno = ECONNREFUSED;
@@ -1233,6 +1310,9 @@ static void MEAFInstallGOTHooks(NSMutableArray<NSDictionary *> *allSlots,
         {"getifaddrs", (void *)hook_af_getifaddrs, (void **)&orig_af_getifaddrs},
         {"SCNetworkReachabilityGetFlags", (void *)hook_af_SCNetworkReachabilityGetFlags, (void **)&orig_af_SCNetworkReachabilityGetFlags},
         {"connect", (void *)hook_af_connect, (void **)&orig_af_connect},
+        {"nw_parameters_create_secure_tcp", (void *)hook_af_nw_create_tcp, (void **)&orig_af_nw_create_tcp},
+        {"nw_parameters_create_secure_udp", (void *)hook_af_nw_create_udp, (void **)&orig_af_nw_create_udp},
+        {"nw_parameters_create", (void *)hook_af_nw_create_plain, (void **)&orig_af_nw_create_plain},
         {"MGCopyAnswer", (void *)hook_af_MGCopyAnswer, (void **)&orig_af_MGCopyAnswer},
         {"statfs", (void *)hook_af_statfs, (void **)&orig_af_statfs},
         {"fstatfs", (void *)hook_af_fstatfs, (void **)&orig_af_fstatfs},
@@ -1880,6 +1960,46 @@ NSDictionary *MEAntiFraud(NSString *op, NSDictionary *a) {
         return MEAFEnableAllLayersWithPersona(persona, trapSvc);
     }
 
+    if ([op isEqualToString:@"engine.egress_pin"]) {
+        NSString *target = [a[@"target"] isKindOfClass:[NSString class]] ? [a[@"target"] lowercaseString] : @"default";
+        NSString *ifName = [a[@"interface"] isKindOfClass:[NSString class]] ? a[@"interface"] : @"";
+        int mode = 0;
+        unsigned int ifIdx = 0;
+        if ([target isEqualToString:@"cellular"] || [target isEqualToString:@"pdp"] || [target isEqualToString:@"wwan"]) {
+            mode = 1;
+            NSString *wantIf = ifName.length ? ifName : @"pdp_ip0";
+            strlcpy(g_af_egress_if_name, wantIf.UTF8String, sizeof(g_af_egress_if_name));
+            ifIdx = if_nametoindex(g_af_egress_if_name);
+            if (ifIdx == 0) {
+                for (NSString *cand in @[@"pdp_ip0", @"pdp_ip1", @"pdp_ip2", @"pdp_ip3"]) {
+                    ifIdx = if_nametoindex(cand.UTF8String);
+                    if (ifIdx != 0) {
+                        strlcpy(g_af_egress_if_name, cand.UTF8String, sizeof(g_af_egress_if_name));
+                        break;
+                    }
+                }
+            }
+        } else if ([target isEqualToString:@"wifi"] || [target isEqualToString:@"en0"]) {
+            mode = 2;
+            strlcpy(g_af_egress_if_name, "en0", sizeof(g_af_egress_if_name));
+            ifIdx = if_nametoindex("en0");
+        } else {
+            mode = 0;
+            ifIdx = 0;
+            g_af_egress_if_name[0] = '\0';
+        }
+        atomic_store(&g_af_egress_mode, mode);
+        atomic_store(&g_af_egress_if_idx, ifIdx);
+        MEAFInstallGOTHooks(NULL, NULL, NULL);
+        return @{
+            @"ok": @YES,
+            @"target": (mode == 1 ? @"cellular" : (mode == 2 ? @"wifi" : @"default")),
+            @"interface": g_af_egress_if_name[0] ? @(g_af_egress_if_name) : @"",
+            @"interface_index": @(ifIdx),
+            @"pid": @(getpid())
+        };
+    }
+
     if ([op isEqualToString:@"engine.audit_fraud_surface"]) {
         if (!atomic_load(&g_af_shield_active)) {
             MEAFEnableAllLayersWithPersona(nil, NO);
@@ -1899,8 +2019,18 @@ static void MEAntiFraudAutoInit(void) {
         if (!data) {
             NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
             if (bundleId.length) {
-                NSString *globalPath = [NSString stringWithFormat:@"/var/mobile/Library/ios-mcp/spoof/%@.json", bundleId];
-                data = [NSData dataWithContentsOfFile:globalPath];
+                NSString *rel = [NSString stringWithFormat:@"/var/mobile/Library/ios-mcp/spoof/%@.json", bundleId];
+                data = [NSData dataWithContentsOfFile:rel];
+                if (!data) {
+                    NSArray<NSString *> *roots = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:NULL];
+                    for (NSString *entry in roots) {
+                        if ([entry hasPrefix:@".jbroot-"]) {
+                            NSString *cand = [[@"/var/containers/Bundle/Application" stringByAppendingPathComponent:entry] stringByAppendingString:rel];
+                            data = [NSData dataWithContentsOfFile:cand];
+                            if (data) break;
+                        }
+                    }
+                }
             }
         }
         if (data.length) {

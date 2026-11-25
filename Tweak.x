@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import "MCPServer.h"
+#import "SystemCapabilitiesManager.h"
 #import "MCPLogger.h"
 #import "IOSMCPPreferences.h"
 
@@ -98,6 +99,9 @@ static void ios_mcp_handle_control_notification(CFNotificationCenterRef center,
             if (gen != sDebounceGen) return;
             ios_mcp_autostart_if_needed(@"network_or_wan_change");
             [[MCPServer sharedInstance] handleNetworkOrWanConfigurationChange];
+            [[SystemCapabilitiesManager sharedInstance] handleNetworkChangeForTunnels];
+            [[MCPServer sharedInstance] publishSSEEvent:@"network_changed"
+                                                payload:IOSMCPNetworkInterfacesSummary()];
         });
     }
 }

@@ -31,6 +31,11 @@ FOUNDATION_EXPORT NSString *MCPRootHelperPath(void);
 /// Connect to the local unsandboxed mcp-helperd spawn broker (returns socket FD >= 0 or -1).
 FOUNDATION_EXPORT int MCPConnectHelperDaemon(void);
 
+/// Send a JSON control request (watchdog_arm, watchdog_disarm, spawn_detached, stop_detached) to mcp-helperd.
+FOUNDATION_EXPORT NSDictionary *MCPHelperDaemonSendControlRequest(NSDictionary *request,
+                                                                  NSTimeInterval timeout,
+                                                                  NSString **errorMessage);
+
 /// Run a command as root via the bundled mcp-root helper, capturing UTF-8 text output.
 FOUNDATION_EXPORT BOOL MCPRunRootProcess(NSString *launchPath,
                                          NSArray<NSString *> *arguments,

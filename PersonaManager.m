@@ -4,6 +4,7 @@
 #import "KeychainManager.h"
 #import "PlistPatchManager.h"
 #import "MCPProcessUtil.h"
+#import "SystemCapabilitiesManager.h"
 #import <sys/stat.h>
 
 static NSString *const kMCPSpoofDir = @"/var/mobile/Library/ios-mcp/spoof";
@@ -470,6 +471,18 @@ static NSDictionary *MCPCountryPreset(NSString *countryCode) {
         return nil;
     }
 
+    // Optional Step 0: Rotate cellular carrier egress IP and/or bind app egress to cellular
+    NSDictionary *rotationRes = nil;
+    if ([args[@"rotate_ip"] boolValue]) {
+        NSMutableDictionary *rotArgs = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"action": @"rotate_egress",
+            @"async": @NO
+        }];
+        if (args[@"rotation_method"]) rotArgs[@"method"] = args[@"rotation_method"];
+        if (args[@"hold_seconds"]) rotArgs[@"hold_seconds"] = args[@"hold_seconds"];
+        rotationRes = [[SystemCapabilitiesManager sharedInstance] wanCellularControllerWithArgs:rotArgs error:NULL];
+    }
+
     // Step 1: Generate or update coherent persona profile and write to disk
     NSMutableDictionary *genArgs = [NSMutableDictionary dictionaryWithDictionary:(args ?: @{})];
     if (args[@"wipe_canaries"] == nil || [args[@"wipe_canaries"] boolValue]) {
@@ -499,6 +512,19 @@ static NSDictionary *MCPCountryPreset(NSString *countryCode) {
     finalRes[@"persona_path"] = [self spoofFileForBundleId:bundleId];
     NSDictionary *rhInfo = [self syncRootHideBlacklistForBundleId:bundleId desiredValue:args[@"roothide_blacklist"]];
     if (rhInfo) finalRes[@"roothide_blacklist"] = rhInfo;
+    if (rotationRes) {
+        finalRes[@"ip_rotation"] = rotationRes;
+    }
+    NSString *egressTarget = [args[@"egress"] isKindOfClass:[NSString class]] ? [args[@"egress"] lowercaseString] : nil;
+    if (egressTarget.length > 0 && ([egressTarget isEqualToString:@"cellular"] || [egressTarget isEqualToString:@"wifi"] || [egressTarget isEqualToString:@"default"])) {
+        NSDictionary *pinRes = [[SystemCapabilitiesManager sharedInstance] wanCellularControllerWithArgs:@{
+            @"action": @"switch_egress",
+            @"scope": @"app",
+            @"bundle_id": bundleId,
+            @"target": egressTarget
+        } error:NULL];
+        if (pinRes) finalRes[@"egress_pin"] = pinRes;
+    }
     if (postPatchAudit) {
         finalRes[@"audit"] = postPatchAudit;
     }
