@@ -285,8 +285,12 @@ static void (*orig_cap_taskResume)(id, SEL) = NULL;
             ? orig_cap_ephemeralConfig([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration))
             : [NSURLSessionConfiguration ephemeralSessionConfiguration];
         NSMutableArray *protos = [NSMutableArray array];
+        Class egressProto = NSClassFromString(@"MEAFEgressURLProtocol");
+        if (egressProto) {
+            [protos addObject:egressProto];
+        }
         for (Class cls in (cfg.protocolClasses ?: @[])) {
-            if (cls != [MCPCapURLProtocol class] && ![NSStringFromClass(cls) containsString:@"MCPNetCap"]) {
+            if (cls != [MCPCapURLProtocol class] && cls != egressProto && ![NSStringFromClass(cls) containsString:@"MCPNetCap"]) {
                 [protos addObject:cls];
             }
         }
